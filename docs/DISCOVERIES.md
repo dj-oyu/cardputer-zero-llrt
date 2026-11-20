@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H31 re-audit: raw-enumeration fast path still intact & ownership-correct post-all-edits (2026-11-20 03:02)
+- **Recall link**: `[Useful] raw enumeration` + `[Note] raw-C-API revisit` asked whether either surface drifted after the H23–H27 ships. Verified in-place, no code changed this round.
+- **Invariant checklist confirmed in walk_json fast path**: JS_GetOwnPropertyNames with STRING_MASK|ENUM_ONLY; per-member JS_GetOwnProperty; `desc.value` freed on BOTH skip branches (getset-flag filter and vanishing types) and otherwise wrapped via `Value::from_raw` RAII — exactly the settled ownership table from the revisit post-mortem; atoms handed to enumeration consumed per original protocol.
+- **Raw-C-API revisit verdict unchanged** (+4% host ⇒ not shipped; revisit condition: device profiling showing builder dominance — unavailable in this sandbox, so verdict stands).
+- **Gates**: e2e-p6a PASS full suite this round; medians in band; tree clean docs-only.
+
 ### [Note] H30 audit: zero production polling sleeps remain — condvar idle wake covers every device pause (2026-11-20 02:48)
 - **Recall link**: `[Genius] condvar instant wake` asked whether other hidden 5 ms slices exist on device paths; `[Dead End] String borrow` kept the audit JS-boundary-free.
 - **Exhaustive scan result** (`rg thread::sleep` across cz-hal/cz-modules/cz-runner): EVERY remaining `sleep(...)` occurrence lives inside `#[cfg(test)]` modules (runner tests after line 408, http_module test mods after 839/1562, kv test helpers). Production has exactly ONE bounded pause: `idle_wait(IDLE_SLEEP=5ms)` guarded by the Condvar that wakes INSTANTLY on enqueue and on `mark_client_closed` (verified still wired post-H27/H24 edits: notify_all + idle_wait intact).
