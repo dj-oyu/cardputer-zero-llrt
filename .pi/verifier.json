@@ -1,0 +1,25 @@
+{
+  "targetScore": 100,
+  "checks": [
+    {
+      "name": "integrity-and-anticheat",
+      "command": "bash /refs/verify/check_integrity.sh",
+      "weight": 15
+    },
+    {
+      "name": "rust-clippy-and-unit-tests",
+      "command": "bash /refs/verify/check_rust.sh",
+      "weight": 35
+    },
+    {
+      "name": "js-practical-e2e-suite",
+      "command": "bash /refs/verify/check_e2e.sh",
+      "weight": 40
+    },
+    {
+      "name": "ts-declarations",
+      "command": "bash /refs/verify/check_types.sh",
+      "weight": 10
+    }
+  ]
+}

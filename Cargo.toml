@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cz-hal",
+    "crates/cz-gfx",
+    "crates/cz-modules",
+    "crates/cz-runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+libc = "0.2"
+rquickjs = { version = "0.14", features = ["std", "classes", "array-buffer"] }
+swash = "0.2"

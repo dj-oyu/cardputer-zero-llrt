@@ -1,0 +1,11 @@
+[package]
+name = "cz-modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cz-hal = { path = "../cz-hal" }
+cz-gfx = { path = "../cz-gfx" }
+rquickjs.workspace = true
+libc.workspace = true
