@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H35 clarification: raw-C-API map now split into builder-loops (rejected) vs one-shot creation (shipped) (2026-11-20 04:16)
+- **Recall link**: `[Dead End] raw object building` and `[Useful] raw enumeration` were cited right after H34 shipped direct-byte strings — superficially contradictory; this note resolves it durably.
+- **Boundary articulated**: the segfault class was per-property BUILD loops (`JS_SetProperty` frees on ALL tails, atoms needed dup discipline, loop-local value lifetimes racing GC) — that verdict stands untouched. H34 is ONE-SHOT: `JS_NewStringLen` produces exactly one owned JSValue wrapped immediately by RAII, no loop, no atom handling, no intermediate lives across collection points. Raw READS (enumeration) and raw ONE-SHOT CREATION are both safe; raw BUILDER LOOPS remain off the table until device profiling shows builder dominance.
+- **Enumeration re-audit**: still fully applied (walk_json ✓; lazy=tape-direct; kv=peeked Record; no other hot enumeration sites) — nothing new to implement this round.
+- **Gates swept post-H34**: integrity/rust/e2e/boss all green; medians 57-58 band; tree clean.
+
 ### [Useful] H34 JS_NewStringLen direct-byte string creation for stringify outputs — validation pass removed (2026-11-20 04:02)
 - **Recall link**: `[Note] raw-C-API revisit` settled OBJECT building (+4%, off) but left STRING creation open; `[Useful] H12/H13` provided the validity invariant that makes it safe. Ownership honored the settled table (fresh owned JS value wrapped by Value::from_raw RAII; exception branch frees then throws via cold path).
 - **Change**: `js_string_from_bytes(ctx, &[u8])` helper replaces `ascii()+String::from_str` at ALL six do_stringify output sites (lazy clean passthrough, dirty serialize, kv record, generic walk — scratch and fallback). Safety chain: clean bytes = PARSE-VALIDATED input; emitted bytes = ASCII writers or valid Rust Strings converted from JS. `ascii()` became dead under `-D warnings` and was removed (real cleanup, not a suppression).
