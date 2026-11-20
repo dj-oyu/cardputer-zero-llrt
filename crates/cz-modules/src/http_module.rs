@@ -28,7 +28,8 @@ use rquickjs::{
 
 use cz_hal::http::STATUS_CODES;
 use cz_hal::http_server::{
-    client_closed, take_disconnect_events, ConnectionEvent, Listener, ReplyFrame, ResponseAction,
+    client_closed, take_disconnect_events, ConnectionEvent, Listener, ReplyFrame, ReplySender,
+    ResponseAction,
 };
 
 /// Node.js-compatible HTTP methods exposed by the module.
@@ -50,7 +51,7 @@ struct Registry {
     tx: Sender<ConnectionEvent>,
     /// Per-connection reply channels awaiting the JS response. Phase 2.5: the channel may carry
     /// a *sequence* (`StreamHead -> StreamChunk* -> StreamEnd`) instead of one buffered frame.
-    replies: Mutex<HashMap<u64, Sender<ResponseAction>>>,
+    replies: Mutex<HashMap<u64, ReplySender>>,
     /// Connections currently in streaming mode, keyed by conn id -> owning server id. Used so
     /// `server.close()` can terminate live SSE channels (spec §3) instead of leaving them open.
     streams: Mutex<HashMap<u64, u64>>,
@@ -115,7 +116,7 @@ pub fn next_active_request() -> Option<ConnectionEvent> {
 }
 
 /// Clone the reply channel for `conn_id` WITHOUT removing it (streaming keeps it alive).
-fn peek_sender(conn_id: u64) -> Option<Sender<ResponseAction>> {
+fn peek_sender(conn_id: u64) -> Option<ReplySender> {
     registry().replies.lock().expect("replies lock").get(&conn_id).cloned()
 }
 

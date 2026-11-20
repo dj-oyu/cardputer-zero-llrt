@@ -18,8 +18,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{Sender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,110 @@ pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Slice used while parked on a reply channel: short enough to notice peer closes (via poll) and
 /// stop flags quickly, long enough to keep idle CPU near zero while streaming or waiting.
 const REPLY_POLL_SLICE: Duration = Duration::from_millis(10);
+
+/// H36 condvar mailbox replacing the per-connection reply channel (Genius instant-wake idiom
+/// ported from the event-loop idle pause): replies wake the connection thread IMMEDIATELY and
+/// idle connections wait on a condvar instead of polling 10 ms slices. mpsc parity is kept via
+/// LEASE COUNTING: `ReplySender` clones/drops flip `alive` exactly when the last sender handle
+/// dies (JS GC of an unanswered response => prompt Closed like Disconnected), and the rx guard
+/// closes on thread exit. ReplyOutcome mirrors Ok/Disconnected/Timeout.
+#[derive(Debug)]
+pub struct ReplyBox {
+    queue: Mutex<VecDeque<ResponseAction>>,
+    cv: Condvar,
+    alive: AtomicU64, // 0 once ALL sender leases drop OR the connection thread exits
+    leases: AtomicU64, // live ReplySender handles
+}
+
+#[derive(Debug, Clone)]
+pub enum ReplyOutcome {
+    Action(ResponseAction),
+    Closed,
+    Timeout,
+}
+
+/// mpsc-sender-parity handle handed to the JS side and registry.
+#[derive(Debug)]
+pub struct ReplySender {
+    box_ref: Arc<ReplyBox>,
+}
+
+impl Clone for ReplySender {
+    fn clone(&self) -> Self {
+        self.box_ref.leases.fetch_add(1, Ordering::AcqRel);
+        Self { box_ref: self.box_ref.clone() }
+    }
+}
+
+impl Drop for ReplySender {
+    fn drop(&mut self) {
+        if self.box_ref.leases.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.box_ref.alive.store(0, Ordering::Release);
+            self.box_ref.cv.notify_all(); // prompt wake, mirroring mpsc Disconnected
+        }
+    }
+}
+
+impl ReplySender {
+    /// mpsc-compatible signature: Err when the connection thread is gone or unclaimed.
+    pub fn send(&self, action: ResponseAction) -> Result<(), ResponseAction> {
+        if self.box_ref.alive.load(Ordering::Acquire) == 0 {
+            return Err(action);
+        }
+        self.box_ref.queue.lock().expect("reply box queue").push_back(action);
+        self.box_ref.cv.notify_all();
+        Ok(())
+    }
+}
+
+impl ReplyBox {
+    fn new() -> (Arc<Self>, ReplySender) {
+        let box_ref = Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            alive: AtomicU64::new(1),
+            leases: AtomicU64::new(1),
+        });
+        (box_ref.clone(), ReplySender { box_ref })
+    }
+
+    pub fn recv_timeout(&self, dur: Duration) -> ReplyOutcome {
+        let mut q = self.queue.lock().expect("reply box queue lock");
+        let start = Instant::now();
+        loop {
+            if let Some(a) = q.pop_front() {
+                return ReplyOutcome::Action(a);
+            }
+            if self.alive.load(Ordering::Acquire) == 0 {
+                return ReplyOutcome::Closed;
+            }
+            let waited = self.cv.wait_timeout(q, dur).expect("reply box wait");
+            q = waited.0;
+            if waited.1.timed_out() || Instant::now() - start >= dur {
+                if self.alive.load(Ordering::Acquire) != 0 {
+                    return ReplyOutcome::Timeout;
+                }
+                if q.is_empty() {
+                    return ReplyOutcome::Closed;
+                }
+                return ReplyOutcome::Action(q.pop_front().expect("rechecked queue"));
+            }
+        }
+    }
+}
+
+/// RAII: marks the mailbox closed when the connection thread exits (JS replies then see Err,
+/// exactly like mpsc Disconnected), waking any waiter.
+struct ReplyRxGuard {
+    box_ref: Arc<ReplyBox>,
+}
+
+impl Drop for ReplyRxGuard {
+    fn drop(&mut self) {
+        self.box_ref.alive.store(0, Ordering::Release);
+        self.box_ref.cv.notify_all();
+    }
+}
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -192,7 +296,7 @@ pub struct ConnectionEvent {
     /// Reply channel for THIS request. Phase 2 delivered one buffered frame; Phase 2.5 lets the
     /// channel carry a *sequence*: `StreamHead` -> many `StreamChunk`s -> `StreamEnd`, each chunk
     /// written and flushed onto the socket immediately, or a single `Buffered` frame (Phase 2).
-    pub reply: Sender<ResponseAction>,
+    pub reply: ReplySender,
 }
 
 /// What the JS side wants the connection thread to do with the socket for one request.
@@ -414,7 +518,7 @@ fn spawn_connection(
                 };
 
                 let keep_alive = req.keep_alive;
-                let (reply_tx, reply_rx) = channel::<ResponseAction>();
+                let (reply_box, reply_tx) = ReplyBox::new();
                 EVENTS_QUEUED.fetch_add(1, Ordering::SeqCst);
                 notify_event_loop();
                 if tx
@@ -441,9 +545,11 @@ fn spawn_connection(
                 // reported back to the JS event loop as `"close"` notifications.
                 let mut streaming = false;
                 let mut deadline = Instant::now() + reply_timeout;
+                // Closing this thread marks the mailbox closed (JS replies get Err like mpsc).
+                let _rx_guard = ReplyRxGuard { box_ref: reply_box.clone() };
                 'reply: loop {
-                    match reply_rx.recv_timeout(REPLY_POLL_SLICE) {
-                        Ok(action) => {
+                    match reply_box.recv_timeout(REPLY_POLL_SLICE) {
+                        ReplyOutcome::Action(action) => {
                             // Fresh budget for the NEXT action on this (possibly long-lived) stream.
                             deadline = Instant::now() + reply_timeout;
                             match action {
@@ -511,7 +617,7 @@ fn spawn_connection(
                                 }
                             }
                         }
-                        Err(RecvTimeoutError::Disconnected) => {
+                        ReplyOutcome::Closed => {
                             DIAG_CHAN_GONE_EXITS.fetch_add(1, Ordering::SeqCst);
                             // JS dropped the response object without finalizing it.
                             if !streaming {
@@ -522,7 +628,7 @@ fn spawn_connection(
                             shutdown(&mut stream);
                             return;
                         }
-                        Err(RecvTimeoutError::Timeout) => {
+                        ReplyOutcome::Timeout => {
                             // Peer gone (FIN/RST)? Notify so JS can clear intervals right away.
                             if peer_closed(&stream) {
                                 mark_client_closed(conn_id);
@@ -648,6 +754,7 @@ impl IntoReply for ResponseFrame {
 #[cfg(test)]
 mod server_tests {
     use super::*;
+    use std::sync::mpsc::channel;
     use std::io::Read;
     use std::time::Instant;
 
