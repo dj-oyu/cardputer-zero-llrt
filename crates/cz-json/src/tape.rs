@@ -1,7 +1,9 @@
 //! Layer 1 — the 16-byte arena `TapeNode` document and its adaptive indexing.
 //!
-//! Nodes live in ONE contiguous `Vec<TapeNode>` reserved as `Vec::with_capacity(input.len() / 12)`
-//! (roughly one malloc per document) in pre-order: children of an Object/Array are appended
+//! Nodes live in ONE contiguous fused-arena `Vec<Rec>` (16 B POD `TapeNode` + key span +
+//! literal end per record) reserved as `Vec::with_capacity(input.len() / 8)` (H33: dense
+//! payloads ran up to 2.9× past the old `/14` reserve and paid regrow rounds) in pre-order:
+//! children of an Object/Array are appended
 //! immediately after their parent, each node's `skip_to` is the index just past its whole subtree
 //! (so siblings are stepped in O(1)), and `end` carries the direct child count for containers.
 //! Object key lookup adapts to width: `<= 16` children scan linearly behind the `key_fp: u16`
