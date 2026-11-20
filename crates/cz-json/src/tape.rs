@@ -129,7 +129,7 @@ impl TapeDoc {
     pub fn build(input: &[u8]) -> Result<Self, ParseErr> {
         let raw: Arc<[u8]> = Arc::from(input); // single allocation + copy
         let mut sink = TapeSink {
-            recs: Vec::with_capacity(input.len() / 14),
+            recs: Vec::with_capacity(input.len() / 8),
             stack: Vec::new(),
         };
         crate::parse::run_parse(input, &mut sink)?;

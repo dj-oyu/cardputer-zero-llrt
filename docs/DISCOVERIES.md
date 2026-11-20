@@ -33,6 +33,18 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Useful] H33 tape records reserve divisor 14 -> 8 — dense payloads were paying Vec regrow rounds (2026-11-20 03:44)
+- **Recall link**: requested synergy of `[Insightful] fused arena exact-capacity` × `[Note] floor`: the fused entry CLAIMED exact reserve but diagnostics proved otherwise; judgment done via µs-visible diagnostics, not integer medians.
+- **Objective diagnosis (`/tmp/h33_diag` against real TapeDoc::build, actual node counts)**: dense number arrays run **2.93x** more records than `len/14` reserves (2–3 regrow rounds per parse); w3-like key-heavy objects **1.41x**; string-heavy docs only 0.01x (over-generous there, capped harmlessly by div choice).
+- **Change**: `recs: Vec::with_capacity(input.len() / 8)` in TapeDoc::build. Divisor 7 was marginally better on dense mocks but div=8 balances key-heavy docs (div=5 showed over-reserve shrink cost in the standalone sweep).
+- **Risk gates explicitly re-checked**: lazy heap contract assertion in phase5 e2e stays PASS (≤150 KiB delta) — over-reserve bounded at div 8; checksums byte-exact (w3 55844720, chkE 1764240); cz-json tests green; probes in band; boss medians 58–59 unchanged (host floor can't resolve few-ns regrow savings) — shipped as a structural A53 allocator win for number-dense payloads, honestly framed.
+- **Self-caught artifacts this round**: mock bench initially mis-typed return (Vec vs usize) and a fixture used non-ASCII escapes outside strings — both harness-side, fixed before drawing conclusions; stale-binary runs discarded per `[Note]` rigor.
+
+### [Note] Reflection checkpoint: verification beats churn; six closure maps now live (2026-11-20 03:32)
+- **Last 15 min landed**: NO new shipped code — H32 live-µs re-proof showed all three memo sites drift-free after the HTTP ships (doc(id) 3.5x, peek_store 5.0x, child_at 5.6x, stabilities true), and raw-enumeration ownership invariants re-confirmed. Two harness artifacts self-caught (malformed h32 fixture; docs header swallowed by multi-line exact match — repaired via anchored splice). Medians stayed in band 57-59; every verifier green.
+- **Value proposition of this phase**: with Epic/Genius/Insightful structural wins banked (-44..46% host) and eight bounded Dead Ends, recall rounds now mostly CONFIRM rather than risk unprovable churn — under `[Note] integer-ms floor` that IS the discipline.
+- **Synergy check (requested)**: fused-arena entry + noise floor ⇒ remaining open question is whether `recs.reserve(len/14)` UNDER-provisions dense documents (regrow rounds on A53 allocator). Diagnostic plan below; µs-visible even when integer medians can't see it.
+
 ### [Note] H32 memo-trio health check — doc(id)/peek_store/child_at all drift-free after HTTP ships (2026-11-20 03:18)
 - **Recall link**: `[Useful] registry memo` + `[Useful] raw enumeration` re-audited with live µs benches instead of new churn; integer medians CANNOT see regressions of a few ns/op, so benches were rerun against current code (honoring `[Note] floor`).
 - **Results vs original proofs**: `doc(id)` memo-hit 3 ns/op vs thrash 9 ns (**3.5x**, stable=true); `peek_store` 5 vs 25 ns (**5.0x**); `child_at` same-doc 2 vs mutex+hash 15 ns (**5.6x**) — identical to the shipped-era numbers ⇒ no drift from H23/H24/H27 edits.
