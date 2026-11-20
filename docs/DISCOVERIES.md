@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Useful] H27 offset-advance socket writer replaces per-partial-write drain memmove (2026-11-20 01:58)
+- **Recall link**: `[Dead End] String<'js> zero-copy borrow` kept the win entirely std-side (no JS values); `[Note] integer-ms floor` routed judgment through a FAIR µs microbench after catching an unfair first draft (clone charged only to the drain side) — rerun charged both sides equally via black_box.
+- **Site & hypothesis**: `write_all_eof_free` (real reply send path) did `bytes.drain(..n)` per accepted prefix — O(remaining) tail memmove each partial write; an offset index is O(1). Hot on w6 replies over loopback/A53 where memcpy is slower.
+- **Fair µs proof (`/tmp/h27/fair.rs`, 3× repeats)**: 1 KB body+headers: drain 23-25 ns vs index 11 ns (**~2.2×**); 8 KB: drain ~990 ns vs index ~143 ns (**~6.9×**); wire semantics byte-for-byte identical (same accepted prefixes, same BrokenPipe/Interrupted handling).
+- **Gates**: cz-hal tests green, workspace `-D warnings` clean, HTTP e2e phase2 11/11 incl keep-alive + streaming, host medians unchanged 57-59 (w6 not host-measurable — this is a device-side w6 win alongside H23/H24 frame gains and the condvar wake), no other call-site changes needed (signature kept; ownership unchanged).
+
 ### [Note] H26 audit: wide_index/lookup is NOT a hot site — linear scan must stay for dup-key semantics; no churn shipped (2026-11-20 01:42)
 - **Recall link**: `[Dead End] String<'js> zero-copy borrow` kept the audit off the JS boundary; `[Note] integer-ms floor` set the bar — a site must be provably hot at µs level before any memo/lock work.
 - **Measured audit**: object member `lookup` uses a LOCK-FREE linear fingerprint scan for count <= LINEAR_SCAN_MAX, which intentionally scans ALL children so duplicate keys resolve to the LAST occurrence (QuickJS overwrite semantics) — memoizing it would change semantics. The mutex wide-index branch only fires on handle creation traffic (tens-to-hundreds calls/run for w3/w4 fixtures, NOT millions like child_at). Micro-estimates put potential savings well under the floor; nothing was implemented or shipped.

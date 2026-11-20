@@ -558,13 +558,17 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn write_all_eof_free(stream: &mut TcpStream, mut bytes: Vec<u8>) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        match stream.write(&bytes) {
+fn write_all_eof_free(stream: &mut TcpStream, bytes: Vec<u8>) -> std::io::Result<()> {
+    // H27: offset advance instead of drain(..n) — drain memmoves the shrinking tail on every
+    // partial write (O(remaining)); an index is O(1). Byte-for-byte identical wire semantics.
+    let len = bytes.len();
+    let mut off = 0usize;
+    while off < len {
+        match stream.write(&bytes[off..]) {
             Ok(0) => return Err(std::io::Error::new(ErrorKind::BrokenPipe, "socket closed")),
             Ok(n) => {
                 // Advance past the accepted prefix (partial writes are fully handled).
-                let _ = bytes.drain(..n);
+                off += n;
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
