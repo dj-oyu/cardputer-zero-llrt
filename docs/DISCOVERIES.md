@@ -33,6 +33,8 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H66 instant duplicate close (pair pre-processed): condvar Genius => H50 live proof (:180/:221/:523) + H47 no-waits-to-wake classification; H33 div-8 => H60 anchor (:134) with divisor-sweep DONE bar + H28 amplification guard in force — functional tree still 5adfbb8/H43, proofs valid as-proven; fresh PASS 56 ms geoMean 7.29 best band; armed reopeners unchanged; zero churn.
+
 ### [Note] H65 instant duplicate close (pair pre-processed): H28 => H52 residue-free proof + permanent density-heuristic DO-NOT-ATTEMPT guard (restated H62); H49 => enumeration ownership fresh-suite-proven, builder boundary FINAL, kv-write target CLOSED-SUPERSEDED by H18 Record-peek (guard on record) — functional tree still 5adfbb8/H43 so all proofs valid as-proven; fresh PASS 58 ms geoMean 7.61; zero re-audit churn.
 - Pointer-only closure per protocol; armed reopeners unchanged (into_arc_slice ⇒ H19; device builder profile ⇒ H46 atom-cache/raw class; cross-recipe CFLAGS shadowing ⇒ H43). Nothing opened, nothing weakened, harness green before/after.
 
