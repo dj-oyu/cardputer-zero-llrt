@@ -1,0 +1,4 @@
+# Final Boss perf lever: raise QuickJS C build optimization beyond the default release mapping
+# for both host simulation and the aarch64 device cross-build (GCC/clang accept these flags).
+[env]
+CFLAGS = "-O3"

@@ -100,6 +100,13 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Note] `CFLAGS=-O3` for QuickJS C via repo .cargo/config.toml — host delta unresolved, shipped for device (2026-11-20 21:35)
+- **Recall link**: `[Useful]` profile-levers entry (Rust-side exhausted; QuickJS C build never tuned) + `[Note]` noise-floor judging discipline.
+- **Change**: new `.cargo/config.toml` `[env] CFLAGS = "-O3"` (cc crate ADDS env flags to its defaults; semantics untouched; applies to host sim AND the aarch64 cross workflow which runs cargo inside this repo).
+- **Host x86_64 (6 repeated medians)**: baseline band 60-61 -> with -O3 59-61 (mean ≈59.7 vs ≈60.3): ~1% = **within the integer-ms noise floor — NOT claimed as a host win**. w7 probe stayed 2 ms (host floor too coarse for interpreter gains). Full rebuild cost ~25 s once (C deps), hot builds stay ~0.48 s; one harness pass took 51 s for the Rust check step (dev-profile C deps rebuilt with the new env) — acceptable.
+- **Real A53 rationale**: QuickJS interpreter/dtoa/unicode C loops at -O3 (vs default mapping) should give small genuine device-side wins, esp. w7_js_core & w1; GCC/clang universally accept -O3; no LSE/atomic/SVE involvement. Cross-build itself NOT verifiable in this sandbox — flagged honestly.
+- **Takeaway**: if device CI shows any friction from CFLAGS, revert is trivial (delete `.cargo/config.toml`).
+
 ### [Useful] Thread-local reusable stringify scratch buffer (H16) (2026-11-20 21:10)
 - **Recall link**: the [Epic] entry's stringify-side residue (fresh `Vec<u8>` per call: w1 4,000×, w2 80×~12 KB, w5 2,000×, w6 responses) + [Note]'s repeated-run discipline; stayed wrapper-level safe (no raw refs — honoring the Dead End bar).
 - **Change**: `crates/cz-modules/src/json_module.rs` — `SCRATCH_OUT` thread-local `RefCell<Vec<u8>>`; lazy passthrough + kv-row branches reuse capacity via `with(|c| c.try_borrow_mut())`. Reentrant `JSON.stringify` from `toJSON` callbacks transparently falls back to a fresh Vec when already borrowed (`Err(_) => None` path), so no corruption/panic possible.
