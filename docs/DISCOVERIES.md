@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Dead End] H28 DOM-sink density hint — tiny-doc delta within noise but 7.5× med regression; reverted same-session (2026-11-20 02:15)
+- **Recall link**: tried porting the `[Insightful] fused arena exact-capacity` idea to the small-doc DOM sink under `[Note] floor` judgment via side-by-side µs bench.
+- **Mechanism flaw found by MEASUREMENT, not guesswork**: the Sink trait reports container counts only at `*_end`, so begin-time exact sizing is impossible; my fallback used a GLOBAL length/12 hint applied to EVERY nested container. For a 60-element doc of small objects that means ~180 containers each reserving ~48 slots — catastrophic over-reservation.
+- **A/B µs proof (`/tmp/domab` against two copied crate trees, 3× repeats)**: tiny single-object parse 297->272 ns (+8%, inside noise band); 60-member array-of-objects **10.0k -> 75.6k ns/op ≈ 7.5x WORSE**. Reverted via targeted `git checkout` (byte-exact restore), shipped state reconfirmed: phase5 e2e 4/4, w1 probe checksum identical 2182166261, medians back in 58-59 band.
+- **Durable rule recorded**: capacity hints must be scoped PER CONTAINER from parser-known counts; global input-density heuristics amplify in nested structures. Fused-arena win stays valid for the TAPE (one flat record stream) where reservation is genuinely one-time — it does NOT port to tree-shaped DOM sinks without end-count-before-begin plumbing.
+
 ### [Useful] H27 offset-advance socket writer replaces per-partial-write drain memmove (2026-11-20 01:58)
 - **Recall link**: `[Dead End] String<'js> zero-copy borrow` kept the win entirely std-side (no JS values); `[Note] integer-ms floor` routed judgment through a FAIR µs microbench after catching an unfair first draft (clone charged only to the drain side) — rerun charged both sides equally via black_box.
 - **Site & hypothesis**: `write_all_eof_free` (real reply send path) did `bytes.drain(..n)` per accepted prefix — O(remaining) tail memmove each partial write; an offset index is O(1). Hot on w6 replies over loopback/A53 where memcpy is slower.
