@@ -92,6 +92,14 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Host x86_64**: w4 probe parseOnly 12 -> 8-9 ms (full 10 -> 9 median); boss medians x3: w4 9/10/10 with total 66-72; the verifier gate passed at 100/100 including w4 verdict run.
 - **Real A53**: NEON ASCII check should pay off even more (in-order pipeline, byte-loop validation was costly); device re-measure pending.
 
+### [Note] Raw-C-API revisit measured after fixing ownership: only +4% on host — not shipped (2026-11-20 20:12)
+- **Recall link**: revisited the [Dead End] "Raw QuickJS C API object building" lesson with corrected ref rules discovered afterwards:
+  - `JS_SetPropertyStr` / `JS_SetPropertyInternal2` free `val` on ALL tails (`done:`/`fail:` in quickjs.c) — NO manual `JS_FreeValue` on error return (that was the original double-free crash).
+  - Atom from `JS_NewAtom`/`JS_SetPropertyStr`: stored into property shape on success without extra dup; `JS_DupAtom` extras handed to SetProperty leak; `JS_GetOwnProperty` returns an OWNED `desc.value` (wrap via `Value::from_raw`, RAII drop balances exactly — the shipped H5 fast-enumeration path follows this and GC-soaked clean 3× at ~239 KB stable heap, checksums identical).
+- **Change**: temporary micro-experiment (`tests/tmp_raw_micro.rs`, DELETED after measurement): safe builders (`Object::new`+`set`) vs raw corrected build (`JS_NewObject`+`JS_SetPropertyStr`+`JS_NewStringLen`+`JS_TRUE/FALSE`), 60k objects each + GC soak ×3 (60k objs churn + `rt.run_gc()`), zero crashes.
+- **Host x86_64**: safe 434.1 ns/obj vs raw 416.5 ns/obj = **ratio only 1.04×** — well under the noise-floor bar set by the [Note] integer-ms entry; shipping raw materialize would add unsafe complexity for no measurable host win. A53 in-order pipeline might see a bigger delta, but cannot be validated in this sandbox → keep safe builders as the authoritative path.
+- **Takeaway**: the original Dead End is now FULLY explained (double-free on error tail + atom over-ref), yet the corrected raw path still isn't worth it on host. Do NOT revisit raw object building again unless device profiling shows the builder itself dominating w3 there.
+
 ## Top-2 Tier Codebase Sweep (required for Epic/Nobel entries)
 
 ### Sweep: [Epic] "Nested lazy subtrees materialize once via native builders" — applied pattern audit (2026-11-20 19:40)
