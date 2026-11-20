@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H60 duplicate-recall closure: H33 div-8 anchor live (tape.rs:134 + corrected header H43) + H18 shared ROW_HANDLER/ROW_SYM intact (kv_module.rs :111/:121/:133/:136–139: target+tag only per row) — both classes empirically drift-free (fresh PASS 56 ms best band, w5 steady); follow-up classes remain barred (divisor sweep done H33; pooling identity-forbidden H38; trap specialization no remaining allocation pressure) (2026-11-20 08:15)
+- Recall links re-cited and re-anchored this pass in one grep — no restatement of original evidence. Round-2 edits touched neither surface; H46's semantics suite (TTL, delete visibility, cross-handle live reads, stringify-from-Record) covers the handler design and stayed green in every harness since.
+- Fresh verifier: totals **56 ms** TARGET_MET (best-of-session band), w1 9 / w2 8 / w3 23 / w4 7 / w5 7 / w7 2, checksums byte-exact all seeds.
+- Protocol honored: pointer closure, nothing opened, nothing weakened, zero churn.
+
 ### [Note] H59 recall closure: H15 + H17 anchor-verified live on current tree (array_offsets Arc tables :125/:307/:321; pre-size + is_ascii_fast :208/:366/:382; generic-walk scratch per H51 inventory) — sibling exhaustion (H39/H57) stands, fresh PASS 57 ms TARGET_MET, no re-litigation (2026-11-20 08:08)
 - **Recall links**: `[Insightful] O(1) array indexing (H15)` + `[Insightful] decode pre-size/ASCII fast path + generic-walk scratch (H17)`. Both shipped designs re-proven intact by line anchors post-Round-2 edits (H42 alias and H40 threshold touch neither structure); one-slot lock-free reader memo on the tables proven drift-free at H47; scratch three-site inventory completed at H51.
 - **Why nothing opens**: every H15/H17 follow-up class is closed with recorded evidence — number-token reserve regrow solved by div-8 (H33), serialize reservation cold (H39), lazy CoW fusion structurally moot (H57), escape writer loop floor-bound after H21 dead / H17 shipped, parse-side host cost now ~0.5 ms/iter near tape-scan floor (H44 split probes). Re-tuning any of these would replay barred churn classes.
