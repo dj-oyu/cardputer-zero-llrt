@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H26 audit: wide_index/lookup is NOT a hot site — linear scan must stay for dup-key semantics; no churn shipped (2026-11-20 01:42)
+- **Recall link**: `[Dead End] String<'js> zero-copy borrow` kept the audit off the JS boundary; `[Note] integer-ms floor` set the bar — a site must be provably hot at µs level before any memo/lock work.
+- **Measured audit**: object member `lookup` uses a LOCK-FREE linear fingerprint scan for count <= LINEAR_SCAN_MAX, which intentionally scans ALL children so duplicate keys resolve to the LAST occurrence (QuickJS overwrite semantics) — memoizing it would change semantics. The mutex wide-index branch only fires on handle creation traffic (tens-to-hundreds calls/run for w3/w4 fixtures, NOT millions like child_at). Micro-estimates put potential savings well under the floor; nothing was implemented or shipped.
+- **Also re-audited**: stringify output side already has exactly one NewStringLen copy; parse input side already single FFI conversion (post-borrow-revert state); materialized-child repeat reads are wrapper-cost bound and bounded by the H22 identity-cache Dead End. Position remains 57-58 ms medians with all gates green; this round's value is the explicit HOT-SITE map: child_at (millions ✓ memoized H25), registry doc(id) ✓, peek_store ✓, frame encode ✓ (µs-proven), lookup (cold-ish ✗ leave alone).
+
 ### [Useful] H25 lock-free one-slot reader memo for array child-offset tables (2026-11-20 01:25)
 - **Recall link**: `[Useful] one-slot registry memo` applied to its THIRD Rust-side site (`doc(id)` ✓, `peek_store` ✓, now `TapeDoc::child_at`); `[Note] integer-ms floor` routed judgment to a µs microbench against the real cz-json API.
 - **Hypothesis**: every indexed read through a lazy array paid an uncontended mutex + u32-hash map lookup (~1.6M times per w3 run). A thread-local `(token, arr, Arc<table>)` slot hit-checked BEFORE locking removes both.
