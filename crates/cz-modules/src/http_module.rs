@@ -844,7 +844,7 @@ mod http_module_tests {
     /// The HTTP registry is process-wide, so socket-level tests must run one at a time (Phase 1
     /// module tests do the same for env-var/global state): plain `cargo test` runs tests in
     /// parallel, which would otherwise interleave servers and queued requests.
-    fn http_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn http_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
@@ -1531,3 +1531,8 @@ mod http_module_tests {
         Ok(())
     }
 }
+
+// Test-only re-export so other #[cfg(test)] modules can serialize against the process-wide
+// HTTP registry (the same mutex the Phase 2 socket tests use).
+#[cfg(test)]
+pub(crate) use http_module_tests::http_test_lock;

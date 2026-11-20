@@ -1140,7 +1140,10 @@ mod module_tests {
 
     #[test]
     fn llrt_bridge_pump_hooks_idle_without_glue_and_after_http_import() {
-        let _lock = test_lock();
+        // Serialize against the HTTP socket tests: pumping the global dispatch loop while other
+        // contexts hold live listeners could steal their queued requests (same re-entry rule as
+        // next_active_request documents), so we take the shared HTTP test lock here.
+        let _lock = http_module::http_test_lock();
         http_module::close_all_servers();
         assert!(!has_active_http_servers(), "no servers before the scenario");
         let rt = Runtime::new().expect("rt");
