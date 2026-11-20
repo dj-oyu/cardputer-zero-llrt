@@ -340,6 +340,132 @@ declare module "cardputer:json" {
   export default czJson;
 }
 
+/** One 3-axis physical IMU reading (m/s^2, rad/s or µT depending on the sensor). */
+interface CzVec3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Snapshot from `cardputer:imu.read()`; missing sensors degrade to `null` fields. */
+interface CzImuReading {
+  /** False when no BMI270/BMM150 data could be read at all (missing IIO root included). */
+  available: boolean;
+  /** Accelerometer in m/s^2 (BMI270 `in_accel_*_raw * in_accel_scale`), or null. */
+  accel: CzVec3 | null;
+  /** Angular velocity in rad/s (BMI270 `in_anglvel_*_raw * in_anglvel_scale`), or null. */
+  gyro: CzVec3 | null;
+  /** Magnetic field in µT (BMM150 `in_magn_*_raw * in_magn_scale`), or null. */
+  mag: CzVec3 | null;
+}
+
+declare module "cardputer:imu" {
+  /** Sorted names of every IIO device found under `CARDPUTER_IIO_DIR` (default `/sys/bus/iio/devices`). */
+  export function devices(): string[];
+  /** Read accel/gyro/mag with `raw * scale` conversions; never throws on missing hardware. */
+  export function read(): CzImuReading;
+
+  const imu: {
+    devices: typeof devices;
+    read: typeof read;
+  };
+  export default imu;
+}
+
+declare module "cardputer:audio" {
+  /**
+   * Synthesize a pure-Rust 44.1 kHz, 16-bit signed LE mono RIFF/WAVE sine wave (44-byte header +
+   * `sampleCount * 2` bytes). `freqHz` clamps to 20..20000, `durationMs` to 1..10000 and
+   * `volume` to 0..1 (default 0.5).
+   */
+  export function generateWav(freqHz: number, durationMs: number, volume?: number): Uint8Array;
+
+  /**
+   * Play a tone. When `CARDPUTER_AUDIO_OUT` points at a file the WAV bytes are written there
+   * deterministically; otherwise `pw-play` (with an `XDG_RUNTIME_DIR=/run/user/1000` fallback) or
+   * `aplay` is invoked. Returns whether playback succeeded.
+   */
+  export function beep(freqHz: number, durationMs: number, volume?: number): boolean;
+
+  /** Replay a WAV file from disk (must exist and start with "RIFF"); returns success. */
+  export function playWav(path: string): boolean;
+
+  const audio: {
+    generateWav: typeof generateWav;
+    beep: typeof beep;
+    playWav: typeof playWav;
+  };
+  export default audio;
+}
+
+/** Frame decoded from NEC timings (`cardputer:ir.decodeNec`). */
+interface CzNecFrame {
+  address: number;
+  command: number;
+  /** True only when both complements match AND every timing sits inside the ±25% window. */
+  valid: boolean;
+}
+
+declare module "cardputer:ir" {
+  /**
+   * Encode one NEC frame: leader `9000`/`4500`, 32 LSB-first bits (`addr`, `~addr`, `cmd`,
+   * `~cmd`) as `562 µs` pulses with `562`/`1687 µs` spaces, plus a `562 µs` trailing pulse —
+   * exactly 67 values ending on a pulse (Linux `LIRC_MODE_PULSE`).
+   */
+  export function encodeNec(address: number, command: number): Uint32Array;
+
+  /** Decode NEC timings (±25% tolerance); null for unusable/short streams or a bad leader. */
+  export function decodeNec(pulses: Uint32Array | number[]): CzNecFrame | null;
+
+  /** Write little-endian `u32` timings to `CARDPUTER_IR_TX_PATH` (default `/dev/lirc0`); returns count. */
+  export function sendRaw(pulses: Uint32Array | number[]): number;
+
+  /** Encode an NEC frame and transmit it; returns the number of timings written. */
+  export function sendNec(address: number, command: number): number;
+
+  const ir: {
+    encodeNec: typeof encodeNec;
+    decodeNec: typeof decodeNec;
+    sendRaw: typeof sendRaw;
+    sendNec: typeof sendNec;
+  };
+  export default ir;
+}
+
+/** Port discovery result from `cardputer:io.listPorts()` (each list sorted). */
+interface CzIoPorts {
+  /** Character devices matching `i2c-*`. */
+  i2c: string[];
+  /** Devices matching `spidev*`. */
+  spi: string[];
+  /** GPIO chips matching `gpiochip*`. */
+  gpio: string[];
+  /** UART nodes matching `ttyS*`, `ttyAMA*` or `serial*`. */
+  uart: string[];
+}
+
+declare module "cardputer:io" {
+  /** Enumerate safe ports under `CARDPUTER_DEV_DIR` (default `/dev`); missing dir yields empties. */
+  export function listPorts(): CzIoPorts;
+
+  /** True for reserved addresses that MUST NOT be written (`0x55` = onboard BQ27220 gauge). */
+  export function isReservedI2cAddr(addr: number): boolean;
+
+  /** Write a string or byte payload to a UART/device path; returns the bytes written. */
+  export function uartWrite(devicePath: string, data: string | Uint8Array): number;
+
+  /** Read up to `maxBytes` (clamped to 0..65536) from a UART/device path. */
+  export function uartRead(devicePath: string, maxBytes?: number): Uint8Array;
+
+  const io: {
+    listPorts: typeof listPorts;
+    isReservedI2cAddr: typeof isReservedI2cAddr;
+    uartWrite: typeof uartWrite;
+    uartRead: typeof uartRead;
+  };
+  export default io;
+}
+
 /** Bound socket address reported by `server.address()` (null before listen / after close). */
 interface CzServerAddress {
   /** Wildcard bind means external peers (e.g. Tailscale) can connect. */

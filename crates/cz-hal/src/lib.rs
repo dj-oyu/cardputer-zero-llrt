@@ -9,6 +9,10 @@
 //! - `CARDPUTER_KEYMAP_PATH` — TCA8418C keymap file (built-in 32 symbol Sym table fallback)
 //! - `CARDPUTER_CONFIG_PATH` — APPLaunch `config.json` (`$HOME/.config/cardputerzero/config.json`)
 //! - `CARDPUTER_POWER_DIR` — BQ27220 battery sysfs directory
+//! - `CARDPUTER_IIO_DIR` — IIO device root for the IMU (`/sys/bus/iio/devices`)
+//! - `CARDPUTER_AUDIO_OUT` — deterministic WAV file sink for audio playback (unset -> pw-play/aplay)
+//! - `CARDPUTER_IR_TX_PATH` — LIRC transmit device (`/dev/lirc0`)
+//! - `CARDPUTER_DEV_DIR` — device directory scanned for i2c/spi/gpio/uart ports (`/dev`)
 //!
 //! [`http`] is transport-agnostic HTTP/1.1 protocol code (request parser, chunked decoding, the
 //! 1 MiB body cap and response serialization) used by the `node:http` module in `cz-modules`.
@@ -22,8 +26,12 @@ pub mod config;
 pub mod fb;
 pub mod http;
 pub mod http_server;
+pub mod imu;
 pub mod input;
+pub mod io;
+pub mod ir;
 pub mod kv;
+pub mod audio;
 pub mod power;
 
 /// Non-empty environment variable as a string, `None` when unset or empty.

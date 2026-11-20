@@ -115,7 +115,8 @@ patch_llrt_modules_cargo() {
 }
 
 # ---------------------------------------------------------------------------
-# 4) llrt_modules/src/module_builder.rs — register the six Cardputer modules via ModuleInfo
+# 4) llrt_modules/src/module_builder.rs — register every Cardputer module via ModuleInfo
+#    (display, input, app, power, kv, json plus the Phase 6A peripherals imu/audio/ir/io).
 # ---------------------------------------------------------------------------
 patch_module_builder() {
     local mb="$TARGET_DIR/llrt_modules/src/module_builder.rs"
@@ -129,12 +130,21 @@ patch_module_builder() {
     // cardputer-zero: module registrations (cz-modules) — gated by the default `cardputer` feature.
     #[cfg(feature = "cardputer")]
     {
-        use cz_modules::{AppModule, DisplayModule, HttpModule, InputModule, KvModule, PowerModule};
+        use cz_modules::{
+            AppModule, AudioModule, DisplayModule, HttpModule, ImuModule, InputModule, IoModule,
+            IrModule, JsonModule, KvModule, PowerModule,
+        };
         builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:display", DisplayModule));
         builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:input", InputModule));
         builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:app", AppModule));
         builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:power", PowerModule));
         builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:kv", KvModule));
+        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:json", JsonModule));
+        // Phase 6A peripheral hardware modules (IIO IMU, PCM audio, NEC/LIRC IR, port + UART).
+        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:imu", ImuModule));
+        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:audio", AudioModule));
+        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:ir", IrModule));
+        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:io", IoModule));
         builder = builder.with_module(llrt_utils::module::ModuleInfo::new("http", HttpModule));
     }
 CZBLOCK
@@ -172,12 +182,20 @@ verify_apply() {
     [ "$dep_n" -eq 1 ] || { echo "FAIL: cz-modules dependency appears $dep_n times (want exactly 1)" >&2; exit 1; }
     grep -q '^cardputer = \["dep:cz-modules"\]' "$tom" || { echo "FAIL: cardputer feature definition missing" >&2; exit 1; }
     grep -qE '^default.*"cardputer"' "$tom" || { echo "FAIL: cardputer not enabled in default features" >&2; exit 1; }
-    for sym in DisplayModule InputModule AppModule PowerModule KvModule HttpModule; do
+    for sym in DisplayModule InputModule AppModule PowerModule KvModule JsonModule HttpModule \
+              ImuModule AudioModule IrModule IoModule; do
         grep -q "$sym" "$mb" || { echo "FAIL: module_builder.rs missing $sym" >&2; exit 1; }
+    done
+    # Each specifier must appear exactly once (re-runs never duplicate registrations).
+    for spec in cardputer:display cardputer:input cardputer:app cardputer:power cardputer:kv \
+                cardputer:json cardputer:imu cardputer:audio cardputer:ir cardputer:io; do
+        local spec_n
+        spec_n="$(grep -cF "ModuleInfo::new(\"$spec\"" "$mb" || true)"
+        [ "$spec_n" -eq 1 ] || { echo "FAIL: $spec registered $spec_n times (want exactly 1)" >&2; exit 1; }
     done
     grep -qF '// cardputer-zero: module registrations (cz-modules)' "$mb" || {
         echo "FAIL: module_builder.rs registration marker missing" >&2; exit 1; }
-    echo "[build-llrt-a53] patches verified OK in $TARGET_DIR (LSE removed, cortex-a53 active, cz-modules wired, 6 modules registered)"
+    echo "[build-llrt-a53] patches verified OK in $TARGET_DIR (LSE removed, cortex-a53 active, cz-modules wired, all 10 Cardputer modules + http alias registered)"
 }
 
 apply_patches() {

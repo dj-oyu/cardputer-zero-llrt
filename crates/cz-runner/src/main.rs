@@ -1,6 +1,12 @@
 //! `cz-js` — Cardputer Zero LLRT CLI runner for plain ES modules (no bundler, no
-//! `node_modules`). Supports `cardputer:*` builtin modules plus relative file imports
-//! (`./hud.mjs`) directly from disk.
+//! `node_modules`). Supports every `cardputer:*` builtin (display, input, app, power, kv, json
+//! plus the Phase 6A peripherals imu/audio/ir/io), Node-style `node:http`/`http` and
+//! `node:fs`/`fs`, and relative file imports (`./hud.mjs`) resolved straight from disk.
+//!
+//! Builtin registration is delegated to `cz_modules::resolve_builtin` / `declare_builtin`: one
+//! `ModuleKind` per specifier, so a new module only needs registering once inside `cz-modules`
+//! (the runner resolves it automatically). The `peripheral_hw_modules_...` test below proves the
+//! Phase 6A specifiers actually resolve and evaluate through this runner's loader.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -426,6 +432,59 @@ mod runner_tests {
             eval_module(&ctx, "inline.mjs", src).expect("eval should pass");
             let ok: bool = ctx.globals().get("__ok").unwrap();
             assert!(ok);
+        });
+    }
+
+    #[test]
+    fn peripheral_hw_modules_resolve_and_evaluate_through_the_runner_loader() {
+        // Registration proof for cardputer:imu / audio / ir / io inside the real cz-js loader:
+        // named + default exports must resolve without any env-var overrides present.
+        let rt = Runtime::new().unwrap();
+        rt.set_loader(CzResolver::new(), CzLoader::new());
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            bind_console(&ctx).unwrap();
+            let src = r#"
+                import * as imu from "cardputer:imu";
+                import imuDef from "cardputer:imu";
+                import * as audio from "cardputer:audio";
+                import * as ir from "cardputer:ir";
+                import * as io from "cardputer:io";
+                if (typeof imu.devices !== "function" || typeof imuDef.read !== "function") {
+                    throw new Error("imu surface");
+                }
+                const r = imu.read();
+                if (typeof r.available !== "boolean") throw new Error("imu read type");
+                const wav = audio.generateWav(440, 20, 0.5);
+                if (!(wav instanceof Uint8Array) || wav.length !== 44 + 882 * 2) {
+                    throw new Error("wav shape " + wav.length);
+                }
+                if (typeof audio.beep !== "function" || typeof audio.playWav !== "function") {
+                    throw new Error("audio surface");
+                }
+                const pulses = ir.encodeNec(0x01, 0x02);
+                if (!(pulses instanceof Uint32Array) || pulses.length !== 67) throw new Error("nec len");
+                const dec = ir.decodeNec(pulses);
+                if (!dec || !dec.valid) throw new Error("nec decode");
+                if (typeof ir.sendRaw !== "function" || typeof ir.sendNec !== "function") {
+                    throw new Error("ir tx surface");
+                }
+                const ports = io.listPorts();
+                for (const k of ["i2c", "spi", "gpio", "uart"]) {
+                    if (!Array.isArray(ports[k])) throw new Error("ports." + k + " must be an array");
+                }
+                if (io.isReservedI2cAddr(0x55) !== true || io.isReservedI2cAddr(0x10) !== false) {
+                    throw new Error("reserved guard");
+                }
+                if (typeof io.uartWrite !== "function" || typeof io.uartRead !== "function") {
+                    throw new Error("uart surface");
+                }
+                console.log("P6_HW_OK");
+                globalThis.__p6 = true;
+            "#;
+            eval_module(&ctx, "inline_p6.mjs", src).expect("peripheral module eval");
+            let ok: bool = ctx.globals().get("__p6").unwrap();
+            assert!(ok, "Phase 6A peripherals must evaluate");
         });
     }
 

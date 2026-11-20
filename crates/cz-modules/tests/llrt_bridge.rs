@@ -1,25 +1,38 @@
-//! Black-box integration tests for the Phase 4A LLRT v0.10.0-beta integration surface exported
-//! by `cz_modules`: root-level `ModuleDef` re-exports, `CARDPUTER_MODULE_NAMES`,
-//! `pump_llrt_http`, and `has_active_http_servers`.
+//! Black-box integration tests for the LLRT v0.10.0-beta integration surface exported by
+//! `cz_modules`: root-level `ModuleDef` re-exports, `CARDPUTER_MODULE_NAMES`, `pump_llrt_http`,
+//! and `has_active_http_servers`. Phase 6A adds the peripheral modules (imu, audio, ir, io).
 
 use rquickjs::{Context, Module, Runtime};
 
 #[test]
-fn llrt_public_defs_register_all_eight_modules_end_to_end() {
+fn llrt_public_defs_register_all_twelve_modules_end_to_end() {
     // Every struct is importable at the crate ROOT (not just through submodules) and can be
-    // declared + evaluated like any LLRT ModuleDef inside a fresh runtime (Phase 5 adds json).
+    // declared + evaluated like any LLRT ModuleDef inside a fresh runtime.
     use cz_modules::{
-        AppModule, CARDPUTER_MODULE_NAMES, DisplayModule, FsModule, HttpModule, InputModule,
-        JsonModule, KvModule, ModuleKind, PowerModule, resolve_builtin,
+        AppModule, AudioModule, CARDPUTER_MODULE_NAMES, DisplayModule, FsModule, HttpModule,
+        ImuModule, InputModule, IoModule, IrModule, JsonModule, KvModule, ModuleKind, PowerModule,
+        resolve_builtin,
     };
 
-    assert_eq!(CARDPUTER_MODULE_NAMES.len(), 6);
+    assert_eq!(CARDPUTER_MODULE_NAMES.len(), 10);
     assert!(CARDPUTER_MODULE_NAMES.contains(&"cardputer:display"));
     assert!(CARDPUTER_MODULE_NAMES.contains(&"cardputer:kv"));
     assert!(CARDPUTER_MODULE_NAMES.contains(&"cardputer:json"));
+    for p6 in [
+        "cardputer:imu",
+        "cardputer:audio",
+        "cardputer:ir",
+        "cardputer:io",
+    ] {
+        assert!(CARDPUTER_MODULE_NAMES.contains(&p6), "missing {p6}");
+    }
     assert_eq!(resolve_builtin("node:http"), Some(ModuleKind::Http));
     assert_eq!(resolve_builtin("fs"), Some(ModuleKind::Fs));
     assert_eq!(resolve_builtin("cardputer:json"), Some(ModuleKind::Json));
+    assert_eq!(resolve_builtin("cardputer:imu"), Some(ModuleKind::Imu));
+    assert_eq!(resolve_builtin("cardputer:audio"), Some(ModuleKind::Audio));
+    assert_eq!(resolve_builtin("cardputer:ir"), Some(ModuleKind::Ir));
+    assert_eq!(resolve_builtin("cardputer:io"), Some(ModuleKind::Io));
 
     let rt = Runtime::new().expect("runtime");
     let ctx = Context::full(&rt).expect("context");
@@ -30,6 +43,10 @@ fn llrt_public_defs_register_all_eight_modules_end_to_end() {
         Module::declare_def::<PowerModule, _>(c.clone(), "cardputer:power").expect("power");
         Module::declare_def::<KvModule, _>(c.clone(), "cardputer:kv").expect("kv");
         Module::declare_def::<JsonModule, _>(c.clone(), "cardputer:json").expect("json");
+        Module::declare_def::<ImuModule, _>(c.clone(), "cardputer:imu").expect("imu");
+        Module::declare_def::<AudioModule, _>(c.clone(), "cardputer:audio").expect("audio");
+        Module::declare_def::<IrModule, _>(c.clone(), "cardputer:ir").expect("ir");
+        Module::declare_def::<IoModule, _>(c.clone(), "cardputer:io").expect("io");
         Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http");
         Module::declare_def::<FsModule, _>(c.clone(), "node:fs").expect("fs");
         let p = Module::evaluate(
@@ -44,6 +61,14 @@ fn llrt_public_defs_register_all_eight_modules_end_to_end() {
             import * as czJson from "cardputer:json";
             import * as http from "node:http";
             import * as fs from "node:fs";
+            import * as imu from "cardputer:imu";
+            import imuDef from "cardputer:imu";
+            import * as audioMod from "cardputer:audio";
+            import audioDef from "cardputer:audio";
+            import * as irMod from "cardputer:ir";
+            import irDef from "cardputer:ir";
+            import * as ioMod from "cardputer:io";
+            import ioDef from "cardputer:io";
             if (display.WIDTH !== 320 || display.HEIGHT !== 170) throw new Error("display dims");
             if (typeof input.poll !== "function") throw new Error("input.poll");
             if (typeof app.memoryUsage !== "function") throw new Error("app.memoryUsage");
@@ -56,6 +81,37 @@ fn llrt_public_defs_register_all_eight_modules_end_to_end() {
             if (typeof czJson.parseLazy !== "function" || typeof czJson.isLazy !== "function" || typeof czJson.lazyStats !== "function") throw new Error("json shape");
             const lazy = czJson.parseLazy('{"a":1}');
             if (!czJson.isLazy(lazy) || lazy.a !== 1) throw new Error("json lazy handle");
+
+            // Phase 6A peripherals: every named export AND the default object must be live.
+            const needP6 = [
+                [imu, imuDef, ["devices", "read"]],
+                [audioMod, audioDef, ["generateWav", "beep", "playWav"]],
+                [irMod, irDef, ["encodeNec", "decodeNec", "sendRaw", "sendNec"]],
+                [ioMod, ioDef, ["listPorts", "isReservedI2cAddr", "uartWrite", "uartRead"]],
+            ];
+            for (const [ns, def, names] of needP6) {
+                for (const n of names) {
+                    if (typeof ns[n] !== "function") throw new Error("named " + n + " missing");
+                    if (typeof def[n] !== "function") throw new Error("default " + n + " missing");
+                }
+            }
+            if (typeof imu.read().available !== "boolean") throw new Error("imu read shape");
+            const wav = audioMod.generateWav(440, 40, 0.5);
+            if (!(wav instanceof Uint8Array) || wav.length !== 44 + 1764 * 2) {
+                throw new Error("audio wav shape " + wav.length);
+            }
+            const pulses = irMod.encodeNec(0x04, 0x08);
+            if (!(pulses instanceof Uint32Array) || pulses.length !== 67) throw new Error("nec shape");
+            const dec = irMod.decodeNec(pulses);
+            if (!dec || dec.valid !== true || dec.address !== 0x04 || dec.command !== 0x08) {
+                throw new Error("nec roundtrip " + JSON.stringify(dec));
+            }
+            const ports = ioMod.listPorts();
+            if (!Array.isArray(ports.i2c) || !Array.isArray(ports.spi)
+                || !Array.isArray(ports.gpio) || !Array.isArray(ports.uart)) {
+                throw new Error("io ports shape " + JSON.stringify(ports));
+            }
+            if (ioMod.isReservedI2cAddr(0x55) !== true) throw new Error("BQ27220 guard");
             globalThis.__R = "LLRT_BRIDGE_ALL_OK";
             "#,
         )

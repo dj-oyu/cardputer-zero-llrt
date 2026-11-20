@@ -19,8 +19,12 @@ use cz_hal::fb::Framebuffer;
 use cz_hal::input::{InputState, KeyEvent as HalKeyEvent, Mods};
 use cz_hal::power::PowerStatus;
 
+pub mod audio_module;
 pub mod fs_module;
 pub mod http_module;
+pub mod imu_module;
+pub mod io_module;
+pub mod ir_module;
 pub mod json_module;
 pub mod kv_module;
 
@@ -31,13 +35,18 @@ pub mod kv_module;
 // Re-export every builtin `rquickjs::module::ModuleDef` struct at the crate root so an LLRT
 // fork (`llrt_modules`) can register them directly via `llrt_utils::module::ModuleInfo` without
 // reaching into submodules.
+pub use audio_module::AudioModule;
 pub use fs_module::FsModule;
 pub use http_module::HttpModule;
+pub use imu_module::ImuModule;
+pub use io_module::IoModule;
+pub use ir_module::IrModule;
 pub use json_module::{install_json, JsonModule};
 pub use kv_module::KvModule;
 
-/// Every Cardputer module specifier the LLRT bridge exposes (display, input, app, power, kv).
-/// HTTP/FS ride the Node-style specifiers listed in [`MODULE_NAMES`].
+/// Every Cardputer module specifier the LLRT bridge exposes (display, input, app, power, kv,
+/// json plus the Phase 6A peripherals: imu, audio, ir, io). HTTP/FS ride the Node-style
+/// specifiers listed in [`MODULE_NAMES`].
 pub const CARDPUTER_MODULE_NAMES: &[&str] = &[
     "cardputer:display",
     "cardputer:input",
@@ -45,6 +54,10 @@ pub const CARDPUTER_MODULE_NAMES: &[&str] = &[
     "cardputer:power",
     "cardputer:kv",
     "cardputer:json",
+    "cardputer:imu",
+    "cardputer:audio",
+    "cardputer:ir",
+    "cardputer:io",
 ];
 
 /// True when at least one `node:http` server is currently listening. Embedders (e.g. `llrt_core`
@@ -94,6 +107,11 @@ pub const MODULE_NAMES: &[&str] = &[
     "cardputer:app",
     "cardputer:power",
     "cardputer:kv",
+    "cardputer:json",
+    "cardputer:imu",
+    "cardputer:audio",
+    "cardputer:ir",
+    "cardputer:io",
     "node:http",
     "http",
     "node:fs",
@@ -111,6 +129,10 @@ pub enum ModuleKind {
     Fs,
     Kv,
     Json,
+    Imu,
+    Audio,
+    Ir,
+    Io,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -125,6 +147,10 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "node:fs" | "fs" => Some(ModuleKind::Fs),
         "cardputer:kv" => Some(ModuleKind::Kv),
         "cardputer:json" => Some(ModuleKind::Json),
+        "cardputer:imu" => Some(ModuleKind::Imu),
+        "cardputer:audio" => Some(ModuleKind::Audio),
+        "cardputer:ir" => Some(ModuleKind::Ir),
+        "cardputer:io" => Some(ModuleKind::Io),
         _ => None,
     }
 }
@@ -144,6 +170,10 @@ pub fn declare_builtin<'js>(
         ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
         ModuleKind::Kv => rquickjs::Module::declare_def::<kv_module::KvModule, _>(ctx.clone(), name),
         ModuleKind::Json => rquickjs::Module::declare_def::<json_module::JsonModule, _>(ctx.clone(), name),
+        ModuleKind::Imu => rquickjs::Module::declare_def::<imu_module::ImuModule, _>(ctx.clone(), name),
+        ModuleKind::Audio => rquickjs::Module::declare_def::<audio_module::AudioModule, _>(ctx.clone(), name),
+        ModuleKind::Ir => rquickjs::Module::declare_def::<ir_module::IrModule, _>(ctx.clone(), name),
+        ModuleKind::Io => rquickjs::Module::declare_def::<io_module::IoModule, _>(ctx.clone(), name),
     }
 }
 
@@ -1117,8 +1147,8 @@ mod module_tests {
 
     #[test]
     fn cardputer_module_names_cover_every_cardputer_builtin_surface() {
-        // Public const surface for the LLRT fork integration (Phase 5 adds cardputer:json).
-        assert_eq!(CARDPUTER_MODULE_NAMES.len(), 6);
+        // Public const surface for the LLRT fork integration (Phase 6A adds imu/audio/ir/io).
+        assert_eq!(CARDPUTER_MODULE_NAMES.len(), 10);
         for n in [
             "cardputer:display",
             "cardputer:input",
@@ -1126,6 +1156,10 @@ mod module_tests {
             "cardputer:power",
             "cardputer:kv",
             "cardputer:json",
+            "cardputer:imu",
+            "cardputer:audio",
+            "cardputer:ir",
+            "cardputer:io",
         ] {
             assert!(CARDPUTER_MODULE_NAMES.contains(&n), "missing {n}");
             assert!(resolve_builtin(n).is_some(), "{n} must resolve to a builtin kind");
@@ -1140,6 +1174,10 @@ mod module_tests {
             Module::declare_def::<PowerModule, _>(c.clone(), "cardputer:power").expect("power");
             Module::declare_def::<KvModule, _>(c.clone(), "cardputer:kv").expect("kv");
             Module::declare_def::<JsonModule, _>(c.clone(), "cardputer:json").expect("json");
+            Module::declare_def::<ImuModule, _>(c.clone(), "cardputer:imu").expect("imu");
+            Module::declare_def::<AudioModule, _>(c.clone(), "cardputer:audio").expect("audio");
+            Module::declare_def::<IrModule, _>(c.clone(), "cardputer:ir").expect("ir");
+            Module::declare_def::<IoModule, _>(c.clone(), "cardputer:io").expect("io");
             Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http");
             Module::declare_def::<FsModule, _>(c.clone(), "node:fs").expect("fs");
         });
