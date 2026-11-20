@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H47 health recall: H25 lock-free memo trio intact post-Round-2; H30 zero-polling verified by classification sweep (all sleeps test-region, no spin/yield anywhere) (2026-11-20 06:35)
+- **Recall links**: `[Useful] H25 one-slot reader memo` + `[Note] H30 zero production polling sleeps`. Audit-only round per protocol — nothing legitimately open.
+- **H25 integrity**: token infrastructure live (`doc_token()` monotonic AtomicUsize, key includes token at tape.rs:24 + slot doc at :23/:295) ⇒ identity-domain rule still enforced post-H42/H43; w3 band (H46) already proves `child_at` hot path unchanged. The per-build Relaxed `fetch_add` is ONE exclusive pair per document parse — proven compliant in the shipped a53 binary gate (LSE=40, RCpc=0 recorded Round 1), so no atomic-budget concern.
+- **H30 integrity (objective classification sweep)**: every `std::thread::sleep` in all crates' src sits under `#[cfg(test)]`/`mod tests` regions (awk nearest-anchor pass); `spin_loop`/`yield_now`/busy-poll grep = ZERO occurrences production-side ⇒ condvar `idle_wait` + ReplyBox wake still cover every device pause; Round-2 edits (H40 threshold, H42 alias, comments) added no waits whatsoever.
+- **New-candidate scan for H25 transplant**: Rust-side hot read sites created since H25: none (no new registries introduced in Round 2). Verdict = audit complete; harness stayed green (medians H46 band); nothing weakened.
+
 ### [Note] H46 Epic-pattern integrity recall: materialize-once gates verified intact post-H42/H43 (w3 band 24-25 stable), atom-cache builder idea logged under the recorded +4% bar (no churn) (2026-11-20 06:28)
 - **Recall links**: `[Epic] Nested lazy subtrees materialize once` + governance-rule checkpoint. Purpose = drift audit of the session's biggest win after Round-2 edits, per protocol.
 - **Integrity proof (code + measurements)**: `got_to_js` parent-gate (`parent == 0 || !subtree_is_clean` → Proxy path; else `materialize_native`) unchanged at json_module.rs:451–483; boss medians ×3 on current tree: totals **57/59/60 ms**, w3 **24/24/25** (baseline 60 ⇒ -58...60%, Epic-era band preserved), all FNV checksums byte-exact every seed, 3-seed anti-cheat PASS each run ⇒ Epic pattern NOT drifted by H40 GC-threshold / H42 alias / H43 comment edits.
