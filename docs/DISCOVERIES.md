@@ -33,6 +33,13 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Dead End] H22 JS-side child identity memo (Map per lazy handle) — regressed w3; second boundary case for handle-caching patterns (2026-11-20 00:28)
+- **Recall link**: synergy of `[Epic]` materialization (churn class) + `[Useful] raw enumeration` (stable wrappers idea); judged under `[Note]` integer-ms floor.
+- **Hypothesis**: caching object-typed children in a JS Map inside the handle closure would skip FFI+wrap on repeat reads with stable identity.
+- **Semantics first**: identity stabilization verified (`doc.meta===doc.meta` true), CoW readback+reserialize ✓, byte-exact passthrough ✓, strings untouched, phase5 e2e 4/4. Two probe failures were MY harness bugs (reading `.a` on `{b:2}` and a loop bound past length) — caught by re-inspecting fixture data, not code, honoring `[Note]` rigor before touching code.
+- **Measured regression (repeats)**: w3 parse_handles 25-27 -> **30-32**, full 23-24 -> **31-32**. Root cause: workloads that create ~20k SHORT-LIVED child handles per pass get zero repeat-read hits while paying per-handle Map allocation + retention/GC pressure. Boundary lesson (extends trap/handle rule): per-handle caches pay ONLY when the SAME handle is read repeatedly; for creation-dominated streams use Rust-side materialization (Epic, already shipped) instead.
+- **Cleanup**: targeted `git checkout` restore (tree was clean at HEAD ⇒ byte-exact); shipped state reconfirmed w3 probe full=24, gc_soak stable, phase5 4/4, medians back to 59-60 band; no JS-value cache shipped anywhere (consistent with symbol-memo Dead End).
+
 ### [Note] Convergence checkpoint: all host-visible structural levers spent; stable band 57-59 ms (-44..46%) (2026-11-20 00:10)
 - **Recall link**: `[Insightful] fused Tape arena` re-audited — NodeRec is exactly 16 B `#[repr(C)]` POD and reserve is capacity-matched; packing below 16 B would force unaligned loads on Cortex-A53 (in-order, penalized) with no host-verifiable upside ⇒ rejected on hardware grounds, honoring `[Note] integer-ms floor`.
 - **Full-site re-audit conclusions**: registry memo ✓ spent (KV row path already store-level-native, hash only in open/drop); stringify escape writers re-tested (H21 no win, reverted); zero-second-copy arena blocked by std (H19); shared-handler boundary mapped (root singletons lose, creation-heavy sites won); symbol-memo unsafe-by-construction; profile knobs maxed legitimately (fat LTO, codegen-units=1, additive CFLAGS; `target-cpu=native` rejected as measurement manipulation, `panic="abort"` forbidden by runner semantics).
