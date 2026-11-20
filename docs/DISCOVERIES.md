@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H32 memo-trio health check — doc(id)/peek_store/child_at all drift-free after HTTP ships (2026-11-20 03:18)
+- **Recall link**: `[Useful] registry memo` + `[Useful] raw enumeration` re-audited with live µs benches instead of new churn; integer medians CANNOT see regressions of a few ns/op, so benches were rerun against current code (honoring `[Note] floor`).
+- **Results vs original proofs**: `doc(id)` memo-hit 3 ns/op vs thrash 9 ns (**3.5x**, stable=true); `peek_store` 5 vs 25 ns (**5.0x**); `child_at` same-doc 2 vs mutex+hash 15 ns (**5.6x**) — identical to the shipped-era numbers ⇒ no drift from H23/H24/H27 edits.
+- **One bench-side bug self-caught**: first h32 fixture concatenated filler AFTER the JSON close brace (“Unexpected trailing characters”) — fixed by embedding pad inside the object; harness artifact, not engine behavior.
+- **Enumeration audit re-confirmed in same round (H31)**: ownership-correct fast path intact. Nothing shipped this round — all cited surfaces verified optimal or bounded.: raw-enumeration fast path still intact & ownership-correct post-all-edits (2026-11-20 03:02)
 ### [Note] H31 re-audit: raw-enumeration fast path still intact & ownership-correct post-all-edits (2026-11-20 03:02)
 - **Recall link**: `[Useful] raw enumeration` + `[Note] raw-C-API revisit` asked whether either surface drifted after the H23–H27 ships. Verified in-place, no code changed this round.
 - **Invariant checklist confirmed in walk_json fast path**: JS_GetOwnPropertyNames with STRING_MASK|ENUM_ONLY; per-member JS_GetOwnProperty; `desc.value` freed on BOTH skip branches (getset-flag filter and vanishing types) and otherwise wrapped via `Value::from_raw` RAII — exactly the settled ownership table from the revisit post-mortem; atoms handed to enumeration consumed per original protocol.
