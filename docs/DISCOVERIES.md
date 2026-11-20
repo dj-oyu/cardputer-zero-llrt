@@ -33,6 +33,9 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H68 instant duplicate close with quantified residual: Symbol-staleness Dead End is SAFE-BY-DESIGN in shipped code (JS-side `Symbol.for` constants are runtime-scoped by QuickJS itself — json shim :39 LAZY, kv :136 ROW_SYM; zero Rust-level JS-value storage exists), and remaining Rust `Symbol::new_global` tag sites :323/:343 fire only on handle creation ≈15 roots + 50 setup rows/run ⇒ cold, permanently below floor; String-borrow Dead End premise already corrected+shipped at H42 (call-scoped CString RAII, rule-consistent per H45/H49) — tree still 5adfbb8/H43 ⇒ valid as-proven; armed reopeners unchanged; zero churn.
+- Guards restated: Rust-side symbol caches stay DOA (identity-domain class), further alias expansion closed by H44 hot-site map. Fresh PASS sustained best band 56 ms; nothing opened, nothing weakened.
+
 ### [Note] H67 instant duplicate close: raw-C-API revisit (+4% host ⇒ not-shipped verdict FINAL via H35/H37/H45/H49 consumption chain; sanctioned surfaces = reads + one-shot creation only; reopener armed = device builder-dominance profile, with H46 atom-cache design pre-staged for that round) ; H27 COMPLETE/N-A per H50 reader scan + H63 anchors (:668–680 intact) — functional tree still 5adfbb8/H43 ⇒ proofs valid as-proven; fresh PASS 56 ms geoMean 7.39; zero churn.
 
 ### [Note] H66 instant duplicate close (pair pre-processed): condvar Genius => H50 live proof (:180/:221/:523) + H47 no-waits-to-wake classification; H33 div-8 => H60 anchor (:134) with divisor-sweep DONE bar + H28 amplification guard in force — functional tree still 5adfbb8/H43, proofs valid as-proven; fresh PASS 56 ms geoMean 7.29 best band; armed reopeners unchanged; zero churn.
