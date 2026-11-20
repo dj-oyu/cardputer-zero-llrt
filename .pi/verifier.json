@@ -4,22 +4,22 @@
     {
       "name": "integrity-and-anticheat",
       "command": "bash /refs/verify/check_integrity.sh",
-      "weight": 15
+      "weight": 10
     },
     {
       "name": "rust-warnings-and-unit-tests",
       "command": "bash /refs/verify/check_rust_p6a.sh",
-      "weight": 30
+      "weight": 20
     },
     {
-      "name": "js-all-regression-and-phase6a-hw-e2e",
+      "name": "js-all-38-regression-e2e",
       "command": "bash /refs/verify/check_e2e_p6a.sh",
-      "weight": 45
+      "weight": 25
     },
     {
-      "name": "ts-declarations-phase6a",
-      "command": "bash /refs/verify/check_types_p6a.sh",
-      "weight": 10
+      "name": "final-boss-30pct-benchmark-and-discoveries",
+      "command": "bash /refs/final_boss/verify_boss_all.sh",
+      "weight": 45
     }
   ]
 }
