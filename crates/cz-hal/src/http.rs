@@ -679,6 +679,52 @@ pub fn serialize_response(
     out
 }
 
+/// Serialize only the status line + headers for a **streaming** (chunked) response. The engine
+/// reserves `Content-Length`, `Transfer-Encoding` and `Connection`: caller-supplied copies of
+/// those are dropped, `Transfer-Encoding: chunked` is emitted instead of any auto
+/// `Content-Length`, and the `Connection` header follows the engine's keep-alive decision.
+pub fn serialize_stream_head(
+    status: u16,
+    reason: Option<&str>,
+    headers: &[(String, String)],
+    keep_alive: bool,
+) -> Vec<u8> {
+    let phrase = reason.unwrap_or_else(|| reason_phrase(status));
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(format!("HTTP/1.1 {status} {phrase}\r\n").as_bytes());
+    let mut seen: Vec<String> = Vec::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "connection"
+            || lower == "transfer-encoding"
+            || lower == "content-length"
+            || seen.contains(&lower)
+        {
+            continue;
+        }
+        seen.push(lower.clone());
+        if lower.chars().all(|c| c.is_ascii_graphic() && c != ':') && !value.contains('\n') && !value.contains('\r') {
+            out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+    }
+    out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    out.extend_from_slice(
+        format!("Connection: {}\r\n\r\n", if keep_alive { "keep-alive" } else { "close" }).as_bytes(),
+    );
+    out
+}
+
+/// Encode one HTTP/1.1 chunk frame: `<hex-size>\r\n<data>\r\n`.
+pub fn chunk_frame(data: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:x}\r\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The terminating zero-length chunk plus empty trailer section (`0\r\n\r\n`).
+pub const LAST_CHUNK_FRAME: &[u8] = b"0\r\n\r\n";
+
 /// Build an interim `HTTP/1.1 100 Continue` frame for `Expect: 100-continue` clients.
 pub fn continue_frame() -> Vec<u8> {
     b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()
@@ -993,6 +1039,65 @@ mod http_tests {
             assert!(seen.insert(*code), "duplicate status code {code}");
         }
         assert!(seen.contains(&200) && seen.contains(&404) && seen.contains(&413));
+    }
+
+    #[test]
+    fn stream_head_forces_chunked_and_reserves_reserved_headers() {
+        let bytes = serialize_stream_head(
+            200,
+            None,
+            &[
+                ("Content-Type".into(), "text/event-stream; charset=utf-8".into()),
+                ("Cache-Control".into(), "no-cache".into()),
+                // Reserved/duplicate fields must be dropped in favor of the engine decision.
+                ("content-length".into(), "42".into()),
+                ("Transfer-Encoding".into(), "gzip".into()),
+                ("Connection".into(), "close".into()),
+                ("X-Powered-By".into(), "Cz0".into()),
+            ],
+            true,
+        );
+        let text = String::from_utf8(bytes).expect("utf8 head");
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Type: text/event-stream; charset=utf-8\r\n"));
+        assert_eq!(text.matches("Transfer-Encoding:").count(), 1);
+        assert!(text.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!text.contains("Content-Length"), "stream head must not announce a length: {text:?}");
+        assert_eq!(text.matches("Connection:").count(), 1);
+        assert!(text.contains("Connection: keep-alive\r\n\r\n"));
+        assert!(text.ends_with("\r\n\r\n"), "head ends on the blank line: {text:?}");
+
+        // Explicit reason phrase and close semantics still work.
+        let closing = String::from_utf8(serialize_stream_head(204, Some("Bye"), &[], false)).unwrap();
+        assert!(closing.starts_with("HTTP/1.1 204 Bye\r\n"));
+        assert!(closing.contains("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn chunk_frames_are_hex_prefixed_then_terminated_by_zero_chunk() {
+        assert_eq!(chunk_frame(b"hello"), b"5\r\nhello\r\n".to_vec());
+        assert_eq!(chunk_frame(&[0u8; 256]), format!("100\r\n{}\r\n", "\0".repeat(256)).into_bytes());
+        // Multi-chunk stream plus terminator parses back exactly like the request-side decoder.
+        let wire = [
+            chunk_frame(b"event: t\n"),
+            chunk_frame(b"data: 1\n\n"),
+            LAST_CHUNK_FRAME.to_vec(),
+        ]
+        .concat();
+        let mut p = RequestParser::new();
+        p.push(
+            format!("POST /sink HTTP/1.1\r\nHost: cz0\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes(),
+        );
+        p.push(&wire);
+        let req = loop {
+            match p.step() {
+                Ok(ParseStep::Request(r)) => break r,
+                Ok(other) => panic!("unexpected {other:?}"),
+                Err(e) => panic!("roundtrip failed: {e}"),
+            }
+        };
+        assert_eq!(req.body, b"event: t\ndata: 1\n\n".to_vec());
+        assert_eq!(LAST_CHUNK_FRAME, b"0\r\n\r\n");
     }
 
     #[test]

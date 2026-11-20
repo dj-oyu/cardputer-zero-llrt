@@ -27,7 +27,9 @@ use rquickjs::{
 };
 
 use cz_hal::http::STATUS_CODES;
-use cz_hal::http_server::{ConnectionEvent, Listener, ReplyFrame};
+use cz_hal::http_server::{
+    client_closed, take_disconnect_events, ConnectionEvent, Listener, ReplyFrame, ResponseAction,
+};
 
 /// Node.js-compatible HTTP methods exposed by the module.
 pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -46,8 +48,12 @@ struct Registry {
     rx: Mutex<Option<Receiver<ConnectionEvent>>>,
     /// Sender clone shared by all listener threads.
     tx: Sender<ConnectionEvent>,
-    /// Per-connection reply channels awaiting the JS response (sequential per socket).
-    replies: Mutex<HashMap<u64, Sender<ReplyFrame>>>,
+    /// Per-connection reply channels awaiting the JS response. Phase 2.5: the channel may carry
+    /// a *sequence* (`StreamHead -> StreamChunk* -> StreamEnd`) instead of one buffered frame.
+    replies: Mutex<HashMap<u64, Sender<ResponseAction>>>,
+    /// Connections currently in streaming mode, keyed by conn id -> owning server id. Used so
+    /// `server.close()` can terminate live SSE channels (spec §3) instead of leaving them open.
+    streams: Mutex<HashMap<u64, u64>>,
 }
 
 fn registry() -> &'static Registry {
@@ -59,6 +65,7 @@ fn registry() -> &'static Registry {
             rx: Mutex::new(Some(rx)),
             tx,
             replies: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
         }
     })
 }
@@ -107,19 +114,88 @@ pub fn next_active_request() -> Option<ConnectionEvent> {
     }
 }
 
-/// Hand the JS response bytes back to the owning connection thread.
+/// Clone the reply channel for `conn_id` WITHOUT removing it (streaming keeps it alive).
+fn peek_sender(conn_id: u64) -> Option<Sender<ResponseAction>> {
+    registry().replies.lock().expect("replies lock").get(&conn_id).cloned()
+}
+
+/// Hand the JS buffered response back to the owning connection thread (Phase 2 path).
 pub fn deliver_response(conn_id: u64, frame: ReplyFrame) -> bool {
     let reg = registry();
     let tx = match reg.replies.lock().expect("replies lock").remove(&conn_id) {
         Some(t) => t,
         None => return false,
     };
-    tx.send(frame).is_ok()
+    reg.streams.lock().expect("streams lock").remove(&conn_id);
+    tx.send(ResponseAction::Buffered(frame)).is_ok()
 }
 
-/// Stop one server: stops accepting, releases the port, and detaches live connections.
+/// Begin a chunked stream on this connection: flush headers NOW, keep the reply channel open.
+fn begin_stream(conn_id: u64, server_id: u64, action_head: ResponseAction) -> bool {
+    if client_closed(conn_id) {
+        return false;
+    }
+    let reg = registry();
+    let tx = match reg.replies.lock().expect("replies lock").get(&conn_id) {
+        Some(t) => t.clone(),
+        None => return false,
+    };
+    if tx.send(action_head).is_err() {
+        return false;
+    }
+    reg.streams.lock().expect("streams lock").insert(conn_id, server_id);
+    true
+}
+
+/// Push one chunk onto a live stream (immediate write + flush happens on the conn thread).
+fn push_stream_chunk(conn_id: u64, data: Vec<u8>) -> bool {
+    if client_closed(conn_id) || data.is_empty() {
+        // Empty chunks are specified as no-ops that still report success while alive.
+        return !client_closed(conn_id);
+    }
+    match peek_sender(conn_id) {
+        Some(tx) => tx.send(ResponseAction::StreamChunk(data)).is_ok(),
+        None => false,
+    }
+}
+
+/// Finalize a stream: optional last chunk + terminating `0\r\n\r\n`, then release the channel.
+fn end_stream(conn_id: u64, last: Option<Vec<u8>>, keep_alive: bool) -> bool {
+    let reg = registry();
+    let tx = match reg.replies.lock().expect("replies lock").remove(&conn_id) {
+        Some(t) => t,
+        None => return !client_closed(conn_id),
+    };
+    reg.streams.lock().expect("streams lock").remove(&conn_id);
+    let mut ok = true;
+    if let Some(bytes) = last {
+        if !bytes.is_empty() && tx.send(ResponseAction::StreamChunk(bytes)).is_err() {
+            ok = false;
+        }
+    }
+    ok && tx.send(ResponseAction::StreamEnd { keep_alive }).is_ok()
+}
+
+/// Stop one server: stops accepting, releases the port, and cleanly terminates any live
+/// streaming channels owned by it (spec \u00a73): send the terminator + report disconnect so JS
+/// event-loop `"close"` listeners can clear intervals.
 pub fn close_server(id: u64) -> bool {
     let reg = registry();
+    let live: Vec<u64> = reg
+        .streams
+        .lock()
+        .expect("streams lock")
+        .iter()
+        .filter(|(_, srv)| **srv == id)
+        .map(|(conn, _)| *conn)
+        .collect();
+    for conn in live {
+        if let Some(tx) = reg.replies.lock().expect("replies lock").remove(&conn) {
+            // Force the terminating chunk; the reader thread then shuts that socket down.
+            tx.send(ResponseAction::StreamEnd { keep_alive: false }).ok();
+        }
+        cz_hal::http_server::mark_client_closed_public(conn);
+    }
     match reg.servers.lock().expect("servers lock").remove(&id) {
         Some(mut l) => cz_hal::http_server::stop_listener(&mut l),
         None => false,
@@ -131,10 +207,14 @@ pub fn close_all_servers() {
     let reg = registry();
     let ids: Vec<u64> = reg.servers.lock().expect("servers lock").keys().copied().collect();
     for id in ids {
-        if let Some(mut l) = reg.servers.lock().expect("servers lock").remove(&id) {
-            cz_hal::http_server::stop_listener(&mut l);
-        }
+        close_server(id);
     }
+}
+
+/// Pull pending client-disconnect notifications (conn ids) for the JS event loop to fire
+/// `"close"` listeners on `req`/`res`.
+pub fn drain_disconnects() -> Vec<u64> {
+    take_disconnect_events()
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +234,38 @@ const HTTP_SHIM: &str = r#"
 
     function norm(name) { return String(name).toLowerCase(); }
 
+    // ---- Live per-connection links (Phase 2.5 "close" events) ------------
+    // connId -> { req, res, fired }. The event loop drains engine disconnect notifications
+    // (__czDrainDisconnects) and fires "close" listeners at most once per request.
+    const links = new Map();
+
+    function czFireClose(link) {
+        if (!link || link.fired) return false;
+        link.fired = true;
+        link.req._closed = true;
+        link.res._closed = true;
+        links.delete(link.connId);
+        for (const fn of (link.req._lis.close || []).slice()) {
+            try { fn(); } catch (e) { czReportError(e); }
+        }
+        for (const fn of (link.res._lis.close || []).slice()) {
+            try { fn(); } catch (e) { czReportError(e); }
+        }
+        return true;
+    }
+
+    // Called by the Rust event loop every pass; returns how many close events fired.
+    globalThis.__czHttpCheckCloses = function () {
+        if (typeof __czDrainDisconnects !== "function") return 0;
+        const ids = __czDrainDisconnects();
+        let fired = 0;
+        for (const id of ids) {
+            const link = links.get(id);
+            if (link) { czFireClose(link); fired++; }
+        }
+        return fired;
+    };
+
     // ---- IncomingMessage --------------------------------------------------
     class CzIncomingMessage {
         constructor(desc) {
@@ -167,6 +279,8 @@ const HTTP_SHIM: &str = r#"
             this._enc = "utf8";
             this._bodyBytes = desc.bodyBytes;
             this._bodyText = desc.bodyText;
+            this._connId = desc.connId;
+            this._closed = false;
             this._lis = { data: [], end: [], error: [], close: [] };
             this._delivered = false;
         }
@@ -216,9 +330,42 @@ const HTTP_SHIM: &str = r#"
             this.writableEnded = false;
             this.socket = desc.socket;
             this._connId = desc.connId;
+            this._serverId = desc.serverId;
             this._keepAlive = desc.keepAlive === true;
             this._headers = new Map();
             this._parts = [];
+            // Phase 2.5: set once flushHeaders()/SSE auto-detect enters chunked mode.
+            this._streaming = false;
+            this._closed = false;
+            this._lis = { close: [] };
+        }
+        on(ev, fn) {
+            if (typeof fn !== "function") throw new TypeError("listener must be a function");
+            const key = String(ev);
+            if (!this._lis[key]) this._lis[key] = [];
+            this._lis[key].push(fn);
+            return this;
+        }
+        _emitPairs() {
+            const pairs = [];
+            for (const entry of this._headers.values()) pairs.push([entry.name, entry.value]);
+            return pairs;
+        }
+        flushHeaders() {
+            // Repeated flushHeaders() calls are a safe no-op (spec §1).
+            if (this.headersSent) return;
+            if (this.hasHeader("content-length")) {
+                // Buffered (Content-Length) responses stay Phase 2: the engine serializes head +
+                // body together at end(); nothing hits the wire until then.
+                this.headersSent = true;
+                return;
+            }
+            const ok = __czStreamStart(this._connId, this._serverId === undefined ? 0 : this._serverId,
+                this.statusCode, this.statusMessage === undefined ? null : this.statusMessage,
+                this._emitPairs(), this._keepAlive);
+            this._streaming = true;
+            this.headersSent = true;
+            if (ok === false) this._closed = true;
         }
         setHeader(name, value) {
             if (value === undefined || value === null) this._headers.delete(norm(name));
@@ -247,20 +394,43 @@ const HTTP_SHIM: &str = r#"
         }
         write(chunk) {
             if (this.writableEnded) throw new Error("write after end");
+            if (this._closed) return false;
+            // SSE streams start immediately without an explicit flushHeaders(): any Content-Type
+            // containing text/event-stream auto-enters streaming mode (spec §1).
+            if (!this.headersSent) {
+                const ct = String(this.getHeader("content-type") || "").toLowerCase();
+                if (ct.indexOf("text/event-stream") !== -1) this.flushHeaders();
+            }
+            if (this._streaming) {
+                if (chunk === undefined || chunk === null) return !this._closed;
+                const ok = __czStreamChunk(this._connId, chunk);
+                if (ok === false) this._closed = true;
+                return ok === true && !this._closed;
+            }
             if (chunk !== undefined && chunk !== null) this._parts.push(chunk);
             return true;
         }
         end(chunk, cb) {
             if (typeof chunk === "function") { cb = chunk; chunk = undefined; }
             if (this.writableEnded) return this; // repeated end() is a safe no-op
+            if (this._streaming) {
+                // Streaming finalize: last chunk (if non-empty) + terminating 0\r\n\r\n frame.
+                const last = chunk === undefined || chunk === null ? null : chunk;
+                const ok = __czStreamEnd(this._connId, last, this._keepAlive);
+                this.headersSent = true;
+                this.writableEnded = true;
+                if (ok === false) this._closed = true;
+                links.delete(this._connId); // normal finish: no disconnect event owed
+                if (typeof cb === "function") { try { cb(); } catch (e) { czReportError(e); } }
+                return this;
+            }
             if (chunk !== undefined && chunk !== null) this._parts.push(chunk);
-            const pairs = [];
-            for (const entry of this._headers.values()) pairs.push([entry.name, entry.value]);
             this.headersSent = true;
             this.writableEnded = true;
             __czRespond(this._connId, this.statusCode,
                         this.statusMessage === undefined ? null : this.statusMessage,
-                        pairs, this._parts, this._keepAlive);
+                        this._emitPairs(), this._parts, this._keepAlive);
+            links.delete(this._connId);
             if (typeof cb === "function") { try { cb(); } catch (e) { czReportError(e); } }
             return this;
         }
@@ -329,6 +499,8 @@ const HTTP_SHIM: &str = r#"
         const server = servers.get(desc.serverId);
         const req = new CzIncomingMessage(desc);
         const res = new CzServerResponse(desc);
+        // Track this connection so the event loop can fire "close" on disconnect (at most once).
+        links.set(desc.connId, { connId: desc.connId, req: req, res: res, fired: false });
         const listeners = server ? (server._ev.request || []).slice() : [];
         if (listeners.length === 0) {
             // Nothing handles requests: answer instead of leaving the client hanging forever.
@@ -416,34 +588,12 @@ fn install_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
         Function::new(
             ctx.clone(),
             |ctx: Ctx<'js>, conn_id: f64, status: f64, reason: Value<'js>, pairs: Array<'js>, parts: Array<'js>, keep_alive: bool| -> Result<bool> {
-                let mut headers: Vec<(String, String)> = Vec::new();
-                for v in pairs.iter::<Value>() {
-                    let pair = v?;
-                    if let Some(arr) = pair.as_array() {
-                        let name: String = arr.get::<JsString>(0)?.to_string()?;
-                        let value: String = arr.get::<JsString>(1)?.to_string()?;
-                        headers.push((name, value));
-                    }
-                }
+                let headers = collect_header_pairs(&pairs)?;
                 let mut body: Vec<u8> = Vec::new();
                 for v in parts.iter::<Value>() {
-                    let v = v?;
-                    if let Some(s) = v.as_string() {
-                        body.extend_from_slice(s.to_string()?.as_bytes());
-                    } else if let Ok(ta) = TypedArray::<u8>::from_value(v.clone()) {
-                        // SAFETY: no JS execution happens while this slice is borrowed.
-                        body.extend_from_slice(unsafe { ta.as_slice() });
-                    } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(v.clone()) {
-                        if let Some(b) = unsafe { ab.as_bytes() } {
-                            body.extend_from_slice(b);
-                        }
-                    }
+                    push_value_bytes(&ctx, v?, &mut body)?;
                 }
-                let reason_txt = if reason.is_null() || reason.is_undefined() {
-                    None
-                } else {
-                    Some(Coerced::<String>::from_js(&ctx, reason)?.0)
-                };
+                let reason_txt = value_to_opt_string(&ctx, reason)?;
                 let code = if status.is_finite() { status as u16 } else { 200 };
                 let frame = ReplyFrame {
                     status: code,
@@ -455,6 +605,74 @@ fn install_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
                 Ok(deliver_response(conn_id as u64, frame))
             },
         )?,
+    )?;
+
+    // ---- Phase 2.5 streaming natives -------------------------------------------------
+    ctx.globals().set(
+        "__czStreamStart",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, conn_id: f64, server_id: f64, status: f64, reason: Value<'js>, pairs: Array<'js>, keep_alive: bool| -> Result<bool> {
+                let headers = collect_header_pairs(&pairs)?;
+                let reason_txt = value_to_opt_string(&ctx, reason)?;
+                let code = if status.is_finite() { status as u16 } else { 200 };
+                Ok(begin_stream(
+                    conn_id as u64,
+                    server_id as u64,
+                    ResponseAction::StreamHead {
+                        status: code,
+                        reason: reason_txt,
+                        headers,
+                        keep_alive,
+                    },
+                ))
+            },
+        )?,
+    )?;
+
+    ctx.globals().set(
+        "__czStreamChunk",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, conn_id: f64, chunk: Value<'js>| -> Result<bool> {
+                let mut bytes: Vec<u8> = Vec::new();
+                push_value_bytes(&ctx, chunk, &mut bytes)?;
+                Ok(push_stream_chunk(conn_id as u64, bytes))
+            },
+        )?,
+    )?;
+
+    ctx.globals().set(
+        "__czStreamEnd",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, conn_id: f64, chunk: Value<'js>, keep_alive: bool| -> Result<bool> {
+                let last = if chunk.is_null() || chunk.is_undefined() {
+                    None
+                } else {
+                    let mut bytes: Vec<u8> = Vec::new();
+                    push_value_bytes(&ctx, chunk, &mut bytes)?;
+                    Some(bytes)
+                };
+                Ok(end_stream(conn_id as u64, last, keep_alive))
+            },
+        )?,
+    )?;
+
+    ctx.globals().set(
+        "__czConnAlive",
+        Function::new(ctx.clone(), |conn_id: f64| -> bool { !client_closed(conn_id as u64) })?,
+    )?;
+
+    ctx.globals().set(
+        "__czDrainDisconnects",
+        Function::new(ctx.clone(), |ctx: Ctx<'js>| -> Result<Array<'js>> {
+            let arr = Array::new(ctx.clone())?;
+            for (i, id) in drain_disconnects().iter().enumerate() {
+                arr.set(i, *id as f64)?;
+            }
+            Ok(arr)
+        })?,
     )?;
 
     ctx.globals().set(
@@ -469,6 +687,49 @@ fn install_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
 
     ctx.eval::<(), _>(HTTP_SHIM)?;
     Ok(())
+}
+
+/// Convert `[name, value]` pairs from JS into header tuples (emission order preserved).
+fn collect_header_pairs(pairs: &Array<'_>) -> Result<Vec<(String, String)>> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for v in pairs.iter::<Value>() {
+        let pair = v?;
+        if let Some(arr) = pair.as_array() {
+            let name: String = arr.get::<JsString>(0)?.to_string()?;
+            let value: String = arr.get::<JsString>(1)?.to_string()?;
+            headers.push((name, value));
+        }
+    }
+    Ok(headers)
+}
+
+/// Append one JS body part (string / Uint8Array / ArrayBuffer) as bytes. No JS execution runs
+/// while the typed-array slice is borrowed.
+fn push_value_bytes<'js>(ctx: &Ctx<'js>, v: Value<'js>, out: &mut Vec<u8>) -> Result<()> {
+    if let Some(s) = v.as_string() {
+        out.extend_from_slice(s.to_string()?.as_bytes());
+    } else if let Ok(ta) = TypedArray::<u8>::from_value(v.clone()) {
+        // SAFETY: no JS execution happens while this slice is borrowed.
+        out.extend_from_slice(unsafe { ta.as_slice() });
+    } else if let Some(ab) = rquickjs::ArrayBuffer::from_value(v.clone()) {
+        if let Some(b) = unsafe { ab.as_bytes() } {
+            out.extend_from_slice(b);
+        }
+    } else if !v.is_null() && !v.is_undefined() {
+        // Coerce anything else exactly like Node's `res.write` stringification.
+        let s = Coerced::<String>::from_js(ctx, v)?;
+        out.extend_from_slice(s.0.as_bytes());
+    }
+    Ok(())
+}
+
+/// Optional status message: null/undefined -> None, otherwise string-coerced.
+fn value_to_opt_string<'js>(ctx: &Ctx<'js>, reason: Value<'js>) -> Result<Option<String>> {
+    if reason.is_null() || reason.is_undefined() {
+        Ok(None)
+    } else {
+        Ok(Some(Coerced::<String>::from_js(ctx, reason)?.0))
+    }
 }
 
 /// Build a fresh plain-object request descriptor (never stored across contexts in Rust).
@@ -990,5 +1251,283 @@ mod http_module_tests {
             }
         }
         None
+    }
+
+    /// Install a minimal Date.now()-based timer registry on a bare test context (mirrors the
+    /// `cz-js` event-loop contract: `__czTimersTick` fires due callbacks and returns remaining).
+    fn test_timers<'js>(ctx: &Ctx<'js>) -> Result<()> {
+        ctx.eval::<(), _>(
+            r#"
+            (function () {
+                const timers = new Map();
+                let nextId = 1;
+                globalThis.setInterval = function (fn, delay) {
+                    if (typeof fn !== "function") throw new TypeError("interval callback must be a function");
+                    const step = Number(delay) > 0 ? Number(delay) : 1;
+                    const id = nextId++;
+                    timers.set(id, { fn: fn, at: Date.now() + step, every: step });
+                    return id;
+                };
+                globalThis.clearInterval = function (id) { timers.delete(id); };
+                globalThis.setTimeout = function (fn, delay) {
+                    if (typeof fn !== "function") throw new TypeError("timeout callback must be a function");
+                    const id = nextId++;
+                    timers.set(id, { fn: fn, at: Date.now() + Math.max(0, Number(delay) || 0), every: null });
+                    return id;
+                };
+                globalThis.clearTimeout = function (id) { timers.delete(id); };
+                globalThis.__czTimerCount = function () { return timers.size; };
+                globalThis.__czTimersTick = function () {
+                    const now = Date.now();
+                    const due = [];
+                    for (const pair of timers.entries()) if (pair[1].at <= now) due.push(pair);
+                    for (const pair of due) {
+                        const id = pair[0], t = pair[1];
+                        if (!timers.has(id)) continue;
+                        if (t.every !== null && t.every > 0) timers.set(id, { fn: t.fn, at: now + t.every, every: t.every });
+                        else timers.delete(id);
+                        try { t.fn(); } catch (e) { if (globalThis.console && console.error) console.error(String(e && e.message || e)); }
+                    }
+                    return timers.size;
+                };
+            })();
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// Poll the JS side (drain HTTP + close notifications + pump jobs OUTSIDE `with()` scopes)
+    /// until `probe` sees a non-empty result or budget runs out.
+    fn eval_poll(rt: &Runtime, ctx: &Context, expr: &str, budget_ms: u128) -> String {
+        let t0 = std::time::Instant::now();
+        loop {
+            let got = ctx.with(|c| -> String {
+                let _ = c.eval::<i64, _>("__czHttpDrainLoop()").unwrap_or(0);
+                let _ = c.eval::<i64, _>("__czTimersTick()").unwrap_or(0);
+                let _ = c.eval::<i64, _>("__czHttpCheckCloses()").unwrap_or(0);
+                c.eval::<String, _>(format!("String({expr})")).unwrap_or_default()
+            });
+            while let Ok(true) = rt.execute_pending_job() {}
+            if !got.is_empty() && got != "undefined" && got != "null" {
+                return got;
+            }
+            if std::time::Instant::now() - t0 > std::time::Duration::from_millis(budget_ms as u64) {
+                return got;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn sse_flush_headers_pushes_live_chunks_and_close_fires_on_disconnect() -> Result<()> {
+        let _lock = http_test_lock();
+        reset_engine_state();
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        // Handler uses an explicit flushHeaders(), pushes via setInterval (like the E2E), and
+        // cleans up through BOTH req.on("close") and res.on("close") exactly once.
+        let src = r#"
+            import http from "node:http";
+            let active = 0, closed = 0, seq = 0, cleaned = false, writeResults = [];
+            globalThis.__STATS = () => JSON.stringify({ active, closed, seq });
+            let timer = null;
+            const cleanup = () => { if (cleaned) return; cleaned = true; try { clearInterval(timer); } catch (e) { errs.push("ci:" + e); } active--; closed++; };
+            const s = http.createServer((req, res) => {
+                res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" });
+                res.flushHeaders();
+                active++;
+                req.on("close", cleanup);
+                res.on("close", cleanup);
+                const push = () => {
+                    if (cleaned) return;
+                    seq++;
+                    writeResults.push(res.write("event: telemetry\ndata: {\"seq\":" + seq + "}\n\n"));
+                };
+                push();
+                timer = setInterval(push, 15);
+            });
+            s.listen(0, "127.0.0.1", () => { globalThis.__ADDR = JSON.stringify(s.address()); });
+            globalThis.__SERVER = s;
+            globalThis.__WR = () => JSON.stringify(writeResults);
+        "#;
+        let rt = Runtime::new()?;
+        let ctx = Context::full(&rt)?;
+        ctx.with(|ctx| -> Result<()> {
+            test_timers(&ctx)?;
+            Module::declare_def::<HttpModule, _>(ctx.clone(), "node:http")?;
+            let p = Module::evaluate(ctx.clone(), "sse.mjs", src)?;
+            p.finish::<()>()?;
+            Ok(())
+        })?;
+        while let Ok(true) = rt.execute_pending_job() {}
+        let addr = take_addr(&ctx).expect("addr");
+
+        let mut sock = TcpStream::connect(("127.0.0.1", addr)).expect("connect sse");
+        sock.set_nodelay(true).ok();
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+        sock.write_all(b"GET /events HTTP/1.1\r\nHost: z\r\nConnection: keep-alive\r\n\r\n").unwrap();
+
+        // Pump the JS event loop (dispatch + timers + close checks) exactly like cz-js does,
+        // collecting wire bytes as they arrive in real time.
+        let mut acc: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut pump = |rt: &Runtime, ctx: &Context, acc: &mut Vec<u8>, sock: &mut TcpStream| {
+            ctx.with(|c| {
+                let _ = c.eval::<i64, _>("__czHttpDrainLoop()");
+                let _ = c.eval::<i64, _>("__czTimersTick()");
+                let _ = c.eval::<i64, _>("__czHttpCheckCloses()");
+            });
+            while let Ok(true) = rt.execute_pending_job() {}
+            match sock.read(&mut tmp) {
+                Ok(n) if n > 0 => acc.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {}
+                _ => {}
+            }
+        };
+        // Headers must complete on their own (flushHeaders fired before any end()).
+        let head_end = loop {
+            if let Some(idx) = (0..acc.len().saturating_sub(3)).find(|&i| &acc[i..i + 4] == b"\r\n\r\n") {
+                break idx;
+            }
+            pump(&rt, &ctx, &mut acc, &mut sock);
+        };
+        let head = String::from_utf8_lossy(&acc[..head_end]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "head {head:?}");
+        assert_eq!(header_val(head.as_bytes(), "content-type").as_deref(), Some("text/event-stream; charset=utf-8"));
+        assert_eq!(header_val(head.as_bytes(), "transfer-encoding").as_deref(), Some("chunked"), "chunked mode {head:?}");
+        assert!(header_val(head.as_bytes(), "content-length").is_none(), "no CL while streaming {head:?}");
+
+        // Keep pumping: live chunk frames must appear BEFORE any terminator (no res.end()).
+        let mut body: Vec<u8> = Vec::new();
+        for _ in 0..600 {
+            pump(&rt, &ctx, &mut body, &mut sock);
+            let text = String::from_utf8_lossy(&body).to_string();
+            if text.contains("\"seq\":2") {
+                assert!(!text.contains("0\r\n\r\n"), "stream terminated before disconnect");
+                break;
+            }
+        }
+        // push #1 fired synchronously during dispatch and may share the first read with the
+        // head bytes, so inspect the FULL wire accumulated so far (head tail + later frames).
+        let mut wire: Vec<u8> = Vec::new();
+        wire.extend_from_slice(&acc[head_end + 4..]);
+        wire.extend_from_slice(&body);
+        let dbg = ctx.with(|c| c.eval::<String, _>(
+            "JSON.stringify({ hasInterval: typeof setInterval, err: globalThis.__HANDLER_ERR || null })",
+        )).unwrap_or_default();
+        assert!(
+            String::from_utf8_lossy(&wire).contains("event: telemetry\ndata: {\"seq\":1}\n\n"),
+            "live push 1 (wire {wire:?}, js {dbg})"
+        );
+        // (Terminator absence for the pre-disconnect window was asserted in the pump loop above.)
+        // res.write returned booleans during streaming (never undefined).
+        let wr = ctx.with(|c| c.eval::<String, _>("globalThis.__WR()")).unwrap();
+        assert!(wr.starts_with("[true") && !wr.contains("undefined"), "write booleans {wr}");
+
+        // Client hangs up: engine detects EOF, event loop fires BOTH close listeners ONCE and the
+        // interval is cleared.
+        // Client hangs up: the engine detects EOF/RST, and the event loop fires BOTH close
+        // listeners exactly once so user cleanup can clearInterval(...).
+        drop(sock);
+        // Wait for the close event with an explicit condition (not mere value presence),
+        // pumping timers + close checks each iteration like the cz-js event loop does.
+        let mut stats = String::new();
+        let t_close = std::time::Instant::now();
+        while t_close.elapsed() < std::time::Duration::from_millis(4000) {
+            ctx.with(|c| {
+                let _ = c.eval::<i64, _>("__czTimersTick()");
+                let _ = c.eval::<i64, _>("__czHttpCheckCloses()");
+            });
+            while let Ok(true) = rt.execute_pending_job() {}
+            stats = ctx.with(|c| c.eval::<String, _>("String(globalThis.__STATS())")).unwrap_or_default();
+            if stats.contains("\"closed\":1") && stats.contains("\"active\":0") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(stats.contains("\"closed\":1"), "close fired exactly once: {stats}");
+        assert!(stats.contains("\"active\":0"), "cleanup decremented active streams: {stats}");
+        // Later writes on a dead stream report false (spec \u00a71 write() semantics).
+        let wr_late = ctx.with(|c| c.eval::<String, _>("globalThis.__WR()")).unwrap_or_default();
+        assert!(wr_late.contains("false"), "write reported false after disconnect: {wr_late}");
+        let timers = ctx.with(|c| c.eval::<i64, _>("__czTimerCount()")).unwrap_or(9);
+        assert_eq!(timers, 0, "interval cleared by close cleanup");
+
+        ctx.with(|ctx| ctx.eval::<(), _>("globalThis.__SERVER.close();"))?;
+        while let Ok(true) = rt.execute_pending_job() {}
+        assert_eq!(listening_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_end_writes_terminator_and_double_flush_headers_is_noop() -> Result<()> {
+        let _lock = http_test_lock();
+        reset_engine_state();
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        // Auto-streaming via Content-Type (NO explicit flushHeaders call), double flush is a
+        // safe no-op, and end(chunk) frames the last chunk + terminating 0\r\n\r\n.
+        let src = r#"
+            import http from "node:http";
+            globalThis.__RESULT = null;
+            const s = http.createServer((req, res) => {
+                res.writeHead(200, { "Content-Type": "text/event-stream" });
+                const firstWrite = res.write("auto-head\n");            // triggers auto flushHeaders
+                res.flushHeaders(); res.flushHeaders();                  // safe no-ops
+                const ended = res.end("tail");
+                __RESULT = JSON.stringify({ firstWrite, headersSent: res.headersSent,
+                                           ended: ended === res, writableEnded: res.writableEnded });
+            });
+            s.listen(0, "127.0.0.1", () => { globalThis.__ADDR = JSON.stringify(s.address()); });
+            globalThis.__SERVER = s;
+        "#;
+        let rt = Runtime::new()?;
+        let ctx = Context::full(&rt)?;
+        ctx.with(|ctx| -> Result<()> {
+            Module::declare_def::<HttpModule, _>(ctx.clone(), "node:http")?;
+            let p = Module::evaluate(ctx.clone(), "sse-end.mjs", src)?;
+            p.finish::<()>()?;
+            Ok(())
+        })?;
+        while let Ok(true) = rt.execute_pending_job() {}
+        let addr = take_addr(&ctx).expect("addr");
+
+        let mut sock = TcpStream::connect(("127.0.0.1", addr)).expect("connect");
+        sock.set_nodelay(true).ok();
+        // Connection: close -> engine shuts the socket after StreamEnd, so read_to_string ends.
+        sock.write_all(b"GET /stream HTTP/1.1\r\nHost: z\r\nConnection: close\r\n\r\n").unwrap();
+        drive_until_dispatched(&rt, &ctx, 1);
+        let mut text = String::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match sock.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => text.push_str(&String::from_utf8_lossy(&tmp[..n])),
+                Err(_) => break,
+            }
+            if text.ends_with("0\r\n\r\n") || text.contains("0\r\n\r\n") && text.ends_with("\r\n\r\n") {
+                break;
+            }
+        }
+        assert_eq!(text.matches("HTTP/1.1 200 OK").count(), 1, "single head, double flush no-op {text:?}");
+        assert!(text.contains("Transfer-Encoding: chunked\r\n"), "chunked mode {text:?}");
+        assert!(!text.contains("Content-Length"), "no CL in streaming wire {text:?}");
+        // "auto-head\n" is 10 bytes -> hex a; "tail" is 4 -> hex 4.
+        assert!(text.contains("a\r\nauto-head\n\r\n"), "hex-10 frame {text:?}");
+        assert!(text.contains("4\r\ntail\r\n"), "final chunk {text:?}");
+        assert!(text.ends_with("0\r\n\r\n"), "terminator last {text:?}");
+
+        let res_json = eval_poll(&rt, &ctx, "globalThis.__RESULT", 1500);
+        assert!(res_json.contains("\"firstWrite\":true"), "auto-stream write true: {res_json}");
+        assert!(res_json.contains("\"headersSent\":true"), "headers sent: {res_json}");
+        assert!(res_json.contains("\"writableEnded\":true"), "writableEnded set: {res_json}");
+        assert!(res_json.contains("\"ended\":true"), "end() returns this: {res_json}");
+
+        ctx.with(|ctx| ctx.eval::<(), _>("globalThis.__SERVER.close();"))?;
+        while let Ok(true) = rt.execute_pending_job() {}
+        Ok(())
     }
 }

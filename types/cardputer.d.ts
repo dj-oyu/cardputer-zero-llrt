@@ -282,9 +282,16 @@ interface ServerResponse {
   writeHead(statusCode: number): ServerResponse;
   writeHead(statusCode: number, headers: Record<string, string | number>): ServerResponse;
   writeHead(statusCode: number, statusMessage: string, headers?: Record<string, string | number>): ServerResponse;
-  /** Append part of the response body before end(). */
+  /** Append part of the response body. Returns false once the connection has closed; in
+   *  streaming mode each non-empty chunk is flushed immediately as a chunked frame. */
   write(chunk: string | Uint8Array): boolean;
-  /** Finalize and transmit the response (Content-Length is auto-set when absent). */
+  /** Send status line + headers NOW with `Transfer-Encoding: chunked` (auto-added when no
+   *  Content-Length) so SSE/long-lived streams start before end(); repeat calls are no-ops. */
+  flushHeaders(): void;
+  /** Register a disconnect listener (fires at most once when the client hangs up mid-stream). */
+  on(event: "close", listener: () => void): ServerResponse;
+  /** Finalize and transmit the response. Buffered responses auto-set Content-Length; streamed
+   *  responses write the last chunk plus the terminating `0\r\n\r\n` frame. */
   end(chunk?: string | Uint8Array, callback?: () => void): ServerResponse;
   end(callback?: () => void): ServerResponse;
 }

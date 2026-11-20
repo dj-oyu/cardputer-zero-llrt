@@ -258,6 +258,11 @@ fn has_http_glue(ctx: &Ctx<'_>) -> bool {
 /// `Context::with()` scope, otherwise the runtime `RefCell` is re-entered and panics with
 /// "RefCell already borrowed". So scopes are opened, closed, and only then jobs are pumped.
 fn loop_pass(rt: &Runtime, ctx: &Context) {
+    // 0. Fire HTTP "close" notifications (Phase 2.5): client disconnects or server-forced
+    //    stream ends queue conn ids in the engine; JS clears intervals / releases streams here.
+    ctx.with(|c| call_js_i64(&c, "__czHttpCheckCloses", 0));
+    drain_jobs(rt);
+
     // 1. Serve any queued HTTP requests inside a short scope.
     ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
     drain_jobs(rt);
