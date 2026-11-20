@@ -36,7 +36,7 @@ pub fn scan_unescaped_run(bytes: &[u8], start: usize) -> usize {
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{
-    vbifq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8, vminvq_u8, vmaxvq_u8, vceqq_u8,
+    vbslq_u8, vceqq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vminvq_u8, vorrq_u8,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -44,15 +44,15 @@ fn neon_scan(bytes: &[u8], start: usize) -> usize {
     let n = bytes.len();
     // Lane index vector 0..15, used to recover the first hit lane without a movemask.
     let lanes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-    let lane_v = vld1q_u8(lanes.as_ptr());
-    let quote_v = vdupq_n_u8(QUOTE);
-    let slash_v = vdupq_n_u8(BACKSLASH);
-    let ctrl_v = vdupq_n_u8(0x20);
-    let all_ones = vdupq_n_u8(u8::MAX);
-
     let mut i = start;
-    while i + 16 <= n {
-        unsafe {
+    unsafe {
+        let lane_v = vld1q_u8(lanes.as_ptr());
+        let quote_v = vdupq_n_u8(QUOTE);
+        let slash_v = vdupq_n_u8(BACKSLASH);
+        let ctrl_v = vdupq_n_u8(0x20);
+        let all_ones = vdupq_n_u8(u8::MAX);
+
+        while i + 16 <= n {
             let v = vld1q_u8(bytes.as_ptr().add(i));
             let eq_quote = vceqq_u8(v, quote_v);
             let eq_slash = vceqq_u8(v, slash_v);
@@ -62,11 +62,11 @@ fn neon_scan(bytes: &[u8], start: usize) -> usize {
             if vmaxvq_u8(hit) != 0 {
                 // Matched lanes keep their index, clean lanes become 255; vminvq yields the
                 // first (lowest) matching lane index inside this chunk.
-                let sel = vbifq_u8(all_ones, lane_v, hit);
+                let sel = vbslq_u8(hit, lane_v, all_ones);
                 return i + vminvq_u8(sel) as usize;
             }
+            i += 16;
         }
-        i += 16;
     }
     // Scalar tail (< 16 bytes).
     while i < n {
