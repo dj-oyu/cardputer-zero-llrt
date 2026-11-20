@@ -7,18 +7,18 @@
       "weight": 15
     },
     {
-      "name": "rust-clippy-and-unit-tests",
-      "command": "bash /refs/verify/check_rust.sh",
-      "weight": 35
+      "name": "rust-warnings-and-unit-tests",
+      "command": "bash /refs/verify/check_rust_p2.sh",
+      "weight": 30
     },
     {
-      "name": "js-practical-e2e-suite",
-      "command": "bash /refs/verify/check_e2e.sh",
-      "weight": 40
+      "name": "js-phase1-and-phase2-webserver-e2e",
+      "command": "bash /refs/verify/check_e2e_p2.sh",
+      "weight": 45
     },
     {
-      "name": "ts-declarations",
-      "command": "bash /refs/verify/check_types.sh",
+      "name": "ts-declarations-phase2",
+      "command": "bash /refs/verify/check_types_p2.sh",
       "weight": 10
     }
   ]
