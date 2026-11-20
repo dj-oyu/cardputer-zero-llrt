@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -778,6 +779,18 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<KvStore>>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Registry mutation counter — lets the one-slot `peek_store` memo validate freshness without
+/// re-locking (Rust-side Arc state only; safe per the JS-value memo Dead End rule).
+fn reg_version() -> &'static AtomicU64 {
+    static V: OnceLock<AtomicU64> = OnceLock::new();
+    V.get_or_init(|| AtomicU64::new(0))
+}
+
+thread_local! {
+    static PEEK_MEMO: std::cell::RefCell<Option<(String, u64, Arc<Mutex<KvStore>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Open (or reuse) a named store and return its shared handle. When `persistPath` is given and a
 /// snapshot already exists on disk, non-expired entries are loaded eagerly.
 pub fn open_store(
@@ -799,6 +812,7 @@ pub fn open_store(
         st.load_from_disk()?;
     }
     reg.insert(name.to_string(), arc.clone());
+    reg_version().fetch_add(1, Ordering::Release);
     Ok(arc)
 }
 
@@ -817,8 +831,25 @@ pub fn has_store(name: &str) -> bool {
 /// Borrow an already-open store handle without creating it (`None` when the name is unknown).
 /// Lets native consumers such as the JSON engine serialize `EntryPayload::Record` directly.
 pub fn peek_store(name: &str) -> Option<Arc<Mutex<KvStore>>> {
-    let reg = registry().lock().expect("kv registry lock");
-    reg.get(name).cloned()
+    // One-slot memo (same idiom as the lazy registry doc() memo): w5's 2,000 same-name lookups
+    // per run skip mutex+hash; freshness is pinned by the mutation version, so drop_store or a
+    // newly opened store invalidate automatically.
+    let ver = reg_version().load(Ordering::Acquire);
+    PEEK_MEMO.with(|m| {
+        if let Some((memo_name, memo_ver, store)) = &*m.borrow() {
+            if *memo_ver == ver && memo_name.as_str() == name {
+                return Some(store.clone());
+            }
+        }
+        let reg = registry().lock().expect("kv registry lock");
+        let found = reg.get(name).cloned();
+        if let Some(arc) = &found {
+            *m.borrow_mut() = Some((name.to_string(), ver, arc.clone()));
+        } else {
+            m.borrow_mut().take();
+        }
+        found
+    })
 }
 
 #[cfg(test)]

@@ -712,9 +712,19 @@ pub fn serialize_stream_head(
     keep_alive: bool,
 ) -> Vec<u8> {
     let phrase = reason.unwrap_or_else(|| reason_phrase(status));
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(format!("HTTP/1.1 {status} {phrase}\r\n").as_bytes());
-    let mut seen: Vec<String> = Vec::new();
+    // H23 idiom mirrored to the streaming head: capacity reserve + direct emission, no format!
+    // per line; skip/dedup semantics unchanged.
+    let mut out: Vec<u8> = Vec::with_capacity(72 + headers.len() * 40);
+    {
+        let st = status.to_string();
+        out.reserve(12 + st.len() + phrase.len() + 4);
+        out.extend_from_slice(b"HTTP/1.1 ");
+        out.extend_from_slice(st.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(phrase.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(headers.len());
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();
         if lower == "connection"
@@ -726,7 +736,11 @@ pub fn serialize_stream_head(
         }
         seen.push(lower.clone());
         if lower.chars().all(|c| c.is_ascii_graphic() && c != ':') && !value.contains('\n') && !value.contains('\r') {
-            out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            out.reserve(name.len() + value.len() + 4);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
         }
     }
     out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");

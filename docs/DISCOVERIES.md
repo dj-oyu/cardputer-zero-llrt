@@ -33,6 +33,13 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Useful] H24 versioned one-slot `peek_store` memo + stream-head direct emission (2026-11-20 01:05)
+- **Recall link**: `[Useful] one-slot registry memo` applied to its second legitimate Rust-side site — `peek_store` runs once per kv-row stringify (w5: 2,000 same-name mutex+hash lookups/run); safe per the JS-value memo rule (Arc<Mutex<KvStore>> is pure Rust state), and the `[Dead End] raw-C-API` lessons kept everything off the JS boundary.
+- **Design**: registry mutation version (`AtomicU64`, Release on insert/remove) pins a thread-local `(name, ver, Arc)` slot — drop_store or a new store invalidates automatically, no stale-handle risk.
+- **µs proof (`/tmp/h24_peek`, real cz-hal API, 3× repeats)**: handle stability true; memo-hit **5 ns/op** vs old-equivalent mutex+hash thrash **25 ns/op ≈ 5.0×**; w5 saves ~40 µs/run (host integer stays 7 ms at the floor; device allocator+lock pressure heavier → larger relative win).
+- **Also shipped**: `serialize_stream_head` now mirrors the H23 capacity-reserve + direct emission idiom with byte-identical skip/dedup semantics (chunked w6 path).
+- **Gates**: workspace `-D warnings` clean, cz-hal tests green, HTTP e2e phase2 11/11 (streaming + wire assertions), kv phase3a 5/5 incl drop/reopen freshness test, gc_soak stable, checksums identical (176555); two compile errors fixed during work (extra generic bracket; atomic import path) per self-review discipline.
+
 ### [Useful] H23 serialize_response: capacity reserve + direct byte emission — µs-proven 2.9×, zero format! per line (2026-11-20 00:45)
 - **Recall link**: the two Dead Ends (`raw-C-API` object building, `String<'js>` zero-copy borrow) forbid JS-value lifetime tricks ⇒ kept the win entirely Rust-owned (`Vec<u8>` emission + one final body copy), judged via µs microbench to clear `[Note] integer-ms floor`.
 - **Hypothesis**: w6's per-request `serialize_response` allocated a growing Vec + one `format!` String per header/status/Content-Length/Connection line — pure allocator waste on every response.
