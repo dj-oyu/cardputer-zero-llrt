@@ -70,6 +70,55 @@ pub fn events_queued() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Instant event-loop wakeup (Final Boss: replaces fixed idle sleeps)
+// ---------------------------------------------------------------------------
+
+static WAKE: static_waker::Waker = static_waker::Waker::new();
+
+mod static_waker {
+    use std::sync::{Condvar, Mutex};
+
+    pub struct Waker {
+        // A plain flag + condvar: notify sets the token, wait consumes it or times out.
+        mu: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Waker {
+        pub const fn new() -> Self {
+            Self { mu: Mutex::new(false), cv: Condvar::new() }
+        }
+        pub fn notify(&self) {
+            let mut g = self.mu.lock().expect("wake lock");
+            *g = true;
+            self.cv.notify_all();
+        }
+        /// Wait up to `max`; returns true if a notification arrived earlier.
+        pub fn wait(&self, max: std::time::Duration) -> bool {
+            let mut g = self.mu.lock().expect("wake lock");
+            if !*g {
+                let (g2, _timed_out) = self.cv.wait_timeout(g, max).expect("wake wait");
+                g = g2;
+            }
+            let woke = *g;
+            *g = false;
+            woke
+        }
+    }
+}
+
+/// Wake the JS event loop's idle pause immediately (called when a request is queued or a
+/// disconnect/timer-relevant state change happens).
+pub fn notify_event_loop() {
+    WAKE.notify();
+}
+
+/// Block the caller up to `max` until `notify_event_loop` fires; returns early on wake.
+pub fn idle_wait(max: Duration) -> bool {
+    WAKE.wait(max)
+}
+
+// ---------------------------------------------------------------------------
 // Client-disconnect notifications (Phase 2.5)
 // ---------------------------------------------------------------------------
 
@@ -94,6 +143,7 @@ pub fn mark_client_closed_public(conn_id: u64) {
 fn mark_client_closed(conn_id: u64) {
     DIAG_MARKS.fetch_add(1, Ordering::SeqCst);
     disconnect_state().lock().expect("disconnect queue lock").push_back(conn_id);
+    notify_event_loop(); // disconnects must reach JS instantly, not at the next idle slice
     let mut set = closed_conn_ids().lock().expect("closed set lock");
     if !set.contains_key(&conn_id) {
         // Bound the set even if nobody ever drains: drop older entries first (they only matter
@@ -366,6 +416,7 @@ fn spawn_connection(
                 let keep_alive = req.keep_alive;
                 let (reply_tx, reply_rx) = channel::<ResponseAction>();
                 EVENTS_QUEUED.fetch_add(1, Ordering::SeqCst);
+                notify_event_loop();
                 if tx
                     .send(ConnectionEvent {
                         server_id,

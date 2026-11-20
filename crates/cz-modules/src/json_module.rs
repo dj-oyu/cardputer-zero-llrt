@@ -140,7 +140,7 @@ pub fn install_json<'js>(ctx: &Ctx<'js>) -> Result<()> {
                 return Ok(Value::new_float(ctx, n.child_count() as f64));
             }
             let got = doc.get(as_idx(node), key.as_str());
-            got_to_js(&ctx, &doc, got)
+            got_to_js(&ctx, &doc, got, as_idx(node))
         },
     )?;
     ctx.globals().set("__czLazyGet", get_fn)?;
@@ -203,7 +203,7 @@ pub fn install_json<'js>(ctx: &Ctx<'js>) -> Result<()> {
                 return Ok(Value::new_undefined(ctx));
             }
             let got = doc.get(as_idx(node), key.as_str());
-            let value = got_to_js(&ctx, &doc, got)?;
+            let value = got_to_js(&ctx, &doc, got, as_idx(node))?;
             let d = Object::new(ctx.clone())?;
             d.set("value", value)?;
             d.set("writable", true)?;
@@ -423,7 +423,7 @@ fn js_to_val<'js>(ctx: &Ctx<'js>, v: &Value<'js>, depth: usize) -> Result<Val<'s
     Ok(Val::Obj(fields))
 }
 
-fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>) -> Result<Value<'js>> {
+fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>, parent: u32) -> Result<Value<'js>> {
     match got {
         Got::Missing => ctx.globals().get::<_, Value>("__czMiss"),
         Got::Scalar(s) => match s {
@@ -434,8 +434,59 @@ fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>) -> Result<Value<'
             cz_json::Scalar::Clean(s) => Ok(rquickjs::String::from_str(ctx.clone(), s)?.into_value()),
             cz_json::Scalar::Escaped(s) => Ok(rquickjs::String::from_str(ctx.clone(), &s)?.into_value()),
         },
-        Got::Subtree(child) => make_lazy_handle(ctx, doc.id.load(std::sync::atomic::Ordering::SeqCst), child),
+        // Direct members of the ROOT container keep transparent Proxy handles so CoW write
+        // traps stay live. Grandchildren+ of untouched subtrees materialize ONCE into plain
+        // native objects built straight from the Tape — no Proxy/handler churn per read.
+        Got::Subtree(child) => {
+            if parent == 0 || !doc.subtree_is_clean(child) {
+                return make_lazy_handle(
+                    ctx,
+                    doc.id.load(std::sync::atomic::Ordering::SeqCst),
+                    child,
+                );
+            }
+            match materialize_native(ctx, doc, child) {
+                Ok(v) => Ok(v),
+                Err(_) => make_lazy_handle(ctx, doc.id.load(std::sync::atomic::Ordering::SeqCst), child),
+            }
+        }
         Got::Owned(v) => dom_to_js(ctx, &v),
+    }
+}
+
+fn materialize_native<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, node: u32) -> Result<Value<'js>> {
+    let t = &doc.tape;
+    let n = t.node(node);
+    if n.kind == cz_json::tape::KIND_ARRAY {
+        let arr = Array::new(ctx.clone())?;
+        for i in 0..n.child_count() {
+            if let Some(c) = t.child_at(node, i) {
+                arr.set(i, materialize_native(ctx, doc, c)?)?;
+            }
+        }
+        Ok(arr.into_value())
+    } else if n.kind == cz_json::tape::KIND_OBJECT {
+        let obj = Object::new(ctx.clone())?;
+        for c in t.children(node) {
+            if let Some(k) = t.key_bytes(c) {
+                if let Ok(key) = k {
+                    obj.set(key.as_ref(), materialize_native(ctx, doc, c)?)?;
+                }
+            }
+        }
+        Ok(obj.into_value())
+    } else {
+        match t.scalar(node) {
+            Ok(s) => match s {
+                cz_json::Scalar::Null => Ok(Value::new_null(ctx.clone())),
+                cz_json::Scalar::Bool(b) => Ok(Value::new_bool(ctx.clone(), b)),
+                cz_json::Scalar::Int(i) => Ok(Value::new_float(ctx.clone(), i as f64)),
+                cz_json::Scalar::Float(f) => Ok(Value::new_float(ctx.clone(), f)),
+                cz_json::Scalar::Clean(s) => Ok(rquickjs::String::from_str(ctx.clone(), s)?.into_value()),
+                cz_json::Scalar::Escaped(s) => Ok(rquickjs::String::from_str(ctx.clone(), &s)?.into_value()),
+            },
+            Err(_) => Ok(Value::new_null(ctx.clone())),
+        }
     }
 }
 
@@ -598,6 +649,57 @@ fn walk_json<'js>(
     }
 
     out.push(b'{');
+    // Fast path: raw property enumeration straight through the QuickJS C API. This skips the
+    // rquickjs per-member String/Value marshaling allocations for plain data objects.
+    unsafe {
+        let q = ctx.as_raw().as_ptr();
+        let mut tab: *mut rquickjs::qjs::JSPropertyEnum = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        let obj_raw = obj.as_value().as_raw();
+        if rquickjs::qjs::JS_GetOwnPropertyNames(
+            q,
+            &mut tab,
+            &mut len,
+            obj_raw,
+            (rquickjs::qjs::JS_GPN_STRING_MASK | rquickjs::qjs::JS_GPN_ENUM_ONLY) as i32,
+        ) == 0
+        {
+            let mut first = true;
+            for i in 0..len {
+                let pe = &*tab.add(i as usize);
+                let mut desc: rquickjs::qjs::JSPropertyDescriptor = std::mem::zeroed();
+                if rquickjs::qjs::JS_GetOwnProperty(q, &mut desc, obj_raw, pe.atom) != 1 {
+                    continue;
+                }
+                // NORMAL (non GETSET/ref) data properties only; getset needs JS-side invocation.
+                if desc.flags & 0x30 != 0 {
+                    rquickjs::qjs::JS_FreeValue(q, desc.value);
+                    continue;
+                }
+                let val = Value::from_raw(ctx.clone(), desc.value);
+                if val.is_undefined() || val.is_function() || val.is_symbol() {
+                    continue; // ECMA: object members with these types vanish
+                }
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                let mut klen = 0u64;
+                let kptr = rquickjs::qjs::JS_AtomToCStringLen(q, &mut klen, pe.atom);
+                if !kptr.is_null() {
+                    let kb = std::slice::from_raw_parts(kptr as *const u8, klen as usize);
+                    write_escaped_str(out, &String::from_utf8_lossy(kb));
+                    rquickjs::qjs::JS_FreeCString(q, kptr);
+                }
+                out.push(b':');
+                walk_json(ctx, &val, out, stack, depth + 1)?;
+            }
+            rquickjs::qjs::JS_FreePropertyEnum(q, tab, len);
+            out.push(b'}');
+            stack.pop();
+            return Ok(());
+        }
+    }
     let mut first = true;
     for p in obj.props::<String, Value>() {
         let (k, val) = p?;

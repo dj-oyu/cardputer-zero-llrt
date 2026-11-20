@@ -80,6 +80,76 @@ fn neon_scan(bytes: &[u8], start: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Fast ASCII check (used to skip UTF-8 state machines on pure-ASCII slices)
+// ---------------------------------------------------------------------------
+
+/// True when every byte of `s` is < 0x80. SWAR 8-byte chunks on x86, NEON 16-byte on aarch64.
+pub fn is_ascii_fast(s: &[u8]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_is_ascii(s)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        swar_is_ascii(s)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn neon_is_ascii(s: &[u8]) -> bool {
+    use core::arch::aarch64::{vld1q_u8, vmaxvq_u8};
+    let n = s.len();
+    let mut i = 0;
+    unsafe {
+        while i + 16 <= n {
+            let v = vld1q_u8(s.as_ptr().add(i));
+            // Max byte of the lane group; anything >= 0x80 disqualifies.
+            if vmaxvq_u8(v) >= 0x80 {
+                return false;
+            }
+            i += 16;
+        }
+        while i < n {
+            if s[i] >= 0x80 {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn swar_is_ascii(s: &[u8]) -> bool {
+    let n = s.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let chunk: [u8; 8] = [
+            s[i],
+            s[i + 1],
+            s[i + 2],
+            s[i + 3],
+            s[i + 4],
+            s[i + 5],
+            s[i + 6],
+            s[i + 7],
+        ];
+        let w = u64::from_le_bytes(chunk);
+        if w & HIGH != 0 {
+            return false;
+        }
+        i += 8;
+    }
+    while i < n {
+        if s[i] >= 0x80 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Portable SWAR fallback (x86_64 / anything else): 8 bytes per iteration
 // ---------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 //! Layer 1 — the 16-byte arena `TapeNode` document and its adaptive indexing.
 //!
-//! Nodes live in ONE contiguous `Vec<TapeNode>` reserved as `Vec::with_capacity(input.len() / 8)`
+//! Nodes live in ONE contiguous `Vec<TapeNode>` reserved as `Vec::with_capacity(input.len() / 12)`
 //! (roughly one malloc per document) in pre-order: children of an Object/Array are appended
 //! immediately after their parent, each node's `skip_to` is the index just past its whole subtree
 //! (so siblings are stepped in O(1)), and `end` carries the direct child count for containers.
@@ -99,12 +99,8 @@ pub const LINEAR_SCAN_MAX: usize = 16;
 /// A parsed document: shared raw bytes + one flat node arena + lazily built wide-object indexes.
 pub struct TapeDoc {
     raw: Arc<[u8]>,
-    nodes: Vec<TapeNode>,
-    /// Parallel to `nodes`: member key content spans, `NO_KEY` when the node has no key.
-    key_spans: Vec<Span>,
-    /// Parallel to `nodes`: full literal byte END for container nodes (`}`/`]` after the close).
-    /// Scalars keep their end inside `TapeNode.end`, so only containers need this side table.
-    lit_ends: Vec<u32>,
+    /// Fused arena: node + key span + container literal end in one contiguous record.
+    recs: Vec<Rec>,
     /// Per-object key indexes for wide objects, built on first lookup and cached here.
     wide_index: Mutex<Option<HashMap<u32, HashMap<u64, u32>>>>,
 }
@@ -112,19 +108,15 @@ pub struct TapeDoc {
 impl TapeDoc {
     /// Build the tape arena from strict JSON text (invalid input -> `Err`, never a panic).
     pub fn build(input: &[u8]) -> Result<Self, ParseErr> {
-        let raw: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
+        let raw: Arc<[u8]> = Arc::from(input); // single allocation + copy
         let mut sink = TapeSink {
-            nodes: Vec::with_capacity(input.len() / 8),
-            key_spans: Vec::with_capacity(input.len() / 8),
-            lit_ends: Vec::with_capacity(input.len() / 8),
+            recs: Vec::with_capacity(input.len() / 14),
             stack: Vec::new(),
         };
         crate::parse::run_parse(input, &mut sink)?;
         Ok(Self {
             raw,
-            nodes: sink.nodes,
-            key_spans: sink.key_spans,
-            lit_ends: sink.lit_ends,
+            recs: sink.recs,
             wide_index: Mutex::new(None),
         })
     }
@@ -136,12 +128,12 @@ impl TapeDoc {
 
     #[inline]
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.recs.len()
     }
 
     #[inline]
     pub fn node(&self, idx: u32) -> &TapeNode {
-        &self.nodes[idx as usize]
+        &self.recs[idx as usize].node
     }
 
     /// Raw source bytes of a node: container brackets `[start..end]`, string body, or number token.
@@ -157,7 +149,7 @@ impl TapeDoc {
     pub fn raw_literal(&self, idx: u32) -> &[u8] {
         let n = self.node(idx);
         if n.is_container() {
-            &self.raw[n.start as usize..self.lit_ends[idx as usize] as usize]
+            &self.raw[n.start as usize..self.recs[idx as usize].lit_end as usize]
         } else {
             self.slice(idx)
         }
@@ -183,13 +175,16 @@ impl TapeDoc {
 
     /// Member key bytes for a child node (`None` when the node has no owning key).
     pub fn key_bytes(&self, child: u32) -> Option<Result<Cow<'_, str>, ParseErr>> {
-        let span = self.key_spans[child as usize];
+        let span = self.recs[child as usize].key;
         if span == NO_KEY {
             return None;
         }
         let bytes = &self.raw[span.0 as usize..span.1 as usize];
         if (self.node(child).flags & FLAG_KEY_ESCAPE) != 0 {
             Some(decode_string_content(bytes).map(Cow::Owned))
+        } else if crate::simd::is_ascii_fast(bytes) {
+            // SAFETY: pure-ASCII bytes are valid UTF-8 by construction.
+            Some(Ok(Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(bytes) })))
         } else {
             Some(
                 std::str::from_utf8(bytes)
@@ -205,7 +200,7 @@ impl TapeDoc {
         if n.key_fp != fp {
             return false;
         }
-        let span = self.key_spans[child as usize];
+        let span = self.recs[child as usize].key;
         if span == NO_KEY {
             return false;
         }
@@ -306,8 +301,13 @@ impl TapeDoc {
                 if (n.flags & FLAG_HAS_ESCAPE) != 0 {
                     Ok(Scalar::Escaped(decode_string_content(bytes)?))
                 } else {
-                    let s = std::str::from_utf8(bytes)
-                        .map_err(|_| ParseErr::new(n.start as usize, "Invalid UTF-8 in string"))?;
+                    let s = if crate::simd::is_ascii_fast(bytes) {
+                        // SAFETY: pure-ASCII bytes are valid UTF-8 by construction.
+                        unsafe { std::str::from_utf8_unchecked(bytes) }
+                    } else {
+                        std::str::from_utf8(bytes)
+                            .map_err(|_| ParseErr::new(n.start as usize, "Invalid UTF-8 in string"))?
+                    };
                     Ok(Scalar::Clean(s))
                 }
             }
@@ -316,8 +316,12 @@ impl TapeDoc {
     }
 
     fn token(&self, idx: u32) -> Result<&str, ParseErr> {
-        std::str::from_utf8(self.slice(idx))
-            .map_err(|_| ParseErr::new(self.node(idx).start as usize, "Invalid token bytes"))
+        let b = self.slice(idx);
+        if crate::simd::is_ascii_fast(b) {
+            // SAFETY: number tokens are ASCII by validated grammar.
+            return Ok(unsafe { std::str::from_utf8_unchecked(b) });
+        }
+        std::str::from_utf8(b).map_err(|_| ParseErr::new(self.node(idx).start as usize, "Invalid token bytes"))
     }
 
     /// Enumerate an object node's member keys in document order. Duplicate keys appear ONCE at
@@ -408,27 +412,38 @@ struct Frame {
 }
 
 /// Sink that appends nodes in pre-order while the shared strict parser validates the document.
+/// One fused arena record: the 16-byte TapeNode plus its member-key span and the container
+/// literal end in a single contiguous slot (one push, one cache-line touch per node).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rec {
+    node: TapeNode,
+    key: Span,
+    lit_end: u32,
+}
+
+/// Sink that appends nodes in pre-order while the shared strict parser validates the document.
 pub struct TapeSink {
-    nodes: Vec<TapeNode>,
-    key_spans: Vec<Span>,
-    lit_ends: Vec<u32>,
+    recs: Vec<Rec>,
     stack: Vec<Frame>,
 }
 
 impl TapeSink {
     fn push(&mut self, kind: u8, flags: u8, span: Span) -> u32 {
-        let idx = self.nodes.len() as u32;
-        self.nodes.push(TapeNode {
+        let idx = self.recs.len() as u32;
+        self.recs.push(Rec {
+            node: TapeNode {
             kind,
             flags,
             key_fp: 0,
             start: span.0,
             // Containers patch `end` to their child count later; scalars keep byte end offsets.
             end: if kind == KIND_OBJECT || kind == KIND_ARRAY { 0 } else { span.1 },
-            skip_to: idx + 1,
+                skip_to: idx + 1,
+            },
+            key: NO_KEY,
+            lit_end: span.1,
         });
-        self.key_spans.push(NO_KEY);
-        self.lit_ends.push(span.1);
         idx
     }
 
@@ -436,10 +451,10 @@ impl TapeSink {
     fn apply_pending_key(&mut self, idx: u32) {
         if let Some(f) = self.stack.last_mut() {
             if let Some((fp, kspan, escaped)) = f.pending.take() {
-                self.nodes[idx as usize].key_fp = fp;
-                self.key_spans[idx as usize] = kspan;
+                self.recs[idx as usize].node.key_fp = fp;
+                self.recs[idx as usize].key = kspan;
                 if escaped {
-                    self.nodes[idx as usize].flags |= FLAG_KEY_ESCAPE;
+                    self.recs[idx as usize].node.flags |= FLAG_KEY_ESCAPE;
                 }
             }
         }
@@ -448,14 +463,14 @@ impl TapeSink {
     fn close_container(&mut self, idx: u32, count: usize, span: Span) {
         let f = self.stack.pop().expect("balanced container frame");
         debug_assert_eq!(f.idx, idx);
-        let next = self.nodes.len() as u32;
+        let next = self.recs.len() as u32;
         {
-            let n = &mut self.nodes[idx as usize];
+            let n = &mut self.recs[idx as usize].node;
             n.start = span.0;
             n.end = count as u32;
             // skip_to = index just past this subtree == next sibling (arena end for the root).
             n.skip_to = next;
-            self.lit_ends[idx as usize] = span.1;
+            self.recs[idx as usize].lit_end = span.1;
         }
         self.apply_pending_key(idx);
     }

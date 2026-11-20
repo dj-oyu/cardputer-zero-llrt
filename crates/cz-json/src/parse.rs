@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use crate::simd::{parse_int_fast, scan_unescaped_run};
+use crate::simd::{is_ascii_fast, scan_unescaped_run};
 use crate::val::{Span, Val};
 
 /// Nesting cap (mirrors QuickJS's recursion guard) so adversarial documents cannot overflow.
@@ -143,10 +143,17 @@ impl<'a> Scanner<'a> {
         let first = scan_unescaped_run(self.b, cs);
         if first < self.b.len() && self.b[first] == b'"' {
             // Clean run: borrow straight from the input buffer (zero copy, no intermediate Vec).
-            let body = std::str::from_utf8(&self.b[cs..first])
-                .map_err(|_| ParseErr::new(cs, "Invalid UTF-8 in string"))?;
+            let body = &self.b[cs..first];
+            // Fast path: pure-ASCII bodies skip the UTF-8 state machine entirely.
+            let s = if is_ascii_fast(body) {
+                // SAFETY: every byte < 0x80, which is valid single-byte UTF-8 by construction.
+                unsafe { std::str::from_utf8_unchecked(body) }
+            } else {
+                std::str::from_utf8(body)
+                    .map_err(|_| ParseErr::new(cs, "Invalid UTF-8 in string"))?
+            };
             self.p = first + 1;
-            return Ok((Cow::Borrowed(body), false, (cs as u32, first as u32)));
+            return Ok((Cow::Borrowed(s), false, (cs as u32, first as u32)));
         }
         if first < self.b.len() && self.b[first] < 0x20 {
             return Err(ParseErr::new(first, "Unescaped control character in string"));
@@ -164,14 +171,23 @@ impl<'a> Scanner<'a> {
     /// token is pure digits (no `.`/`e`/`E`), otherwise the parsed `f64`.
     pub fn scan_number(&mut self) -> Result<(Span, Option<i64>, f64), ParseErr> {
         let start = self.p;
-        if self.peek() == Some(b'-') {
+        let neg = self.peek() == Some(b'-');
+        if neg {
             self.p += 1;
         }
-        // Integer part: 0 | [1-9][0-9]*  (rejects leading zeros such as "01").
+        // Integer part: 0 | [1-9][0-9]*  (rejects leading zeros such as "01"). Single-pass
+        // digit accumulation so integer tokens never get re-parsed from their slice.
+        let mut acc: u64 = 0;
+        let mut digits: usize = 0;
         match self.peek() {
-            Some(b'0') => self.p += 1,
+            Some(b'0') => {
+                digits = 1;
+                self.p += 1;
+            }
             Some(c) if c.is_ascii_digit() => {
                 while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+                    acc = acc.wrapping_mul(10).wrapping_add((self.b[self.p] - b'0') as u64);
+                    digits += 1;
                     self.p += 1;
                 }
             }
@@ -205,12 +221,29 @@ impl<'a> Scanner<'a> {
         let tok = &self.b[start..end];
         let span = (start as u32, end as u32);
         if is_int {
-            if let Some(v) = parse_int_fast(tok) {
+            if digits > 1 && tok[usize::from(neg)] == b'0' {
+                return Err(ParseErr::new(start, "Invalid number token with leading zero"));
+            }
+            // Reuse the value accumulated during the digit scan (no second pass over the token).
+            let fits = if neg { acc <= 9223372036854775808 } else { acc <= i64::MAX as u64 };
+            if fits {
+                let v = if neg && acc == 9223372036854775808 {
+                    i64::MIN
+                } else if neg {
+                    -(acc as i64)
+                } else {
+                    acc as i64
+                };
                 return Ok((span, Some(v), v as f64));
             }
             // Beyond i64 magnitude: QuickJS keeps such numbers as floats.
         }
-        let text = std::str::from_utf8(tok).map_err(|_| ParseErr::new(start, "Invalid number"))?;
+        let text = if is_ascii_fast(tok) {
+            // SAFETY: JSON number grammar tokens are pure ASCII (`-`, digits, `.`, `e`, `+`).
+            unsafe { std::str::from_utf8_unchecked(tok) }
+        } else {
+            std::str::from_utf8(tok).map_err(|_| ParseErr::new(start, "Invalid number"))?
+        };
         let f = match text.parse::<f64>() {
             Ok(f) => f,
             // Grammar already validated, so a parse failure can only be magnitude overflow.
@@ -335,9 +368,9 @@ pub fn decode_string_content(content: &[u8]) -> Result<String, ParseErr> {
 
 /// Drive a whole document through `sink`: whitespace, one strict value, then EOF.
 pub fn run_parse<'a, S: Sink<'a>>(input: &'a [u8], sink: &mut S) -> Result<(), ParseErr> {
-    // One full-document UTF-8 validation pass (std's checker is SIMD-accelerated): values arriving
-    // from JS strings are always valid, and Rust-side callers get clean errors otherwise.
-    std::str::from_utf8(input).map_err(|_| ParseErr::new(0, "Invalid UTF-8 in document"))?;
+    // No full-document UTF-8 pre-validation pass: every string body and member key is validated
+    // when borrowed (`scan_string` clean path / `key_bytes`), so an invalid byte always errors at
+    // its own offset. Skipping the extra whole-document checker removes one 100% memory pass.
     let mut sc = Scanner::new(input);
     sc.skip_ws();
     if sc.peek().is_none() {

@@ -419,10 +419,27 @@ pub fn register(doc: Arc<LazyDoc>) -> u32 {
     id
 }
 
-/// Look up a registered document by id.
+/// Look up a registered document by id. A one-slot thread-local memo skips the global registry
+/// mutex + vector scan when the same document is accessed repeatedly (hot JSON.parse loops).
 pub fn doc(id: u32) -> Option<Arc<LazyDoc>> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<Option<(u32, Arc<LazyDoc>)>> = const { std::cell::RefCell::new(None) };
+    }
+    if let Some(hit) = MEMO.with(|m| {
+        let g = m.borrow();
+        match &*g {
+            Some((mid, arc)) if *mid == id => Some(arc.clone()),
+            _ => None,
+        }
+    }) {
+        return Some(hit);
+    }
     let reg = registry().lock().expect("lazy registry lock");
-    reg.get(id as usize).cloned()
+    let found = reg.get(id as usize).cloned();
+    if let Some(arc) = &found {
+        MEMO.with(|m| *m.borrow_mut() = Some((id, arc.clone())));
+    }
+    found
 }
 
 /// How many Lazy documents are currently registered (diagnostics/tests).

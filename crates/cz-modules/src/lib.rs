@@ -189,7 +189,9 @@ pub fn http_has_pending() -> bool {
 
 /// Idle pause for event-loop passes (~5ms, keeps CardputerZero CPU usage low while waiting).
 pub fn http_idle_pause() {
-    std::thread::sleep(http_module::IDLE_SLEEP);
+    // Instant-wakeup idle pause: fires as soon as a request/disconnect event is queued, so
+    // Keep-Alive round trips skip the fixed 5 ms sleep entirely (still CPU-friendly at max).
+    cz_hal::http_server::idle_wait(http_module::IDLE_SLEEP);
 }
 
 // ---------------------------------------------------------------------------
