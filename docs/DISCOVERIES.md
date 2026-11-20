@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Dead End] H29 ASCII pre-check before stringify-output UTF-8 validation — 2x SLOWER; std from_utf8 is already SIMD (2026-11-20 02:32)
+- **Recall link**: tried reusing the `[Useful] H13 is_ascii_fast` pattern on `ascii()` in do_stringify (called per stringify over up to 237 KB passthrough buffers), judged by µs A/B per `[Note] floor`; `[Note] raw-C-API revisit` reinforced measuring real shipped code paths, not proxies.
+- **Objective µs data (`/tmp/h29` vs live cz-json API, 3× repeats)**: 22 KB: old 266-270 ns vs "new" 517-519 ns; 237 KB: old ~2.8-2.9 µs vs new ~5.5 µs → **~2× slower at both sizes**. Root cause: `std::str::from_utf8` validates via SWAR/SIMD main loop itself (~0.9 B/cycle valid-ASCII); adding our NEON/SWAR pre-check does the SAME detection work twice.
+- **Inverse lesson for H13 insight**: unchecked-after-ascii only pays where validity would OTHERWISE be established expensively (parse-time decode with per-char escape handling). Against an already-SIMD validator it's pure duplicate work. Not shipped; `git checkout` byte-exact revert; gates reconfirmed (phase5 4/4, medians back in band, workspace green).
+- **Site status recorded**: stringify-output UTF cost is ALREADY optimal — one SIMD validation + one NewStringLen copy per stringify; no further win available there without custom unsafe that duplicates std's own machinery.
+
 ### [Dead End] H28 DOM-sink density hint — tiny-doc delta within noise but 7.5× med regression; reverted same-session (2026-11-20 02:15)
 - **Recall link**: tried porting the `[Insightful] fused arena exact-capacity` idea to the small-doc DOM sink under `[Note] floor` judgment via side-by-side µs bench.
 - **Mechanism flaw found by MEASUREMENT, not guesswork**: the Sink trait reports container counts only at `*_end`, so begin-time exact sizing is impossible; my fallback used a GLOBAL length/12 hint applied to EVERY nested container. For a 60-element doc of small objects that means ~180 containers each reserving ~48 slots — catastrophic over-reservation.
