@@ -558,6 +558,27 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
     if v.is_undefined() || v.is_function() || v.is_symbol() {
         return Ok(Value::new_undefined(ctx.clone()));
     }
+    // 3. Regular JS values.
+    if v.is_undefined() || v.is_function() || v.is_symbol() {
+        return Ok(Value::new_undefined(ctx.clone()));
+    }
+    // Scratch reuse for the generic walk too: the borrow is HELD across `walk_json`, so a
+    // reentrant JSON.stringify (from a `toJSON` callback) fails `try_borrow_mut` and transparently
+    // falls back to a fresh Vec below — no aliasing is ever possible.
+    let scratch_hit = SCRATCH_OUT.with(|c| match c.try_borrow_mut() {
+        Ok(mut out) => {
+            out.clear();
+            let mut stack: Vec<*mut c_void> = Vec::new();
+            match walk_json(ctx, v, &mut *out, &mut stack, 0) {
+                Ok(()) => Some(rquickjs::String::from_str(ctx.clone(), ascii(&out))),
+                Err(e) => Some(Err(e)),
+            }
+        }
+        Err(_) => None,
+    });
+    if let Some(r) = scratch_hit {
+        return r.map(|s| s.into_value());
+    }
     let mut out = Vec::new();
     let mut stack: Vec<*mut c_void> = Vec::new();
     walk_json(ctx, v, &mut out, &mut stack, 0)?;

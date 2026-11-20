@@ -307,15 +307,22 @@ fn hex4_at(buf: &[u8], at: usize) -> Result<u32, ParseErr> {
 /// parse-time decoder (short escapes, `\uXXXX`, mandatory surrogate pairing) so Tape reads and
 /// DOM parses always agree. Used lazily: escaped text materializes only when actually touched.
 pub fn decode_string_content(content: &[u8]) -> Result<String, ParseErr> {
-    let mut out = String::new();
+    // Pre-size for the output (escapes only ever SHRINK vs the escaped source length).
+    let mut out = String::with_capacity(content.len());
     let mut i = 0usize;
     while i < content.len() {
         let r = scan_unescaped_run(content, i);
         if r > i {
-            out.push_str(
-                std::str::from_utf8(&content[i..r])
-                    .map_err(|_| ParseErr::new(i, "Invalid UTF-8 in string"))?,
-            );
+            let run = &content[i..r];
+            if crate::simd::is_ascii_fast(run) {
+                // SAFETY: pure ASCII is valid UTF-8 by construction.
+                out.push_str(unsafe { std::str::from_utf8_unchecked(run) });
+            } else {
+                out.push_str(
+                    std::str::from_utf8(run)
+                        .map_err(|_| ParseErr::new(i, "Invalid UTF-8 in string"))?,
+                );
+            }
         }
         if r >= content.len() {
             break;

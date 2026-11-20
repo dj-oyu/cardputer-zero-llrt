@@ -100,6 +100,14 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Insightful] Decode pre-size + mid-decode ASCII fast path; scratch reuse for GENERIC stringify walk (H17) (2026-11-20 21:55)
+- **Recall link**: `[Useful]` profile-levers entry + `[Note]` repeated-run discipline; stayed pure cz-json/Rust (zero JS refs → honors every FFI Dead End).
+- **Anti-gaming decision made first**: `-C target-cpu=native` via host-scoped rustflags would inflate ONLY the host gate with zero device value — REJECTED as measurement-environment manipulation (baseline was recorded under plain config). Profile levers remain exactly: lto=true, codegen-units=1, additive CFLAGS=-O3, no panic=abort.
+- **Change**: (a) `parse.rs decode_string_content` — `String::with_capacity(content.len())` (escapes only shrink output; kills growth reallocs on w2's ~96 KB×80 decodes) + NEON/SWAR `is_ascii_fast` skip for clean runs between escapes (UTF-8-checked fallback kept for multibyte/Japanese runs); (b) `json_module.rs do_stringify` branch 3 now reuses `SCRATCH_OUT` with the borrow HELD across `walk_json`: any reentrant `JSON.stringify` from a `toJSON` callback fails `try_borrow_mut` and falls back to a fresh Vec — aliasing impossible by construction. Circular-ref/BigInt errors leave scratch dirty but next `clear()` discards ✓.
+- **Host x86_64 (3× repeated probes + medians)**: w2 probe full 10 -> **7-8 ms (-20...30%)**; w1 probe 10 -> 8-9; boss medians 56/60/59 (mean ≈58.3 vs 59-61 band), w2 host median 7-8 vs its 12 baseline (**-33%**), everything else stable-or-better, checksums byte-identical (w1 2182166261 / w2 2166961621 unchanged), semantics verified (circular TypeError, toJSON nesting via fallback path, BigInt throw) + 78 crate tests green; full harness 100/100.
+- **Real A53**: escape-heavy w2 should gain MORE (byte-loop validation & realloc growth were costlier there); NEON ascii check already device-proven intrinsics.
+- **Takeaway / sweep**: same capacity pre-size idea fits `lazy.rs serialize` output buffers and `http::serialize_response`.
+
 ### [Note] `CFLAGS=-O3` for QuickJS C via repo .cargo/config.toml — host delta unresolved, shipped for device (2026-11-20 21:35)
 - **Recall link**: `[Useful]` profile-levers entry (Rust-side exhausted; QuickJS C build never tuned) + `[Note]` noise-floor judging discipline.
 - **Change**: new `.cargo/config.toml` `[env] CFLAGS = "-O3"` (cc crate ADDS env flags to its defaults; semantics untouched; applies to host sim AND the aarch64 cross workflow which runs cargo inside this repo).
