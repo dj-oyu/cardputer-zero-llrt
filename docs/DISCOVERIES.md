@@ -33,6 +33,9 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H65 instant duplicate close (pair pre-processed): H28 => H52 residue-free proof + permanent density-heuristic DO-NOT-ATTEMPT guard (restated H62); H49 => enumeration ownership fresh-suite-proven, builder boundary FINAL, kv-write target CLOSED-SUPERSEDED by H18 Record-peek (guard on record) — functional tree still 5adfbb8/H43 so all proofs valid as-proven; fresh PASS 58 ms geoMean 7.61; zero re-audit churn.
+- Pointer-only closure per protocol; armed reopeners unchanged (into_arc_slice ⇒ H19; device builder profile ⇒ H46 atom-cache/raw class; cross-recipe CFLAGS shadowing ⇒ H43). Nothing opened, nothing weakened, harness green before/after.
+
 ### [Note] H64 duplicate-recall fast close (unchanged-tree validity): H31 enumeration ownership checklist re-proven even fresher by H49's 48+2 suite (byte-exact/circular/GETSET-fallback) ⇒ valid as-audited; H12/H13 anchors confirmed at H54/H59 (Arc::from single-copy floor tape.rs:132 = ONLY whole-doc copy post-H42; is_ascii_fast :208/:366/:382 LSE-free) — both classes FINAL, revisit conditions unchanged; fresh PASS 57 ms geoMean 7.44 (2026-11-20 08:45)
 - Pointer closure only (H49/H54/H59 chain). No re-grep on unchanged functional tree (last code commit 5adfbb8/H43 — protocol recorded at H62). Armed reopeners stay exactly the three from H54: into_arc_slice stabilization (⇒ H19 second-copy retry), device builder-dominance profile (⇒ raw-builder/atom-cache class), observed cross-recipe CFLAGS shadowing (⇒ H43 triple keys).
 - Fresh verifier: totals **57 ms** TARGET_MET, all checksums exact every seed. Nothing opened, nothing weakened, zero churn.
