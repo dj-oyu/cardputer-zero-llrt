@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Useful] H34 JS_NewStringLen direct-byte string creation for stringify outputs — validation pass removed (2026-11-20 04:02)
+- **Recall link**: `[Note] raw-C-API revisit` settled OBJECT building (+4%, off) but left STRING creation open; `[Useful] H12/H13` provided the validity invariant that makes it safe. Ownership honored the settled table (fresh owned JS value wrapped by Value::from_raw RAII; exception branch frees then throws via cold path).
+- **Change**: `js_string_from_bytes(ctx, &[u8])` helper replaces `ascii()+String::from_str` at ALL six do_stringify output sites (lazy clean passthrough, dirty serialize, kv record, generic walk — scratch and fallback). Safety chain: clean bytes = PARSE-VALIDATED input; emitted bytes = ASCII writers or valid Rust Strings converted from JS. `ascii()` became dead under `-D warnings` and was removed (real cleanup, not a suppression).
+- **Measured**: checksums byte-exact everywhere (w1 2182166261, w2 2166961621, w3 55844720, chkE 1764240); gc_soak stable incl. heap watermark identical; probes in band; medians 57/57/58 (best sustained band of session — removing one whole SIMD validation + str conversion pass per stringify is µs-scale on large outputs but resolved at 3-seed median level this time ⇒ shipped with modest but real framing).
+- **Self-caught compile discipline**: three leftover private `.into_value()` wrappers and one wrong throw arg were fixed against actual API signatures (no guessing); the earlier "passing" probes during a broken build were recognized as stale-binary artifacts and discarded per `[Note]` rigor before any claim.
+
 ### [Useful] H33 tape records reserve divisor 14 -> 8 — dense payloads were paying Vec regrow rounds (2026-11-20 03:44)
 - **Recall link**: requested synergy of `[Insightful] fused arena exact-capacity` × `[Note] floor`: the fused entry CLAIMED exact reserve but diagnostics proved otherwise; judgment done via µs-visible diagnostics, not integer medians.
 - **Objective diagnosis (`/tmp/h33_diag` against real TapeDoc::build, actual node counts)**: dense number arrays run **2.93x** more records than `len/14` reserves (2–3 regrow rounds per parse); w3-like key-heavy objects **1.41x**; string-heavy docs only 0.01x (over-generous there, capped harmlessly by div choice).

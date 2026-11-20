@@ -515,13 +515,13 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
                     }
                     // No JS runs inside `from_str` (pure allocation + copy): the borrow cannot
                     // re-enter while held. Zero extra Rust-side copies.
-                    Some(rquickjs::String::from_str(ctx.clone(), ascii(&out)))
+                    Some(unsafe { js_string_from_bytes(&ctx, &out) })
                 }
                 Err(_) => None, // reentrant stringify: fall back below
             }
         });
         if let Some(r) = scratch_hit {
-            return Ok(r?.into_value());
+            return Ok(r?);
         }
         let mut out = Vec::new();
         if doc.subtree_is_clean(node) {
@@ -530,7 +530,7 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
         } else {
             doc.serialize(node, &mut out);
         }
-        return Ok(rquickjs::String::from_str(ctx.clone(), ascii(&out))?.into_value());
+        return Ok(unsafe { js_string_from_bytes(ctx, &out) }?);
     }
     // 2. cardputer:kv row handles — direct EntryPayload::Record serialization, no JS traps.
     if let Some((store, key)) = kv_row_tag(ctx, v)? {
@@ -541,17 +541,17 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
                     write_kv_record(&mut *out, &store, &key);
                     // Record serialization touches Rust state only; `from_str` allocates a JS
                     // string without running JS — no reentrancy risk while borrowed.
-                    Some(rquickjs::String::from_str(ctx.clone(), ascii(&out)))
+                    Some(unsafe { js_string_from_bytes(&ctx, &out) })
                 }
                 Err(_) => None,
             }
         });
         if let Some(r) = scratch_hit {
-            return Ok(r?.into_value());
+            return Ok(r?);
         }
         let mut out = Vec::new();
         write_kv_record(&mut out, &store, &key);
-        return Ok(rquickjs::String::from_str(ctx.clone(), ascii(&out))?.into_value());
+        return Ok(unsafe { js_string_from_bytes(ctx, &out) }?);
     }
     // 3. Regular JS values.
     if v.is_undefined() || v.is_function() || v.is_symbol() {
@@ -569,29 +569,42 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
             out.clear();
             let mut stack: Vec<*mut c_void> = Vec::new();
             match walk_json(ctx, v, &mut *out, &mut stack, 0) {
-                Ok(()) => Some(rquickjs::String::from_str(ctx.clone(), ascii(&out))),
+                Ok(()) => Some(unsafe { js_string_from_bytes(&ctx, &out) }),
                 Err(e) => Some(Err(e)),
             }
         }
         Err(_) => None,
     });
     if let Some(r) = scratch_hit {
-        return r.map(|s| s.into_value());
+        return r;
     }
     let mut out = Vec::new();
     let mut stack: Vec<*mut c_void> = Vec::new();
     walk_json(ctx, v, &mut out, &mut stack, 0)?;
-    Ok(rquickjs::String::from_str(ctx.clone(), ascii(&out))?.into_value())
+    Ok(unsafe { js_string_from_bytes(ctx, &out) }?)
 }
 
-/// JSON output is always ASCII (our writers only emit digits/escapes), so conversion is trivial.
-fn ascii(bytes: &[u8]) -> &str {
-    // A UTF-8 failure would be an engine bug; fall back to a lossy view instead of panicking.
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => "{}",
+/// Build a JS string DIRECTLY from owned UTF-8 bytes via JS_NewStringLen - no intermediate
+/// &str validation pass. Safety chain for the stringify outputs: (a) clean-subtree passthrough
+/// bytes come from PARSE-VALIDATED input (H12/H13 invariant), (b) serialized/emitted bytes are
+/// ASCII from writers or valid Rust Strings converted from JS. Ownership: the fresh JS value is
+/// refcount-owned and immediately wrapped by Value::from_raw RAII (settled ownership table).
+unsafe fn js_string_from_bytes<'js>(ctx: &Ctx<'js>, bytes: &[u8]) -> Result<Value<'js>> {
+    let q = ctx.as_raw().as_ptr();
+    let v = rquickjs::qjs::JS_NewStringLen(
+        q,
+        bytes.as_ptr() as *const ::core::ffi::c_char,
+        bytes.len() as ::core::ffi::c_ulong /* size_t */,
+    );
+    if unsafe { rquickjs::qjs::JS_IsException(v) } {
+        // Cold path (allocation failure): drop the exception marker and surface a Rust-side
+        // error the runner converts to a JS throw. Matches prior from_str failure semantics.
+        unsafe { rquickjs::qjs::JS_FreeValue(q, v) };
+        return Err(Exception::throw_message(ctx, "string allocation failed"));
     }
+    Ok(Value::from_raw(ctx.clone(), v))
 }
+
 
 /// Serialize a KV row straight from the Rust `EntryPayload::Record` (sorted field names).
 fn write_kv_record(out: &mut Vec<u8>, store: &str, key: &str) {
