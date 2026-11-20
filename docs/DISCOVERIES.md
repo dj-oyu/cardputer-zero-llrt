@@ -33,6 +33,14 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Dead End] H21 SWAR single-mask escape writer — no host win; `continue`-skips-counter bug + flawed fuzz harness caught (2026-11-20 23:58)
+- **Recall link**: `[Useful] profile knobs` fully spent ⇒ stay in safe code paths; `[Useful] one-slot memo` checked against KV registry (row path already store-memoized — nothing hot left there); noise-floor Note governed the ship bar.
+- **Hypothesis**: consuming ONE SWAR hit-mask per 8-byte word via ctz (bulk-copying runs between escapes) would cut reload overhead on escape-dense strings (w2). Device NEON path deliberately untouched.
+- **Correctness**: authoritative evidence kept honest — w2 checksum byte-identical (2166961621) baseline vs H21, escaped-string unit tests green, gc_soak stable. A random-string fuzz initially reported 30 mismatches but showed the SAME count on the stashed BASELINE build ⇒ the harness double-stringified (`console.log(JSON.stringify(<json-text-param>))`) — recognized as harness artifact, discarded, NOT used to claim/deny correctness.
+- **Bug class recorded (reusable)**: a `continue` on clean words skipped the loop's `i += 8` → infinite loop (cargo test hang caught it instantly). Rule: every `continue` inside counted loops must advance the cursor explicitly.
+- **Measured verdict (repeats)**: probe stringifyOnly 3–4 ms and full 7–8 ms on BOTH states; boss-level delta under the integer-ms floor ⇒ no ≥ 1.05× proof → reverted via `git checkout` (tree returned byte-identical to HEAD; shipped state reconfirmed w2 full=8, w3 full=24, phase5 4/4).
+- **A53 note**: escape-dense cost share is similar on device, but without host-verifiable gain shipping unproven churn violates `[Note]`; revisit only with µs-level device profiling.
+
 ### [Note] H19 zero-second-copy lazy arena via Vec→Arc buffer reuse — blocked by std on Rust 1.100; reverted (2026-11-20 23:40)
 - **Recall link**: `[Dead End] raw-C-API` kept the attempt in pure safe Rust; `[Note] noise-floor` demanded objective structural proof before any claim.
 - **Hypothesis**: every >=4 KB lazy parse copies the document twice (JS->Rust String conversion, then Arc allocation). A Vec→Arc buffer move would eliminate the second whole-doc copy for w2/w3/w4.
