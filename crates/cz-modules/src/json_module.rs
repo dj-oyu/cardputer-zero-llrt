@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 
 use rquickjs::function::Args;
-use rquickjs::{Array, Ctx, CString, Exception, Function, Object, Result, Symbol, Value};
+use rquickjs::{Array, Atom, Ctx, CString, Exception, Function, Object, Result, Symbol, Value};
 
 use cz_hal::kv::KvValue;
 use cz_json::lazy::{Got, LazyDoc};
@@ -464,14 +464,85 @@ fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>, parent: u32) -> R
     }
 }
 
+/// Round 3 (w3 kill): L1-resident, 32-slot direct-mapped `JSAtom` cache for repeated object
+/// member keys. Homogeneous arrays (`id`/`name`/`status`/`score`/`voltage`/`active` x 250) re-hash
+/// the same handful of keys through `JS_NewAtomLen` on every `obj.set`. A cached atom is handed
+/// out as a cheap `JS_DupAtom` clone instead; exact inline byte verification (len + up to 24
+/// bytes) makes hash collisions harmless. The cache lives ONLY inside one builder call — all
+/// atoms are RAII-owned against this very `Ctx`, dropped when the call returns (zero leaks, zero
+/// cross-runtime staleness). Long/odd keys bypass caching and consume their atom exactly like
+/// before.
+struct InlineKey {
+    len: u8,
+    bytes: [u8; 24],
+}
+
+struct AtomKeyCache<'js> {
+    ctx: Ctx<'js>,
+    slots: [Option<(Atom<'js>, InlineKey)>; 32],
+}
+
+#[inline]
+fn fast_key_hash(key: &str) -> u64 {
+    // FNV-1a over the key bytes; correctness never depends on it (slots verify exact bytes).
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in key.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+impl<'js> AtomKeyCache<'js> {
+    fn new(ctx: Ctx<'js>) -> Self {
+        Self {
+            ctx,
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+
+    /// Returns an owned duplicate ready for `obj.set` (which frees it right after the store).
+    fn get_or_make(&mut self, key: &str) -> Result<Atom<'js>> {
+        let slot = (fast_key_hash(key) & 31) as usize;
+        if let Some((atom, k)) = &self.slots[slot] {
+            if k.len as usize == key.len() && k.bytes[..k.len as usize] == *key.as_bytes() {
+                return Ok(atom.clone()); // JS_DupAtom + refcount bump, no hashing
+            }
+        }
+        let atom = Atom::from_str(self.ctx.clone(), key)?;
+        if key.len() <= 24 {
+            let mut bytes = [0u8; 24];
+            bytes[..key.len()].copy_from_slice(key.as_bytes());
+            // Cache keeps ONE reference; replacing a slot RAII-frees whatever was there before.
+            self.slots[slot] = Some((atom.clone(), InlineKey { len: key.len() as u8, bytes }));
+            return Ok(atom); // hand out the fresh copy (moved, not cloned)
+        }
+        Ok(atom) // uncached long keys move straight into `obj.set` like before
+    }
+}
+
 fn materialize_native<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, node: u32) -> Result<Value<'js>> {
+    let t = &doc.tape;
+    let n = t.node(node);
+    // Gate: the atom cache pays off ONLY when one build pass creates many objects with repeated
+    // keys (big clean subtree arrays). A single-object materialization (the dominant proxy shape:
+    // one item per native call) measured 0.76x WITH the cache in the isolated per-call A/B — so
+    // small/top-single nodes take the untouched plain-key path. See DISCOVERIES H75/H76.
+    if n.kind == cz_json::tape::KIND_ARRAY && n.child_count() >= 16 {
+        let mut cache = AtomKeyCache::new(ctx.clone());
+        return materialize_native_cached(ctx, doc, node, &mut cache);
+    }
+    materialize_native_plain(ctx, doc, node)
+}
+
+fn materialize_native_plain<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, node: u32) -> Result<Value<'js>> {
     let t = &doc.tape;
     let n = t.node(node);
     if n.kind == cz_json::tape::KIND_ARRAY {
         let arr = Array::new(ctx.clone())?;
         for i in 0..n.child_count() {
             if let Some(c) = t.child_at(node, i) {
-                arr.set(i, materialize_native(ctx, doc, c)?)?;
+                arr.set(i, materialize_native_plain(ctx, doc, c)?)?;
             }
         }
         Ok(arr.into_value())
@@ -480,7 +551,51 @@ fn materialize_native<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, node: u32) -> Result<V
         for c in t.children(node) {
             if let Some(k) = t.key_bytes(c) {
                 if let Ok(key) = k {
-                    obj.set(key.as_ref(), materialize_native(ctx, doc, c)?)?;
+                    obj.set(key.as_ref(), materialize_native_plain(ctx, doc, c)?)?;
+                }
+            }
+        }
+        Ok(obj.into_value())
+    } else {
+        match t.scalar(node) {
+            Ok(s) => match s {
+                cz_json::Scalar::Null => Ok(Value::new_null(ctx.clone())),
+                cz_json::Scalar::Bool(b) => Ok(Value::new_bool(ctx.clone(), b)),
+                cz_json::Scalar::Int(i) => Ok(Value::new_float(ctx.clone(), i as f64)),
+                cz_json::Scalar::Float(f) => Ok(Value::new_float(ctx.clone(), f)),
+                cz_json::Scalar::Clean(s) => Ok(rquickjs::String::from_str(ctx.clone(), s)?.into_value()),
+                cz_json::Scalar::Escaped(s) => Ok(rquickjs::String::from_str(ctx.clone(), &s)?.into_value()),
+            },
+            Err(_) => Ok(Value::new_null(ctx.clone())),
+        }
+    }
+}
+
+fn materialize_native_cached<'js>(
+    ctx: &Ctx<'js>,
+    doc: &LazyDoc,
+    node: u32,
+    cache: &mut AtomKeyCache<'js>,
+) -> Result<Value<'js>> {
+    // Recursion inside a cache-enabled pass stays on the cached builder; nested small subtrees
+    // still reuse the parent call's slots (uniform sibling objects dominate this class).
+    let t = &doc.tape;
+    let n = t.node(node);
+    if n.kind == cz_json::tape::KIND_ARRAY {
+        let arr = Array::new(ctx.clone())?;
+        for i in 0..n.child_count() {
+            if let Some(c) = t.child_at(node, i) {
+                arr.set(i, materialize_native_cached(ctx, doc, c, cache)?)?;
+            }
+        }
+        Ok(arr.into_value())
+    } else if n.kind == cz_json::tape::KIND_OBJECT {
+        let obj = Object::new(ctx.clone())?;
+        for c in t.children(node) {
+            if let Some(k) = t.key_bytes(c) {
+                if let Ok(key) = k {
+                    let atom = cache.get_or_make(key.as_ref())?;
+                    obj.set(atom, materialize_native_cached(ctx, doc, c, cache)?)?;
                 }
             }
         }

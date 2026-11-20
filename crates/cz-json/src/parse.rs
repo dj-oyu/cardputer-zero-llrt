@@ -269,38 +269,66 @@ impl<'a> Scanner<'a> {
     }
 }
 
-fn hex_val(c: u8) -> Option<u32> {
-    match c {
-        b'0'..=b'9' => Some((c - b'0') as u32),
-        b'a'..=b'f' => Some((c - b'a') as u32 + 10),
-        b'A'..=b'F' => Some((c - b'A') as u32 + 10),
-        _ => None,
+/// `const`-built 256-entry hex nibble map: valid `[0-9a-fA-F]` -> 0..15, everything else -> -1.
+/// Replaces the match-chain `hex_val`, so four digits decode through independent table loads
+/// with zero serial branches (Round 3 A53 stall work — see audit entry for `hex4_opt`).
+const HEX_NIBBLE: [i8; 256] = build_hex_nibble();
+
+const fn build_hex_nibble() -> [i8; 256] {
+    let mut t = [-1i8; 256];
+    let mut c = 0usize;
+    while c < 10 {
+        t[b'0' as usize + c] = c as i8;
+        c += 1;
     }
+    let mut c = 0usize;
+    while c < 6 {
+        t[b'a' as usize + c] = (c + 10) as i8;
+        t[b'A' as usize + c] = (c + 10) as i8;
+        c += 1;
+    }
+    t
 }
 
 /// Four hex digits at `at` inside `buf`, or `None` when truncated/non-hex (positional walker form).
+/// The four bytes arrive as ONE little-endian word (A53 handles unaligned loads), and rejection
+/// is a single OR-of-sign-bits test — no serial `?` chain across the four digits.
+#[inline]
 fn hex4_opt(buf: &[u8], at: usize) -> Option<u32> {
     if at + 4 > buf.len() {
         return None;
     }
-    let mut v = 0u32;
-    for k in 0..4 {
-        v = (v << 4) | hex_val(buf[at + k])?;
+    let w = u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+    let t0 = HEX_NIBBLE[(w & 0xff) as usize] as u32;
+    let t1 = HEX_NIBBLE[((w >> 8) & 0xff) as usize] as u32;
+    let t2 = HEX_NIBBLE[((w >> 16) & 0xff) as usize] as u32;
+    let t3 = HEX_NIBBLE[(w >> 24) as usize] as u32;
+    // Any invalid lane sign-extends to 0xFFFFFFFF; one test rejects all four.
+    if (t0 | t1 | t2 | t3) & 0x8000_0000 != 0 {
+        return None;
     }
-    Some(v)
+    // First byte is the most significant nibble, exactly like the old shift loop.
+    Some((t0 << 12) | (t1 << 8) | (t2 << 4) | t3)
 }
 
-/// Four hex digits at `at` inside `buf`.
+/// Four hex digits at `at` inside `buf`. Error positions match the old byte-wise walk exactly:
+/// truncation reports `at`, and the FIRST bad digit reports `at + k`.
 fn hex4_at(buf: &[u8], at: usize) -> Result<u32, ParseErr> {
     if at + 4 > buf.len() {
         return Err(ParseErr::new(at, "Truncated \\u escape"));
     }
-    let mut v = 0u32;
-    for k in 0..4 {
-        let d = hex_val(buf[at + k]).ok_or_else(|| ParseErr::new(at + k, "Invalid hex digit"))?;
-        v = (v << 4) | d;
+    match hex4_opt(buf, at) {
+        Some(v) => Ok(v),
+        None => {
+            // Cold path: locate the first offending byte for the exact legacy message/offset.
+            for k in 0..4 {
+                if HEX_NIBBLE[buf[at + k] as usize] < 0 {
+                    return Err(ParseErr::new(at + k, "Invalid hex digit"));
+                }
+            }
+            Err(ParseErr::new(at, "Invalid hex digit")) // unreachable fallback
+        }
     }
-    Ok(v)
 }
 
 /// Decode an escaped JSON string BODY (bytes strictly between the quotes). Identical rules to the
@@ -698,6 +726,23 @@ mod parse_tests {
         assert!(items[6].as_f64().unwrap().is_finite());
         assert!(items[7].as_f64().unwrap().is_infinite());
         assert!((items[8].as_f64().unwrap() - 1.2345678901234568e19).abs() < 1.0);
+    }
+
+    #[test]
+    fn u_escape_errors_keep_legacy_positions_and_messages() {
+        // Round 3 word-loaded hex4_at must report byte-identical errors to the old walk
+        // (positions/messages captured live from the pre-change snapshot in the A/B probe).
+        let tail = parse_dom(b"\"\\u12\"").expect_err("short escape tail");
+        assert_eq!(tail.msg, "Unterminated string or raw control byte");
+        let bad2 = parse_dom(b"\"a\\u12g4b\"").expect_err("bad digit");
+        assert_eq!(bad2.msg, "Invalid hex digit");
+        assert_eq!(bad2.pos, 5, "first-bad-digit position must match legacy walk");
+        let bad3 = parse_dom(b"\"\\uZZZZ\"").expect_err("bad digits");
+        assert_eq!(bad3.msg, "Invalid hex digit");
+        assert_eq!(bad3.pos, 2);
+        // Mixed case hex stays valid and decodes identically (word path covers a-f/A-F lanes).
+        let ok = parse_dom(b"\"\\u00E9\\uff4A\"").expect("mixed case escapes");
+        assert_eq!(ok.as_str(), Some("éｊ"));
     }
 
     #[test]

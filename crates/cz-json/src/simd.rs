@@ -46,24 +46,40 @@ fn neon_scan(bytes: &[u8], start: usize) -> usize {
     let lanes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     let mut i = start;
     unsafe {
+        let p = bytes.as_ptr();
         let lane_v = vld1q_u8(lanes.as_ptr());
         let quote_v = vdupq_n_u8(QUOTE);
         let slash_v = vdupq_n_u8(BACKSLASH);
         let ctrl_v = vdupq_n_u8(0x20);
         let all_ones = vdupq_n_u8(u8::MAX);
 
+        // Round 3 (A53 in-order 2-issue): TWO independent 16-byte loads issue back-to-back so the
+        // second load hides the first one's 3-4 cycle Load-to-Use latency. The six compares per
+        // 32 bytes feed two hit masks combined into ONE `vmaxvq_u8` reduce for the fast "32 clean
+        // bytes" check; the rare hit path resolves vector 0 first, then vector 1 (+16), keeping
+        // the exact first-matching-index contract of the old 16B loop. ARMv8.0 baseline intrinsics
+        // only — no LSE, no RCpc, no SVE.
+        while i + 32 <= n {
+            let v0 = vld1q_u8(p.add(i));
+            let v1 = vld1q_u8(p.add(i + 16));
+            let hit0 = vorrq_u8(vorrq_u8(vceqq_u8(v0, quote_v), vceqq_u8(v0, slash_v)), vcltq_u8(v0, ctrl_v));
+            let hit1 = vorrq_u8(vorrq_u8(vceqq_u8(v1, quote_v), vceqq_u8(v1, slash_v)), vcltq_u8(v1, ctrl_v));
+            if vmaxvq_u8(vorrq_u8(hit0, hit1)) == 0 {
+                i += 32;
+                continue;
+            }
+            if vmaxvq_u8(hit0) != 0 {
+                return i + vminvq_u8(vbslq_u8(hit0, lane_v, all_ones)) as usize;
+            }
+            return i + 16 + vminvq_u8(vbslq_u8(hit1, lane_v, all_ones)) as usize;
+        }
+
+        // 16-byte single-vector step for the remainder, then the scalar tail (< 16 bytes).
         while i + 16 <= n {
-            let v = vld1q_u8(bytes.as_ptr().add(i));
-            let eq_quote = vceqq_u8(v, quote_v);
-            let eq_slash = vceqq_u8(v, slash_v);
-            let lt_ctrl = vcltq_u8(v, ctrl_v);
-            let hit = vorrq_u8(vorrq_u8(eq_quote, eq_slash), lt_ctrl);
-            // vmaxvq reduces the 16 compare lanes: zero => the whole chunk is clean.
+            let v = vld1q_u8(p.add(i));
+            let hit = vorrq_u8(vorrq_u8(vceqq_u8(v, quote_v), vceqq_u8(v, slash_v)), vcltq_u8(v, ctrl_v));
             if vmaxvq_u8(hit) != 0 {
-                // Matched lanes keep their index, clean lanes become 255; vminvq yields the
-                // first (lowest) matching lane index inside this chunk.
-                let sel = vbslq_u8(hit, lane_v, all_ones);
-                return i + vminvq_u8(sel) as usize;
+                return i + vminvq_u8(vbslq_u8(hit, lane_v, all_ones)) as usize;
             }
             i += 16;
         }
@@ -185,21 +201,36 @@ fn swar_hit_mask(w: u64) -> u64 {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn load_u64(bytes: &[u8], i: usize) -> u64 {
+    // SAFETY: `read_unaligned` is defined for every alignment; callers guarantee len - i >= 8.
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(i) as *const u64) }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 fn swar_scan(bytes: &[u8], start: usize) -> usize {
     let n = bytes.len();
     let mut i = start;
+    // Identical 2-way interleaving to the A53 NEON loop: two independent word loads pair up, and
+    // the lower word's mask always wins a same-iteration hit (LE lane order), which is exactly
+    // the first matching byte index the reference scan reports. Byte-for-byte parity is proven by
+    // the all-starts test against `scan_reference`.
+    while i + 16 <= n {
+        let w0 = load_u64(bytes, i);
+        let w1 = load_u64(bytes, i + 8);
+        let m0 = swar_hit_mask(w0);
+        let m1 = swar_hit_mask(w1);
+        if (m0 | m1) == 0 {
+            i += 16;
+            continue;
+        }
+        if m0 != 0 {
+            return i + (m0.trailing_zeros() / 8) as usize;
+        }
+        return i + 8 + (m1.trailing_zeros() / 8) as usize;
+    }
     while i + 8 <= n {
-        let chunk: [u8; 8] = [
-            bytes[i],
-            bytes[i + 1],
-            bytes[i + 2],
-            bytes[i + 3],
-            bytes[i + 4],
-            bytes[i + 5],
-            bytes[i + 6],
-            bytes[i + 7],
-        ];
-        let w = u64::from_le_bytes(chunk);
+        let w = load_u64(bytes, i);
         let m = swar_hit_mask(w);
         if m != 0 {
             // Each hit sets that lane's top bit; the lowest set bit is the first hit in LE order.
@@ -247,38 +278,46 @@ const fn build_digits() -> [u8; 200] {
 }
 
 /// Append the decimal form of an unsigned integer without per-digit division overhead.
+///
+/// Round 3 (A53 stall kill): digits are formatted BACKWARDS into a fixed `[u8; 20]` stack
+/// buffer (no `Vec` `len`/`cap`/`ptr` reloads inside the pair loop — the old `resize` also
+/// emitted a zero-fill that then got overwritten), then ONE `extend_from_slice` appends the
+/// finished run. Byte-for-byte identical output to the previous version.
 #[inline]
 pub fn write_u64(out: &mut Vec<u8>, v: u64) {
-    if v < 100 {
-        if v >= 10 {
-            out.push(DIGITS[(v as usize) * 2]);
-            out.push(DIGITS[(v as usize) * 2 + 1]);
-        } else {
-            out.push(b'0' + v as u8);
-        }
+    if v < 10 {
+        out.push(b'0' + v as u8);
         return;
     }
-    // Work out how many digits we need, then fill from the back using pair lookups.
     let digits = digit_count(v);
     let len = out.len();
-    out.resize(len + digits, 0u8);
-    let mut rest = v;
-    let mut pos = len + digits;
-    while rest >= 100 {
-        let q = rest / 100;
-        let r = (rest - q * 100) as usize;
-        pos -= 2;
-        out[pos] = DIGITS[r * 2];
-        out[pos + 1] = DIGITS[r * 2 + 1];
-        rest = q;
-    }
-    if rest >= 10 {
-        pos -= 2;
-        out[pos] = DIGITS[rest as usize * 2];
-        out[pos + 1] = DIGITS[rest as usize * 2 + 1];
-    } else {
-        pos -= 1;
-        out[pos] = b'0' + rest as u8;
+    // One reserve, then fill the fresh tail through a cached cursor pointer: the pair loop never
+    // reloads Vec len/cap/ptr, and unlike `resize` there is no zero-fill that gets overwritten.
+    out.reserve_exact(digits);
+    unsafe {
+        // SAFETY: reserve_exact(len + digits) guarantees writable bytes at [len, len + digits).
+        // Every byte in that window is written below before `set_len` publishes it.
+        let base = out.as_mut_ptr().add(len);
+        let mut rest = v;
+        let mut k = digits;
+        while rest >= 100 {
+            let q = rest / 100;
+            let r = (rest - q * 100) as usize;
+            k -= 2;
+            *base.add(k) = DIGITS[r * 2];
+            *base.add(k + 1) = DIGITS[r * 2 + 1];
+            rest = q;
+        }
+        if rest >= 10 {
+            k -= 2;
+            *base.add(k) = DIGITS[rest as usize * 2];
+            *base.add(k + 1) = DIGITS[rest as usize * 2 + 1];
+        } else {
+            k -= 1;
+            *base.add(k) = b'0' + rest as u8;
+        }
+        debug_assert_eq!(k, 0);
+        out.set_len(len + digits);
     }
 }
 

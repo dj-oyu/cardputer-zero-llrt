@@ -504,35 +504,138 @@ enum ChunkMove {
 
 /// Find the end of the header section: either `\r\n\r\n` or bare `\n\n`, whichever comes first.
 /// Returns `(header_block_end_index, terminator_length)`.
+///
+/// Round 3 (Stall #1 kill): instead of two byte-at-a-time `find_subslice` walks over the whole
+/// buffer, one vectorized newline-candidate scan (`scan_newline`) drives exact-local checks at
+/// each `\n`. Matches are discovered in ascending START order (`\n\n` starts at the candidate,
+/// `\r\n\r\n` starts one byte earlier), so the first event reported equals the legacy
+/// `min(crlf_first, lf_first)` with crlf winning a tie. Semantics identical, including the
+/// "pattern must be fully present" rule.
 fn find_head_terminator(buf: &mut VecDeque<u8>) -> Option<(usize, usize)> {
     let contig = buf.make_contiguous();
-    let crlf = find_subslice(contig, b"\r\n\r\n");
-    let lf = find_subslice(contig, b"\n\n");
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(if a <= b { (a, 4) } else { (b, 2) }),
-        (Some(a), None) => Some((a, 4)),
-        (None, Some(b)) => Some((b, 2)),
-        (None, None) => None,
+    let n = contig.len();
+    let mut p = scan_newline(contig, 0);
+    loop {
+        let Some(nl) = p else { return None };
+        // Bare \n\n at `nl`: needs a second newline immediately after it.
+        if nl + 1 < n && contig[nl + 1] == b'\n' {
+            return Some((nl, 2));
+        }
+        // \r\n\r\n starting at nl - 1: \r before, \r then \n two bytes ahead.
+        if nl >= 1
+            && nl + 2 < n
+            && contig[nl - 1] == b'\r'
+            && contig[nl + 1] == b'\r'
+            && contig[nl + 2] == b'\n'
+        {
+            return Some((nl - 1, 4));
+        }
+        p = scan_newline(&contig[nl + 1..], 0).map(|q| q + nl + 1);
     }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.len() > haystack.len() {
+/// Index of the first `\n` at or after `start`, or `None`. ARMv8.0 NEON (32B interleaved, then
+/// 16B) on aarch64; identical-semantics SWAR words elsewhere; scalar tail keeps exact parity.
+fn scan_newline(bytes: &[u8], start: usize) -> Option<usize> {
+    let n = bytes.len();
+    if start >= n {
         return None;
     }
-    for i in 0..=(haystack.len() - needle.len()) {
-        if &haystack[i..i + needle.len()] == needle {
-            return Some(i);
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{
+            vbslq_u8, vceqq_u8, vdupq_n_u8, vld1q_u8, vminvq_u8, vmaxvq_u8,
+        };
+        let lanes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut i = start;
+        unsafe {
+            let p = bytes.as_ptr();
+            let lane_v = vld1q_u8(lanes.as_ptr());
+            let nl_v = vdupq_n_u8(b'\n');
+            let all_ones = vdupq_n_u8(u8::MAX);
+            while i + 32 <= n {
+                // Two independent loads back-to-back hide the A53 Load-to-Use stall.
+                let v0 = vld1q_u8(p.add(i));
+                let v1 = vld1q_u8(p.add(i + 16));
+                let hit0 = vceqq_u8(v0, nl_v);
+                let hit1 = vceqq_u8(v1, nl_v);
+                if vmaxvq_u8(hit0) == 0 && vmaxvq_u8(hit1) == 0 {
+                    i += 32;
+                    continue;
+                }
+                if vmaxvq_u8(hit0) != 0 {
+                    return Some(i + vminvq_u8(vbslq_u8(hit0, lane_v, all_ones)) as usize);
+                }
+                return Some(i + 16 + vminvq_u8(vbslq_u8(hit1, lane_v, all_ones)) as usize);
+            }
+            while i + 16 <= n {
+                let v = vld1q_u8(p.add(i));
+                let hit = vceqq_u8(v, nl_v);
+                if vmaxvq_u8(hit) != 0 {
+                    return Some(i + vminvq_u8(vbslq_u8(hit, lane_v, all_ones)) as usize);
+                }
+                i += 16;
+            }
         }
+        while i < n {
+            if bytes[i] == b'\n' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
-    None
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        const ONES: u64 = 0x0101010101010101;
+        const HIGH: u64 = 0x8080808080808080;
+        #[inline]
+        fn swar_eq(w: u64, v: u8) -> u64 {
+            let x = w ^ (ONES * u64::from(v));
+            x.wrapping_sub(ONES) & !x & HIGH
+        }
+        #[inline]
+        fn load8(b: &[u8], i: usize) -> u64 {
+            // SAFETY: read_unaligned handles any alignment; callers guarantee len - i >= 8.
+            unsafe { core::ptr::read_unaligned(b.as_ptr().add(i) as *const u64) }
+        }
+        let mut i = start;
+        while i + 16 <= n {
+            let w0 = load8(bytes, i);
+            let w1 = load8(bytes, i + 8);
+            let m0 = swar_eq(w0, b'\n');
+            let m1 = swar_eq(w1, b'\n');
+            if (m0 | m1) == 0 {
+                i += 16;
+                continue;
+            }
+            if m0 != 0 {
+                return Some(i + (m0.trailing_zeros() / 8) as usize);
+            }
+            return Some(i + 8 + (m1.trailing_zeros() / 8) as usize);
+        }
+        while i + 8 <= n {
+            let m = swar_eq(load8(bytes, i), b'\n');
+            if m != 0 {
+                return Some(i + (m.trailing_zeros() / 8) as usize);
+            }
+            i += 8;
+        }
+        while i < n {
+            if bytes[i] == b'\n' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
 }
 
 /// Remove one header/trailer line (`\r\n` or `\n` terminated) from the front of `buf`.
 /// Returns `None` when the terminator has not arrived yet.
 fn take_line(buf: &mut VecDeque<u8>) -> Option<Vec<u8>> {
     let contig = buf.make_contiguous();
-    let nl = find_subslice(contig, b"\n")?;
+    let nl = scan_newline(contig, 0)?;
     let mut line: Vec<u8> = contig[..nl].to_vec();
     if line.last() == Some(&b'\r') {
         line.pop();
@@ -788,6 +891,112 @@ mod http_tests {
                 ParseStep::NeedMore => return Err(HttpError::BadRequest("incomplete fixture".into())),
                 ParseStep::InterimContinue => continue,
                 ParseStep::Request(r) => return Ok(r),
+            }
+        }
+    }
+
+    fn legacy_find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.len() > haystack.len() {
+            return None;
+        }
+        for i in 0..=(haystack.len() - needle.len()) {
+            if &haystack[i..i + needle.len()] == needle {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn legacy_head_terminator(contig: &[u8]) -> Option<(usize, usize)> {
+        let crlf = legacy_find_subslice(contig, b"\r\n\r\n");
+        let lf = legacy_find_subslice(contig, b"\n\n");
+        match (crlf, lf) {
+            (Some(a), Some(b)) => Some(if a <= b { (a, 4) } else { (b, 2) }),
+            (Some(a), None) => Some((a, 4)),
+            (None, Some(b)) => Some((b, 2)),
+            (None, None) => None,
+        }
+    }
+
+    #[test]
+    fn scan_newline_matches_naive_index_on_tricky_buffers() {
+        // Mixes CRLF clusters, lone LF/CR, padding runs and every chunk-boundary offset class.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut s = 0xE5A5AA5Au32;
+        for block in 0..40usize {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            match block % 7 {
+                0 => buf.extend_from_slice(b"\r\n\r\n"),
+                1 => buf.extend_from_slice(b"\n\n"),
+                2 => buf.extend_from_slice(b"\r"),
+                3 => buf.push(b'\n'),
+                _ => buf.extend_from_slice(b"X-Multi-Word-Header-Line: value0123456789!"),
+            }
+            if s & 3 == 0 {
+                buf.push(b'\n');
+            }
+        }
+        for start in 0..=buf.len() {
+            assert_eq!(
+                scan_newline(&buf, start),
+                buf[start..].iter().position(|b| *b == b'\n').map(|p| p + start),
+                "scan_newline mismatch at start={start}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_terminator_and_take_line_match_legacy_on_wrapped_buffers() {
+        // Deterministic fuzz: every pattern class, compared against the legacy two-subsearch
+        // algorithm, including VecDeque states whose data wraps (non-contiguous ring layout).
+        let mut s = 0xC0FFEE11u32;
+        for trial in 0..240usize {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let mut data: Vec<u8> = Vec::new();
+            for piece in 0..(4 + (s as usize % 6)) {
+                match ((s >> (piece * 3)) % 9) as u8 {
+                    0 => data.extend_from_slice(b"GET / HTTP/1.1\r\n"),
+                    1 => data.extend_from_slice(b"Host: x\r\n"),
+                    2 => data.extend_from_slice(b"\r\n"),
+                    3 => data.extend_from_slice(b"\n"),
+                    4 => data.extend_from_slice(b"a\n"),
+                    5 => data.extend_from_slice(b"\r\n\r\n"),
+                    6 => data.extend_from_slice(b"long padding value line for vector lanes!!"),
+                    7 => data.push(b'\r'),
+                    _ => data.extend_from_slice(b"\n\r"),
+                }
+            }
+            let want = legacy_head_terminator(&data);
+            // Force a wrapped ring layout on odd trials: push, drain a prefix, push the rest,
+            // then compare BOTH implementations on the same logical queue content.
+            let mut q = VecDeque::with_capacity(16);
+            if trial % 2 == 1 && data.len() > 10 {
+                q.extend(data[..6].iter().copied());
+                q.drain(..4);
+                q.extend(data[6..].iter().copied());
+                let lin = q.make_contiguous().to_vec();
+                assert_eq!(find_head_terminator(&mut q), legacy_head_terminator(&lin), "wrapped terminator mismatch trial={trial}");
+                continue;
+            } else {
+                q.extend(data.iter().copied());
+            }
+            assert_eq!(find_head_terminator(&mut q), want, "terminator mismatch trial={trial}");
+            // take_line parity over the first line of the same buffer state.
+            let mut q2 = VecDeque::<u8>::with_capacity(16);
+            q2.extend(data.iter().copied());
+            let nl_ref = data.iter().position(|b| *b == b'\n');
+            let got = take_line(&mut q2);
+            match nl_ref {
+                Some(nl) => {
+                    let line = &data[..nl];
+                    let expect = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
+                    assert_eq!(got.as_deref(), Some(expect), "take_line mismatch trial={trial}");
+                }
+                None => assert_eq!(got, None, "take_line must be None trial={trial}"),
             }
         }
     }
