@@ -1,0 +1,14 @@
+#!/bin/sh
+# `npm` shim for CardputerZero: routes npm-style invocations to zpm (Zero Package Manager).
+# Prefers ${ZPM_RUNTIME:-cz-llrt} when it is available on PATH, falls back to node.
+# This script is POSIX sh, LF line endings, executable (chmod +x).
+
+DIR=$(dirname "$0")
+ZPM="$DIR/zpm.mjs"
+
+RUN="${ZPM_RUNTIME:-cz-llrt}"
+if ! command -v "$RUN" >/dev/null 2>&1; then
+  RUN=node
+fi
+
+exec "$RUN" "$ZPM" "$@"
