@@ -33,6 +33,10 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H62 duplicate-recall fast close: functional tree unchanged since H43 (`git log -1 -- crates` = 5adfbb8), so H28 residue-free proof (H52) + H30/H47 zero-polling classification remain valid as-proven — re-grepping an unchanged tree is redundant churn; fresh PASS hit NEW best band 55 ms geoMean 7.22 (2026-11-20 08:30)
+- Protocol: pointer to authoritative audits (H52 capacity-anchor scan; H47 sleep-region classification; H55 rule consolidation). Both recalled classes carry durable guard rules — density heuristics DO-NOT-ATTEMPT (nested amplification mechanism, per-container parser counts only) and polling never reintroduced (condvar idle_wait + ReplyBox cover every device pause) — so this pair closes instantly forever after.
+- Fresh verifier: totals **55 ms** TARGET_MET, w1 9 / w2 7 / w3 23 / w4 7 / w5 7 / w7 2, checksums exact all seeds. Nothing opened, nothing weakened, zero churn.
+
 ### [Note] H61 duplicate-recall closure: H17 already anchor-verified at H59 (no restatement needed); the thin-LTO profile note is SUPERSEDED by the shipped fat-LTO upgrade — current Cargo.toml reads opt-level 3 / lto=true / codegen-units=1, so the thin-era record must be read through its successor; fresh PASS 56 ms geoMean 7.29 best sustained band (2026-11-20 08:22)
 - **Stale-record guard recorded**: `[profile.release] lto=thin` entries predate the Fat-LTO entry (medians 65–66→65/66/65 thin-vs-fat sweep then sustained 56–60 totals across H40–H60). Any future recall citing thin-LTO notes should check Cargo.toml live (`grep -A4 profile.release`) — shipped truth is `lto = true`; panic=abort remains permanently rejected (error rendering needs unwind) and target-cpu=native stays rejected as host-measurement manipulation per recorded anti-gaming rule.
 - H17 class status pointer-only: three-site scratch + pre-size + ASCII skip anchors live at :208/:366/:382 (H59), sibling exhaustion H39/H57, parse floor H44 — nothing opens.
