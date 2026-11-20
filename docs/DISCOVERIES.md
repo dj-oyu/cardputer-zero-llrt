@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H37 closure: raw-C boundary fully consumed after H34/H35; standalone string-bench replication abandoned on external API churn (2026-11-20 04:52)
+- **Recall link**: the two raw-C-API entries re-cited post-H36. Both are now CONSUMED: builder loops rejected (+4% revisit verdict), reads (enumeration) and one-shot creation (H34 direct bytes) shipped with the settled ownership table; no unexploited raw surface remains.
+- **Attempted extra proof**: /tmp/h37 standalone microbench replicating from_str vs JS_NewStringLen externally — blocked by rquickjs API shape differences outside our wrapper stack (Context/Ctx constructors, GC helpers). Recognized as bench-side churn, abandoned per the fuzz/harness-artifact precedent rather than hacked; authoritative H34 evidence stays the in-repo byte-exact checksums (w1/w2/w3 exact, chkE stable) + sustained 57 ms medians resolved at 3-seed level.
+- **No code changes this round.**
+
 ### [Genius] H36 condvar ReplyBox replaces per-connection 10 ms reply polling (Keep-Alive hot path) (2026-11-20 04:36)
 - **Recall link**: `[Genius] instant condvar wake` (event-loop idle) mapped to the LAST poll-slice site: each connection thread did `recv_timeout(10ms)` on a std mpsc reply channel — per-idle-connection slice syscalls + up-to-one-slice reply latency, exactly the class that entry conquered on the event loop; `[Useful] scratch buffer` reentry-fallback philosophy informed keeping public semantics untouched.
 - **Design**: `ReplyBox` = Mutex<VecDeque> + Condvar; `ReplySender` handle with MANUAL Clone/Drop LEASE COUNTING reproducing mpsc disconnect parity (last sender drop => alive=0 + notify_all => prompt Closed — e.g. JS GC of an unanswered response answers 500 immediately); ReplyRxGuard closes on thread exit; ReplyOutcome mirrors Ok/Disconnected/Timeout arms byte-semantically (peer_closed probes, deadlines, wedged-stream cleanup unchanged).
