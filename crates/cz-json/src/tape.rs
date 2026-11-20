@@ -10,11 +10,26 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::parse::{decode_string_content, Key, ParseErr, Sink};
 use crate::simd::parse_int_fast;
 use crate::val::Span;
+
+thread_local! {
+    /// One-slot reader memo for array child-offset tables (H25): lock-free hit path.
+    /// Keyed by (document token, array node) — node ids are doc-relative, so a bare node key
+    /// would collide across documents in one process (caught by phase5 e2e immediately).
+    static ARRAY_MEMO: std::cell::RefCell<Option<(usize, u32, Arc<Vec<u32>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Unique identity per TapeDoc: monotonically increasing, never reused (no pointer-reuse risk).
+fn doc_token() -> &'static AtomicUsize {
+    static T: OnceLock<AtomicUsize> = OnceLock::new();
+    T.get_or_init(|| AtomicUsize::new(1))
+}
 
 /// Absent-key sentinel inside `key_spans` (a real empty key `""` has span `(x, x)` with x valid).
 const NO_KEY: Span = (u32::MAX, u32::MAX);
@@ -105,7 +120,8 @@ pub struct TapeDoc {
     wide_index: Mutex<Option<HashMap<u32, HashMap<u64, u32>>>>,
     /// Per-array child offset tables (node index -> [child0, child1, ...]), built on the FIRST
     /// indexed access of an array so repeated `arr[j]` reads become O(1) instead of O(j) walks.
-    array_offsets: Mutex<Option<HashMap<u32, Vec<u32>>>>,
+    array_offsets: Mutex<Option<HashMap<u32, Arc<Vec<u32>>>>>,
+    token: usize,
 }
 
 impl TapeDoc {
@@ -122,6 +138,7 @@ impl TapeDoc {
             recs: sink.recs,
             wide_index: Mutex::new(None),
             array_offsets: Mutex::new(None),
+            token: doc_token().fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -273,35 +290,50 @@ impl TapeDoc {
         if index >= n.child_count() {
             return None;
         }
-        // Fast path: memoized child offset table (built once per array on first indexed read).
-        {
-            let guard = self.array_offsets.lock().expect("array offsets lock");
-            if let Some(map) = guard.as_ref() {
-                if let Some(tab) = map.get(&arr) {
+        // H25 one-slot reader memo (same idiom as doc(id)/peek_store): repeat indexed reads of
+        // the SAME array hit a lock-free thread-local before touching the mutex/hash.
+        ARRAY_MEMO.with(|m| {
+            if let Some((tok, id, tab)) = &*m.borrow() {
+                if *tok == self.token && *id == arr {
                     return tab.get(index).copied();
                 }
             }
-        }
-        let mut cur = arr + 1;
-        for _ in 0..index {
-            cur = self.node(cur).skip_to;
-        }
-        // Build the full table for this array now that it is being indexed repeatedly.
-        {
-            let mut guard = self.array_offsets.lock().expect("array offsets lock");
-            let map = guard.get_or_insert_with(HashMap::new);
-            if !map.contains_key(&arr) {
-                let count = n.child_count();
-                let mut tab = Vec::with_capacity(count);
-                let mut c = arr + 1;
-                for _ in 0..count {
-                    tab.push(c);
-                    c = self.node(c).skip_to;
+            None
+        })
+            .or_else(|| {
+                {
+                    let guard = self.array_offsets.lock().expect("array offsets lock");
+                    if let Some(map) = guard.as_ref() {
+                        if let Some(tab) = map.get(&arr) {
+                            ARRAY_MEMO.with(|m| *m.borrow_mut() = Some((self.token, arr, tab.clone())));
+                            return tab.get(index).copied();
+                        }
+                    }
                 }
-                map.insert(arr, tab);
-            }
-        }
-        Some(cur)
+                let mut cur = arr + 1;
+                for _ in 0..index {
+                    cur = self.node(cur).skip_to;
+                }
+                // Build the full table for this array now that it is being indexed repeatedly.
+                {
+                    let mut guard = self.array_offsets.lock().expect("array offsets lock");
+                    let map = guard.get_or_insert_with(HashMap::new);
+                    if !map.contains_key(&arr) {
+                        let count = n.child_count();
+                        let mut tab = Vec::with_capacity(count);
+                        let mut c = arr + 1;
+                        for _ in 0..count {
+                            tab.push(c);
+                            c = self.node(c).skip_to;
+                        }
+                        map.insert(arr, Arc::new(tab));
+                    }
+                    if let Some(tab) = map.get(&arr) {
+                        ARRAY_MEMO.with(|m| *m.borrow_mut() = Some((self.token, arr, tab.clone())));
+                    }
+                }
+                Some(cur)
+            })
     }
 
     /// Read a scalar node (clean string bodies borrow the raw document — zero copy).

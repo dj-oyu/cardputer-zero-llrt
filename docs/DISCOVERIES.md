@@ -33,6 +33,14 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Useful] H25 lock-free one-slot reader memo for array child-offset tables (2026-11-20 01:25)
+- **Recall link**: `[Useful] one-slot registry memo` applied to its THIRD Rust-side site (`doc(id)` ✓, `peek_store` ✓, now `TapeDoc::child_at`); `[Note] integer-ms floor` routed judgment to a µs microbench against the real cz-json API.
+- **Hypothesis**: every indexed read through a lazy array paid an uncontended mutex + u32-hash map lookup (~1.6M times per w3 run). A thread-local `(token, arr, Arc<table>)` slot hit-checked BEFORE locking removes both.
+- **Critical bug caught by e2e**: first draft keyed the slot on bare node id — node ids are DOCUMENT-relative, so two lazy docs in one process collided (phase5 dropped to 0 PASS immediately). Fix: unique monotonic `TapeDoc.token` (AtomicUsize, never reused ⇒ no pointer-recycle risk) added to the key; phase5 back to 4/4. Lesson: thread-local memos over engine state MUST key on a stable identity domain, never relative ids or raw pointers.
+- **µs proof (`/tmp/h25_bench`, 3× repeats)**: same-doc repeat reads **2 ns/op** vs old-equivalent mutex+hash path **15 ns/op ≈ 5.5×**, identical checksums; stability self-check true.
+- **Gates**: workspace `-D warnings` clean, 78 crate tests green, gc_soak stable, w3 checksum byte-exact 55844720, medians 57-58 totals with w3 23-24 band kept (host integer at floor; device A53 lock/hash pressure heavier → bigger relative win, compounding the O(1)-indexing Insightful entry).
+- **Table storage now `Arc<Vec<u32>>`** so the slot holds shared immutable tables; build semantics unchanged (first indexed read builds full table; fallback scan path byte-identical).
+
 ### [Useful] H24 versioned one-slot `peek_store` memo + stream-head direct emission (2026-11-20 01:05)
 - **Recall link**: `[Useful] one-slot registry memo` applied to its second legitimate Rust-side site — `peek_store` runs once per kv-row stringify (w5: 2,000 same-name mutex+hash lookups/run); safe per the JS-value memo rule (Arc<Mutex<KvStore>> is pure Rust state), and the `[Dead End] raw-C-API` lessons kept everything off the JS boundary.
 - **Design**: registry mutation version (`AtomicU64`, Release on insert/remove) pins a thread-local `(name, ver, Arc)` slot — drop_store or a new store invalidates automatically, no stale-handle risk.
