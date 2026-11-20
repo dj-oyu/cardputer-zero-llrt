@@ -100,6 +100,13 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Useful] Thread-local reusable stringify scratch buffer (H16) (2026-11-20 21:10)
+- **Recall link**: the [Epic] entry's stringify-side residue (fresh `Vec<u8>` per call: w1 4,000×, w2 80×~12 KB, w5 2,000×, w6 responses) + [Note]'s repeated-run discipline; stayed wrapper-level safe (no raw refs — honoring the Dead End bar).
+- **Change**: `crates/cz-modules/src/json_module.rs` — `SCRATCH_OUT` thread-local `RefCell<Vec<u8>>`; lazy passthrough + kv-row branches reuse capacity via `with(|c| c.try_borrow_mut())`. Reentrant `JSON.stringify` from `toJSON` callbacks transparently falls back to a fresh Vec when already borrowed (`Err(_) => None` path), so no corruption/panic possible.
+- **Host x86_64 (3× repeated)**: lazy passthru probe 18 -> 17 ms (consistent −5%, byte-exact 2000/2000); w5 probe unchanged 8 ms (row traps dominate); boss medians 60-61 vs prior band 59-62 = within noise floor → host win NOT claimed.
+- **Real A53 rationale**: retained-capacity writes remove per-call malloc/growth on the slower A53 allocator + memset paths (w5/w6/w2 side), expected small device-only gain; zero semantic risk (checksums identical, full harness 100/100).
+- **Takeaway / sweep**: same scratch pattern could serve `http_server` frame encoding (per-response Vec allocs in `serialize_response`) later.
+
 ### [Insightful] O(1) array indexing via lazily-memoized child offset tables (H15) (2026-11-20 20:50)
 - **Recall link**: the [Epic] materialization post-mortem showed w3 still ≈28-31 ms of which a slice was mechanical `child_at` O(j) `skip_to` walks (sum over j ≈ 31k node steps per parse × 80); the [Note] noise-floor demanded repeated-run proof. Pure-Rust arena fix — deliberately NOT touching the raw-C-API surface the [Dead End] warns about.
 - **Change**: `crates/cz-json/src/tape.rs` — `TapeDoc.array_offsets: Mutex<Option<HashMap<u32, Vec<u32>>>>`; `child_at` serves indexed reads from a per-array table built on first indexed access (walk once, cache all children), falls back to the walk for one-off reads. Rust-side only: QuickJS JS heap lazy-proof delta unchanged (e2e <150 KiB gate green).

@@ -494,10 +494,36 @@ fn materialize_native<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, node: u32) -> Result<V
 // JSON.stringify routing
 // ---------------------------------------------------------------------------
 
+// Thread-local stringify scratch buffer: capacity is retained across calls so hot stringify
+// loops stop re-mallocating. Reentrant JSON.stringify (via `toJSON` callbacks) transparently
+// falls back to a fresh Vec when the scratch is already borrowed.
+thread_local! {
+    static SCRATCH_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
     // 1. Transparent Lazy handles.
     if let Some((id, node)) = lazy_tag(ctx, v)? {
         let doc = need_doc(ctx, id as f64)?;
+        let scratch_hit = SCRATCH_OUT.with(|c| {
+            match c.try_borrow_mut() {
+                Ok(mut out) => {
+                    out.clear();
+                    if doc.subtree_is_clean(node) {
+                        out.extend_from_slice(doc.raw_slice(node));
+                    } else {
+                        doc.serialize(node, &mut *out);
+                    }
+                    // No JS runs inside `from_str` (pure allocation + copy): the borrow cannot
+                    // re-enter while held. Zero extra Rust-side copies.
+                    Some(rquickjs::String::from_str(ctx.clone(), ascii(&out)))
+                }
+                Err(_) => None, // reentrant stringify: fall back below
+            }
+        });
+        if let Some(r) = scratch_hit {
+            return Ok(r?.into_value());
+        }
         let mut out = Vec::new();
         if doc.subtree_is_clean(node) {
             // Zero re-parse, zero re-serialize: the exact original bytes.
@@ -509,6 +535,21 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
     }
     // 2. cardputer:kv row handles — direct EntryPayload::Record serialization, no JS traps.
     if let Some((store, key)) = kv_row_tag(ctx, v)? {
+        let scratch_hit = SCRATCH_OUT.with(|c| {
+            match c.try_borrow_mut() {
+                Ok(mut out) => {
+                    out.clear();
+                    write_kv_record(&mut *out, &store, &key);
+                    // Record serialization touches Rust state only; `from_str` allocates a JS
+                    // string without running JS — no reentrancy risk while borrowed.
+                    Some(rquickjs::String::from_str(ctx.clone(), ascii(&out)))
+                }
+                Err(_) => None,
+            }
+        });
+        if let Some(r) = scratch_hit {
+            return Ok(r?.into_value());
+        }
         let mut out = Vec::new();
         write_kv_record(&mut out, &store, &key);
         return Ok(rquickjs::String::from_str(ctx.clone(), ascii(&out))?.into_value());
