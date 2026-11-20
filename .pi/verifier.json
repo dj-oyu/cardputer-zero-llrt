@@ -8,13 +8,13 @@
     },
     {
       "name": "rust-warnings-and-unit-tests",
-      "command": "bash /refs/verify/check_rust_p2.sh",
-      "weight": 30
+      "command": "bash /refs/verify/check_rust_p2_5.sh",
+      "weight": 25
     },
     {
-      "name": "js-phase1-and-phase2-webserver-e2e",
-      "command": "bash /refs/verify/check_e2e_p2.sh",
-      "weight": 45
+      "name": "js-phase1-2-and-sse-e2e",
+      "command": "bash /refs/verify/check_e2e_p2_5.sh",
+      "weight": 50
     },
     {
       "name": "ts-declarations-phase2",
