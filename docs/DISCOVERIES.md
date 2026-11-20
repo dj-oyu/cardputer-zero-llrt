@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H51 duplicate-recall fast close: all THREE SCRATCH_OUT sites now inventory-confirmed (lazy passthrough :507, kv row :537, generic walk ~:575 w/ held-borrow fallback); CFLAGS unchanged — pair fully processed by H48/H43/H41, verdicts re-affirmed, zero new work needed (2026-11-20 07:05)
+- Recall links re-cited (`H16 scratch`, `CFLAGS=-O3 note`). New increment this pass: completed H16's site inventory — the generic-walk branch also runs on SCRATCH_OUT with the borrow HELD across `walk_json` and a fresh-Vec fallback for reentrant `toJSON` (aliasing impossible by construction, per H17). Fresh verifier run this round: totals **58 ms**, every workload ≥ -20% except floor-exempt w7, checksums byte-exact, TARGET_MET ⇒ no drift.
+- CFLAGS: shipped `-O3` untouched; H43's higher-resolution A/B conclusion (host noise-floor neutral; device rationale preserved) and its open cc-rs `CFLAGS_$TARGET` shadowing caveat for the external cross-build recipe remain the authoritative statements — no re-litigation warranted.
+- Both pattern sweeps already CLOSED with evidence elsewhere (frame encode: H41 µs DOA; scalar strings: H44 out-of-window). Nothing opened; nothing weakened; harness green throughout.
+
 ### [Note] H50 recall: condvar waker trio (WAKE/idle_wait/notify sites) + H27 offset writer verified live post-Round-2; reader side audited clean — RequestParser is ownership-incremental, NO memmove sibling exists anywhere (pattern N/A recorded) (2026-11-20 06:58)
 - **Recall links**: `[Genius] instant condvar wakeup` + `[Useful] H27 offset-advance socket writer`. Audit-only per protocol.
 - **Condvar integrity (code evidence)**: `static_waker::Waker` const-init static at http_server.rs:180, `idle_wait(max)` early-wake semantics :221, notify call-sites :216/:250/:523 intact; the connection reader still fires `EVENTS_QUEUED.fetch_add + notify_event_loop()` per request BEFORE mpsc send (line ~546 region shown live) ⇒ 1k Keep-Alive reqs still wake the JS loop instantly; Round-2 edits added zero waits/locks (H47 classification stands), so condvar coverage unchanged. Sibling candidates (kv/signal waits) remain nonexistent — nothing to wake.
