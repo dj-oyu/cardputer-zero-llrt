@@ -32,7 +32,7 @@ const fsp = fs.promises;
 const REGISTRY = process.env.ZPM_REGISTRY || "https://registry.npmjs.org";
 const ESBUILD = process.env.ZPM_ESBUILD || "esbuild";
 const RUNTIME = process.env.ZPM_RUNTIME || "cz-llrt";
-const TMP_ROOT = process.env.ZPM_TMPDIR || (os.tmpdir ? os.tmpdir() : "/tmp");
+const TMP_ROOT = process.env.ZPM_TMPDIR || "/tmp";
 
 function err(msg) {
   console.error("zpm error: " + msg);

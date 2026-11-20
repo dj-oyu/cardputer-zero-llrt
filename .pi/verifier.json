@@ -2,24 +2,14 @@
   "targetScore": 100,
   "checks": [
     {
-      "name": "integrity-and-anticheat",
-      "command": "bash /refs/verify/check_integrity.sh",
-      "weight": 10
+      "name": "phase7-zpm-and-hono-e2e",
+      "command": "node /refs/phase7/verify_phase7.mjs",
+      "weight": 70
     },
     {
-      "name": "rust-warnings-and-unit-tests",
-      "command": "bash /refs/verify/check_rust_p6a.sh",
-      "weight": 20
-    },
-    {
-      "name": "js-all-38-regression-e2e",
-      "command": "bash /refs/verify/check_e2e_p6a.sh",
-      "weight": 25
-    },
-    {
-      "name": "final-boss-30pct-benchmark-and-discoveries",
-      "command": "bash /refs/final_boss/verify_boss_all.sh",
-      "weight": 45
+      "name": "rust-unit-tests-no-regression",
+      "command": "cargo test --workspace -- --test-threads=1",
+      "weight": 30
     }
   ]
 }

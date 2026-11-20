@@ -167,11 +167,12 @@ export function serve(app, opts = {}) {
     req.on("data", (d) => chunks.push(d));
     req.on("end", () => {
       const bodyText = chunks.map(chunkToText).join("");
-      const webReq = new globalThis.Request(buildUrl(req, server.address() ? server.address().port : 0), {
-        method: req.method,
-        headers: req.headers,
-        body: bodyText,
-      });
+      const method = String(req.method || "GET").toUpperCase();
+      const reqInit = { method, headers: req.headers };
+      if (method !== "GET" && method !== "HEAD" && bodyText.length > 0) {
+        reqInit.body = bodyText;
+      }
+      const webReq = new globalThis.Request(buildUrl(req, server.address() ? server.address().port : 0), reqInit);
       Promise.resolve(app.fetch(webReq))
         .then((webRes) => webRes.text().then((txt) => {
           res.statusCode = webRes.status;
