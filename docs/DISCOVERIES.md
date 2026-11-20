@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H61 duplicate-recall closure: H17 already anchor-verified at H59 (no restatement needed); the thin-LTO profile note is SUPERSEDED by the shipped fat-LTO upgrade — current Cargo.toml reads opt-level 3 / lto=true / codegen-units=1, so the thin-era record must be read through its successor; fresh PASS 56 ms geoMean 7.29 best sustained band (2026-11-20 08:22)
+- **Stale-record guard recorded**: `[profile.release] lto=thin` entries predate the Fat-LTO entry (medians 65–66→65/66/65 thin-vs-fat sweep then sustained 56–60 totals across H40–H60). Any future recall citing thin-LTO notes should check Cargo.toml live (`grep -A4 profile.release`) — shipped truth is `lto = true`; panic=abort remains permanently rejected (error rendering needs unwind) and target-cpu=native stays rejected as host-measurement manipulation per recorded anti-gaming rule.
+- H17 class status pointer-only: three-site scratch + pre-size + ASCII skip anchors live at :208/:366/:382 (H59), sibling exhaustion H39/H57, parse floor H44 — nothing opens.
+- Fresh verifier this pass: totals **56 ms** TARGET_MET, w1 8 / w2 8 / w3 24 / w4 7 / w5 7 / w7 2, checksums exact all seeds; profile trio empirically optimal. Nothing opened, nothing weakened, zero churn.
+
 ### [Note] H60 duplicate-recall closure: H33 div-8 anchor live (tape.rs:134 + corrected header H43) + H18 shared ROW_HANDLER/ROW_SYM intact (kv_module.rs :111/:121/:133/:136–139: target+tag only per row) — both classes empirically drift-free (fresh PASS 56 ms best band, w5 steady); follow-up classes remain barred (divisor sweep done H33; pooling identity-forbidden H38; trap specialization no remaining allocation pressure) (2026-11-20 08:15)
 - Recall links re-cited and re-anchored this pass in one grep — no restatement of original evidence. Round-2 edits touched neither surface; H46's semantics suite (TTL, delete visibility, cross-handle live reads, stringify-from-Record) covers the handler design and stayed green in every harness since.
 - Fresh verifier: totals **56 ms** TARGET_MET (best-of-session band), w1 9 / w2 8 / w3 23 / w4 7 / w5 7 / w7 2, checksums byte-exact all seeds.
