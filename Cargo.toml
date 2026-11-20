@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cz-json",
     "crates/cz-hal",
     "crates/cz-gfx",
     "crates/cz-modules",

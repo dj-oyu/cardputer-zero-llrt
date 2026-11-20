@@ -310,6 +310,36 @@ declare module "cardputer:kv" {
   export default kv;
 }
 
+/** Diagnostics snapshot for a Lazy JSON handle (`cardputer:json.lazyStats`). */
+interface CzLazyJsonStats {
+  /** Total `TapeNode` arena nodes in the document (each exactly 16 bytes). */
+  nodeCount: number;
+  /** Size of the shared immutable raw source bytes held by the document. */
+  rawBytes: number;
+  /** True once Copy-on-Write has materialized this subtree into real JS state. */
+  materialized: boolean;
+}
+
+declare module "cardputer:json" {
+  /**
+   * Force a transparent Lazy Tape handle regardless of document size (`>= 4096` byte documents
+   * already arrive lazy from the replaced `JSON.parse`). Untouched members are read straight from
+   * the Rust tape; writing any member copies it through a Copy-on-Write override layer.
+   */
+  export function parseLazy(text: string): any;
+  /** True while `value` is an untouched (clean) Lazy JSON handle. */
+  export function isLazy(value: any): boolean;
+  /** Arena diagnostics for a Lazy handle, or null for anything else. */
+  export function lazyStats(value: any): CzLazyJsonStats | null;
+
+  const czJson: {
+    parseLazy: typeof parseLazy;
+    isLazy: typeof isLazy;
+    lazyStats: typeof lazyStats;
+  };
+  export default czJson;
+}
+
 /** Bound socket address reported by `server.address()` (null before listen / after close). */
 interface CzServerAddress {
   /** Wildcard bind means external peers (e.g. Tailscale) can connect. */

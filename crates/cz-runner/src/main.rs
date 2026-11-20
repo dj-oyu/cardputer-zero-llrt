@@ -371,6 +371,9 @@ fn main() {
     let run_result = ctx.with(|ctx| -> Result<(), String> {
         bind_console(&ctx).map_err(|e| format!("{e}"))?;
         bind_timers(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 5: swap globalThis.JSON.parse / JSON.stringify for the cz-json NEON engine
+        // (fast < 4 KiB path, transparent Lazy handles for larger documents, kv-row shortcut).
+        cz_modules::install_json(&ctx).map_err(|e| format!("{e}"))?;
         eval_module(&ctx, &name, &source)
     });
     // Drain any remaining QuickJS jobs outside the context scope.

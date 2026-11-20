@@ -21,6 +21,7 @@ use cz_hal::power::PowerStatus;
 
 pub mod fs_module;
 pub mod http_module;
+pub mod json_module;
 pub mod kv_module;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ pub mod kv_module;
 // reaching into submodules.
 pub use fs_module::FsModule;
 pub use http_module::HttpModule;
+pub use json_module::{install_json, JsonModule};
 pub use kv_module::KvModule;
 
 /// Every Cardputer module specifier the LLRT bridge exposes (display, input, app, power, kv).
@@ -42,6 +44,7 @@ pub const CARDPUTER_MODULE_NAMES: &[&str] = &[
     "cardputer:app",
     "cardputer:power",
     "cardputer:kv",
+    "cardputer:json",
 ];
 
 /// True when at least one `node:http` server is currently listening. Embedders (e.g. `llrt_core`
@@ -107,6 +110,7 @@ pub enum ModuleKind {
     Http,
     Fs,
     Kv,
+    Json,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -120,6 +124,7 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "node:http" | "http" => Some(ModuleKind::Http),
         "node:fs" | "fs" => Some(ModuleKind::Fs),
         "cardputer:kv" => Some(ModuleKind::Kv),
+        "cardputer:json" => Some(ModuleKind::Json),
         _ => None,
     }
 }
@@ -138,6 +143,7 @@ pub fn declare_builtin<'js>(
         ModuleKind::Http => rquickjs::Module::declare_def::<http_module::HttpModule, _>(ctx.clone(), name),
         ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
         ModuleKind::Kv => rquickjs::Module::declare_def::<kv_module::KvModule, _>(ctx.clone(), name),
+        ModuleKind::Json => rquickjs::Module::declare_def::<json_module::JsonModule, _>(ctx.clone(), name),
     }
 }
 
@@ -1111,14 +1117,15 @@ mod module_tests {
 
     #[test]
     fn cardputer_module_names_cover_every_cardputer_builtin_surface() {
-        // Public const surface for the LLRT fork integration.
-        assert_eq!(CARDPUTER_MODULE_NAMES.len(), 5);
+        // Public const surface for the LLRT fork integration (Phase 5 adds cardputer:json).
+        assert_eq!(CARDPUTER_MODULE_NAMES.len(), 6);
         for n in [
             "cardputer:display",
             "cardputer:input",
             "cardputer:app",
             "cardputer:power",
             "cardputer:kv",
+            "cardputer:json",
         ] {
             assert!(CARDPUTER_MODULE_NAMES.contains(&n), "missing {n}");
             assert!(resolve_builtin(n).is_some(), "{n} must resolve to a builtin kind");
@@ -1132,6 +1139,7 @@ mod module_tests {
             Module::declare_def::<AppModule, _>(c.clone(), "cardputer:app").expect("app");
             Module::declare_def::<PowerModule, _>(c.clone(), "cardputer:power").expect("power");
             Module::declare_def::<KvModule, _>(c.clone(), "cardputer:kv").expect("kv");
+            Module::declare_def::<JsonModule, _>(c.clone(), "cardputer:json").expect("json");
             Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http");
             Module::declare_def::<FsModule, _>(c.clone(), "node:fs").expect("fs");
         });

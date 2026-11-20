@@ -495,6 +495,26 @@ impl KvStore {
         self.enforce_limits();
     }
 
+    /// Snapshot ALL live fields of a structured record in sorted field-name order WITHOUT touching
+    /// LRU recency or hit/miss counters (used by `JSON.stringify(kv.row(...))` direct native
+    /// serialization so stringifying a row never perturbs store stats). Returns `None` for scalar
+    /// entries, missing keys and expired records.
+    pub fn record_fields(&mut self, key: &str) -> Option<Vec<(String, KvValue)>> {
+        self.purge_expired();
+        let entry = self.entries.get(key)?;
+        match &entry.payload {
+            EntryPayload::Record(map) if !map.is_empty() => {
+                let mut out: Vec<(String, KvValue)> = map
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Read one field from a structured record (hit/miss counted, recency bumped).
     pub fn get_field(&mut self, key: &str, field: &str) -> Option<KvValue> {
         self.purge_expired();
@@ -792,6 +812,13 @@ pub fn drop_store(name: &str) -> bool {
 pub fn has_store(name: &str) -> bool {
     let reg = registry().lock().expect("kv registry lock");
     reg.contains_key(name)
+}
+
+/// Borrow an already-open store handle without creating it (`None` when the name is unknown).
+/// Lets native consumers such as the JSON engine serialize `EntryPayload::Record` directly.
+pub fn peek_store(name: &str) -> Option<Arc<Mutex<KvStore>>> {
+    let reg = registry().lock().expect("kv registry lock");
+    reg.get(name).cloned()
 }
 
 #[cfg(test)]

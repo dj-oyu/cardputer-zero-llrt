@@ -54,11 +54,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cz-json"
+version = "0.1.0"
+
+[[package]]
 name = "cz-modules"
 version = "0.1.0"
 dependencies = [
  "cz-gfx",
  "cz-hal",
+ "cz-json",
  "libc",
  "rquickjs",
 ]

@@ -5,19 +5,21 @@
 use rquickjs::{Context, Module, Runtime};
 
 #[test]
-fn llrt_public_defs_register_all_seven_modules_end_to_end() {
-    // All seven structs are importable at the crate ROOT (not just through submodules) and can
-    // be declared + evaluated like any LLRT ModuleDef inside a fresh runtime.
+fn llrt_public_defs_register_all_eight_modules_end_to_end() {
+    // Every struct is importable at the crate ROOT (not just through submodules) and can be
+    // declared + evaluated like any LLRT ModuleDef inside a fresh runtime (Phase 5 adds json).
     use cz_modules::{
         AppModule, CARDPUTER_MODULE_NAMES, DisplayModule, FsModule, HttpModule, InputModule,
-        KvModule, ModuleKind, PowerModule, resolve_builtin,
+        JsonModule, KvModule, ModuleKind, PowerModule, resolve_builtin,
     };
 
-    assert_eq!(CARDPUTER_MODULE_NAMES.len(), 5);
+    assert_eq!(CARDPUTER_MODULE_NAMES.len(), 6);
     assert!(CARDPUTER_MODULE_NAMES.contains(&"cardputer:display"));
     assert!(CARDPUTER_MODULE_NAMES.contains(&"cardputer:kv"));
+    assert!(CARDPUTER_MODULE_NAMES.contains(&"cardputer:json"));
     assert_eq!(resolve_builtin("node:http"), Some(ModuleKind::Http));
     assert_eq!(resolve_builtin("fs"), Some(ModuleKind::Fs));
+    assert_eq!(resolve_builtin("cardputer:json"), Some(ModuleKind::Json));
 
     let rt = Runtime::new().expect("runtime");
     let ctx = Context::full(&rt).expect("context");
@@ -27,6 +29,7 @@ fn llrt_public_defs_register_all_seven_modules_end_to_end() {
         Module::declare_def::<AppModule, _>(c.clone(), "cardputer:app").expect("app");
         Module::declare_def::<PowerModule, _>(c.clone(), "cardputer:power").expect("power");
         Module::declare_def::<KvModule, _>(c.clone(), "cardputer:kv").expect("kv");
+        Module::declare_def::<JsonModule, _>(c.clone(), "cardputer:json").expect("json");
         Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http");
         Module::declare_def::<FsModule, _>(c.clone(), "node:fs").expect("fs");
         let p = Module::evaluate(
@@ -38,6 +41,7 @@ fn llrt_public_defs_register_all_seven_modules_end_to_end() {
             import * as app from "cardputer:app";
             import * as power from "cardputer:power";
             import * as kv from "cardputer:kv";
+            import * as czJson from "cardputer:json";
             import * as http from "node:http";
             import * as fs from "node:fs";
             if (display.WIDTH !== 320 || display.HEIGHT !== 170) throw new Error("display dims");
@@ -49,6 +53,9 @@ fn llrt_public_defs_register_all_seven_modules_end_to_end() {
             if (s.get("k") !== 7) throw new Error("kv roundtrip");
             if (typeof http.createServer !== "function" || !Array.isArray(http.METHODS)) throw new Error("http shape");
             if (typeof fs.readFileSync !== "function" || typeof fs.existsSync !== "function") throw new Error("fs shape");
+            if (typeof czJson.parseLazy !== "function" || typeof czJson.isLazy !== "function" || typeof czJson.lazyStats !== "function") throw new Error("json shape");
+            const lazy = czJson.parseLazy('{"a":1}');
+            if (!czJson.isLazy(lazy) || lazy.a !== 1) throw new Error("json lazy handle");
             globalThis.__R = "LLRT_BRIDGE_ALL_OK";
             "#,
         )

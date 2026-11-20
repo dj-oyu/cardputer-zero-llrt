@@ -109,11 +109,16 @@ const KV_SHIM: &str = r#"
     // A row handle is a thin Proxy over an EMPTY target. Data field names are NEVER copied onto
     // the JS object; the traps forward to STORE-LEVEL native functions that take (key, field,...).
     // Per row() we allocate only the Proxy + handler closures — no new Rust closures at all.
-    globalThis.__czKvMakeRow = function (key, ttl, getF, setF, delF, hasF) {
+    // The hidden `Symbol.for("cz.kvRow")` tag on the target lets JSON.stringify serialize the
+    // record straight from Rust EntryPayload::Record without walking any JS property (symbols are
+    // invisible to Object.getOwnPropertyNames, so the zero-copy own-prop proof stays intact).
+    globalThis.__czKvMakeRow = function (storeName, key, ttl, getF, setF, delF, hasF) {
         // NaN sentinel when unset: rquickjs rejects an EXPLICIT undefined for Opt<f64>, but a
         // plain number always converts; ttl_opt() filters non-finite to None on the native side.
         const useTtl = (typeof ttl === "number" && isFinite(ttl) && ttl > 0) ? ttl : NaN;
-        return new Proxy({}, {
+        const t = {};
+        Reflect.set(t, Symbol.for("cz.kvRow"), { store: String(storeName), key: String(key) });
+        return new Proxy(t, {
             get:    function (t, k) { if (typeof k === "string") return getF(key, k); return Reflect.get(t, k); },
             set:    function (t, k, v) { if (typeof k === "string") { setF(key, k, v, useTtl); return true; } return Reflect.set(t, k, v); },
             deleteProperty: function (t, k) { if (typeof k === "string") return delF(key, k) === true; return Reflect.deleteProperty(t, k); },
@@ -134,7 +139,7 @@ const KV_SHIM: &str = r#"
         // delField/hasField, all `(key, field, ...)` shaped) so row() allocates zero Rust
         // closures — only a thin Proxy over an empty target per call.
         s.row = function (key, ttl) {
-            return __czKvMakeRow(String(key), ttl, this.getField, this.setField, this.delField, this.hasField);
+            return __czKvMakeRow(String(name), String(key), ttl, this.getField, this.setField, this.delField, this.hasField);
         };
         return s;
     };
