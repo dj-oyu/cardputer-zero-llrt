@@ -8,17 +8,17 @@
     },
     {
       "name": "rust-warnings-and-unit-tests",
-      "command": "bash /refs/verify/check_rust_p5.sh",
+      "command": "bash /refs/verify/check_rust_p6a.sh",
       "weight": 30
     },
     {
-      "name": "js-all-regression-and-cz-json-e2e",
-      "command": "bash /refs/verify/check_e2e_p5.sh",
+      "name": "js-all-regression-and-phase6a-hw-e2e",
+      "command": "bash /refs/verify/check_e2e_p6a.sh",
       "weight": 45
     },
     {
-      "name": "ts-declarations-phase5",
-      "command": "bash /refs/verify/check_types_p5.sh",
+      "name": "ts-declarations-phase6a",
+      "command": "bash /refs/verify/check_types_p6a.sh",
       "weight": 10
     }
   ]
