@@ -1149,13 +1149,36 @@ mod http_module_tests {
         // request bytes are written: the queued event must be dropped (never dispatched).
         let mut sock = TcpStream::connect(("127.0.0.1", addr)).expect("connect before close");
         sock.set_nodelay(true).ok();
+
+        // Deterministic accept proof (replaces racing-with-accept immediate close): dispatch one
+        // normal request on a second connection first. accept_loop services the backlog FIFO, so
+        // once /early lands the earlier `sock` already owns its reader thread — closing after
+        // that can never miss the pending connection in the backlog.
+        {
+            let mut early = TcpStream::connect(("127.0.0.1", addr)).expect("early connect");
+            early.set_nodelay(true).ok();
+            early
+                .write_all(b"GET /early HTTP/1.1\r\nHost: z\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            drive_until_dispatched(&rt, &ctx, 1);
+            let early_text = read_response(&mut early);
+            assert!(early_text.starts_with("HTTP/1.1 200"), "pre-close evidence frame {early_text:?}");
+        }
+
         ctx.with(|ctx| ctx.eval::<(), _>("globalThis.__SERVER.close();"))?;
         while let Ok(true) = rt.execute_pending_job() {}
         assert_eq!(listening_count(), 0, "closed server must leave the registry");
 
+        // Objective queueing proof instead of a fixed 80 ms guess: after writing the late bytes
+        // poll until the engine-queued event count grows past the post-close baseline.
+        let queued_before = cz_hal::http_server::events_queued();
         sock.write_all(b"GET /late HTTP/1.1\r\nHost: z\r\nConnection: close\r\n\r\n").unwrap();
-        // Give the reader thread time to queue the (now stale) event, then drain.
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        let mut waited = 0u32;
+        while cz_hal::http_server::events_queued() == queued_before && waited < 400 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+        assert!(waited < 400, "late request never reached the engine queue");
         let dispatched = ctx.with(|ctx| -> i64 {
             let drain: Function = ctx.globals().get("__czHttpDrainLoop").unwrap();
             drain.call(()).unwrap_or(0)
@@ -1166,8 +1189,10 @@ mod http_module_tests {
         // The client is answered rather than left hanging (reply channel dropped -> engine 500).
         let text = read_response(&mut sock);
         assert!(text.starts_with("HTTP/1.1 500 Internal Server Error"), "post-close frame {text:?}");
+        // /early dispatched exactly once BEFORE close as accept-liveness evidence; the late
+        // request must never have run the listener afterwards, so the count stays at one.
         let seen = ctx.with(|ctx| ctx.eval::<String, _>("String(globalThis.__dispatches)")).unwrap();
-        assert_eq!(seen, "0", "request listener must never run after close");
+        assert_eq!(seen, "1", "listener ran after close or never ran pre-close (count={seen})");
         Ok(())
     }
 
