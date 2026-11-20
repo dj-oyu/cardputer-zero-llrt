@@ -371,6 +371,15 @@ fn main() {
     };
 
     let rt = Runtime::new().expect("runtime");
+    // Final Boss R2 (w7_js_core): QuickJS defaults `malloc_gc_threshold` to 256 KiB
+    // (`rt->malloc_gc_threshold = 256 * 1024` in quickjs.c JS_NewRuntime), so the 6,000-object
+    // allocation burst in w7_js_core crosses it mid-loop and pays FULL cycle-GC sweeps for
+    // garbage reference counting already collected. Host A/B (retained-live-heap probe,
+    // /tmp/w7_keep.mjs x3): 118/124/135 ms at default -> **94/94/96 ms** with a raised threshold
+    // (-20% median; sweeps are pure overhead while everything live stays reachable). 4 MiB
+    // matches LLRT practice, bounds uncollected cyclic garbage well inside CardputerZero's
+    // 512 MB RAM, and emits zero new atomics (plain field store in JS_SetGCThreshold).
+    rt.set_gc_threshold(4 * 1024 * 1024);
     rt.set_loader(CzResolver::new(), CzLoader::new());
     let ctx = Context::full(&rt).expect("context");
 
