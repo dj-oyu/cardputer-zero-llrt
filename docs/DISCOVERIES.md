@@ -33,6 +33,13 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H19 zero-second-copy lazy arena via Vec→Arc buffer reuse — blocked by std on Rust 1.100; reverted (2026-11-20 23:40)
+- **Recall link**: `[Dead End] raw-C-API` kept the attempt in pure safe Rust; `[Note] noise-floor` demanded objective structural proof before any claim.
+- **Hypothesis**: every >=4 KB lazy parse copies the document twice (JS->Rust String conversion, then Arc allocation). A Vec→Arc buffer move would eliminate the second whole-doc copy for w2/w3/w4.
+- **Objective blocker**: `Vec::into_arc_slice` does not exist on this toolchain (rustc 1.100.0), and a pointer-identity micro-probe (`/tmp/arc_reuse.rs`) showed `Arc::from(Vec<u8>)` STILL copies (`same-ptr=false`) → no std API reuses a Vec buffer into `Arc<[u8]>` today; the fallback is byte-for-byte the old cost. Abandoned rather than shipped as a no-op.
+- **Cleanup rigor**: compile error caught at check time; probe numbers observed during the broken build came from the PREVIOUS binary and were discarded per `[Note]`. Full revert via targeted `git checkout` (tree was clean at HEAD ⇒ exact restore); shipped state reconfirmed: w3 probe full=23, w4 full=8, gc_soak stable, phase5 4/4 + phase2 11/11, workspace `-D warnings` green.
+- **Revisit condition**: if a future Rust in this line stabilizes `ArcSlice`/`into_arc_slice`, retry H19 (~0.3-0.5 ms expected host on w4/w3; proportionally larger on A53 where memcpy costs more).
+
 ### [Epic] Nested lazy subtrees materialize once via native builders — Proxy churn eliminated (2026-11-20 18:42)
 - **Hypothesis**: w3 profile decomposition (`/tmp/probe_w3.mjs`, release, 80 iterations of the 22 KB `medJson`): parse-only=10 ms, parse+length=8, parse+child-handle-loop=53, full score-sums=59. ~45 ms of w3 was **20,000 per-access Proxy handle creations** (`__czLazyMake`: new target + handler closure + LAZY symbol set + FFI `__czLazyIsArray` + registry mutex), not tape build.
 - **Change**: `crates/cz-modules/src/json_module.rs` — `got_to_js` takes a `parent` node index; direct members of the ROOT container still return transparent Proxy handles (CoW write traps stay live at depth 1, e2e `doc.meta.seq = 99` semantics preserved), grandchildren of **clean** subtrees materialize ONCE into plain JS objects/arrays built straight from the Tape (safe rquickjs builders). Grandchildren dirty → old Proxy path.
