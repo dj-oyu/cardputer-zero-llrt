@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H53 recall closure: root-proxy closure-handler revert shape re-verified on current tree (shim :48/:86 literal+Proxy, materialize gate :449) — trap/handle boundary encoded correctly; condvar trio already proven live H50, fresh PASS 58 ms TARGET_MET (2026-11-20 07:20)
+- **Recall links**: `[Dead End] shared LAZY_HANDLER root proxies` + `[Genius] condvar idle wake`.
+- **Boundary encoding audit**: JSON_SHIM currently holds the closure-captured per-call `handler` literal (:48) with `new Proxy(t, handler)` (:86) exactly as the same-session byte-exact restore left it — NO shared-root-handler variant anywhere in the tree (the measured w3 regression class 24→26-27 ms cannot recur), while grandchildren route through the clean-subtree materialize gate (:449) that ELIMINATES handles+traps (the winning side of the ratio rule). kv ROW_HANDLER stays on the creation-heavy side where sharing won (H18). Boundary rule (apply ONLY where handle creation dominates trap traffic; never on hot-trap singletons) re-affirmed FINAL; Round-2 edits add zero Proxy surfaces (H42 alias is value-side only).
+- **Condvar**: already re-proven live this session (H50 code evidence at :180/:216/:221/:523); no new waits/sleeps since (H47 classification stands), so nothing re-litigated this pass.
+- **Fresh verifier**: totals **58 ms** TARGET_MET, w3 24 (Epic band), all checksums exact ⇒ both recalled designs intact. No candidates opened; nothing weakened; zero churn.
+
 ### [Note] H52 recall closure: H28 revert residue-free confirmed (only parser-known per-container capacities exist — decode pre-size content.len() :311, array len :418; zero global density hints); Round-2 checkpoint convergence re-affirmed with fresh PASS (58 ms, TARGET_MET) (2026-11-20 07:12)
 - **Recall links**: `[Dead End] H28 DOM-sink density hint` + `[Note] Round 2 recall checkpoint`.
 - **H28 durable rule audited against CURRENT tree**: grep of every `with_capacity` in parse/stringify hot files yields ONLY scoped sizes (`decode_string_content` pre-size = exact content length; `js_to_val` array reserve = arr.get len; tape fused recs div-8 = one flat stream, genuinely one-time per the Dead End's own carve-out). No global input-length-derived nested hint anywhere ⇒ revert complete, rule honored by all shipped code. Revert commit itself (5eccd89) touched only DISCOVERIES — no functional residue possible.
