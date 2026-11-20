@@ -69,7 +69,6 @@ const JSON_SHIM: &str = r#"
             },
             ownKeys: function (t) {
                 const keys = __czLazyOwnKeys(id, node);
-                // Invariant: all target own keys (array "length" is non-configurable) must appear.
                 for (const tk of Reflect.ownKeys(t)) {
                     let seen = false;
                     for (const x of keys) { if (x === tk) { seen = true; break; } }

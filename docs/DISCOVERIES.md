@@ -100,6 +100,13 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Dead End] Shared LAZY_HANDLER for JSON root proxies — regressed w3; trap/handle ratio boundary found (2026-11-20 22:55)
+- **Recall link**: attempted the `[Epic]` shared-handler pattern on the Lazy JSON shim; reverted after repeated measurement per `[Note]` discipline.
+- **Hypothesis**: hoisting one Proxy handler (traps read {id,node} from the hidden tag) would cut per-handle allocations like it did for kv rows.
+- **Change**: json_module.rs JSON_SHIM shared handler + tag reads — implemented, semantics verified byte-exact (CoW/delete/for-in/passthrough 10/10 probe items, phase5 4/4, 78 tests), then measured 5×: w3 median 24 -> **26-27 consistent** (probe full 23-24 -> 26-27), total band shifted +2 ms → genuine regression.
+- **Root cause = the boundary condition of the Epic pattern itself**: when TRAP calls ≫ HANDLE creations (w3: ~20k index traps through the level-1 items Proxy vs only ~80 root handles per iteration), the extra symbol-get per trap costs more than the saved handler allocations. KV rows won because creation pressure dominates there (2,000 row() calls/run). Grandchild materialization still wins because it ELIMINATES both handlers AND traps (20k proxies gone entirely).
+- **Rule recorded**: apply shared-handler ONLY where handle creation dominates trap traffic; never on hot-trap singletons. Reverted json_module shim to closure-captured handler (exact original text restored via targeted splice; w3 back to 23-24, totals 58-59, checksums byte-identical, harness 100/100).
+
 ### [Useful] One shared row Proxy handler for ALL kv rows — Epic pattern crossed into `cardputer:kv` (H18) (2026-11-20 22:20)
 - **Recall link**: direct application of the `[Epic]` insight (per-access Proxy/handler churn is the dominant cost class) to the untouched KV surface flagged in that entry's sweep note; judging per `[Note]` repeated-run discipline.
 - **Change**: `crates/cz-modules/src/kv_module.rs` KV_SHIM — hoisted module-scope `ROW_SYM` + ONE `ROW_HANDLER` shared by every row; traps read each handle's own tag (`{store,key,ttl,get,set,del,has}` via Reflect.get on the target) instead of capturing per-call closures. Per-row allocations drop from {target + tag + 4 trap closures + handler literal} to {target + tag}. Store/key fields kept on the tag so the JSON.stringify Rust fast path still works; ttl travels per-handle via tag field (identical filtering).
