@@ -117,13 +117,43 @@ const KV_SHIM: &str = r#"
         // plain number always converts; ttl_opt() filters non-finite to None on the native side.
         const useTtl = (typeof ttl === "number" && isFinite(ttl) && ttl > 0) ? ttl : NaN;
         const t = {};
-        Reflect.set(t, Symbol.for("cz.kvRow"), { store: String(storeName), key: String(key) });
-        return new Proxy(t, {
-            get:    function (t, k) { if (typeof k === "string") return getF(key, k); return Reflect.get(t, k); },
-            set:    function (t, k, v) { if (typeof k === "string") { setF(key, k, v, useTtl); return true; } return Reflect.set(t, k, v); },
-            deleteProperty: function (t, k) { if (typeof k === "string") return delF(key, k) === true; return Reflect.deleteProperty(t, k); },
-            has:    function (t, k) { if (typeof k === "string") return hasF(key, k) === true; return Reflect.has(t, k); },
+        Reflect.set(t, ROW_SYM, {
+            store: String(storeName),
+            key: String(key),
+            ttl: useTtl,
+            get: getF,
+            set: setF,
+            del: delF,
+            has: hasF,
         });
+        // ONE shared handler for every row in the process (Epic insight applied to KV):
+        // traps read the handle's key/ttl/natives from its own hidden tag — zero per-row
+        // handler closure allocations. The empty extensible target keeps all Proxy invariants.
+        return new Proxy(t, ROW_HANDLER);
+    };
+
+    const ROW_SYM = Symbol.for("cz.kvRow");
+    const ROW_HANDLER = {
+        get: function (t, k) {
+            const tg = Reflect.get(t, ROW_SYM);
+            if (tg !== undefined && typeof k === "string") return tg.get(tg.key, k);
+            return Reflect.get(t, k);
+        },
+        set: function (t, k, v) {
+            const tg = Reflect.get(t, ROW_SYM);
+            if (tg !== undefined && typeof k === "string") { tg.set(tg.key, k, v, tg.ttl); return true; }
+            return Reflect.set(t, k, v);
+        },
+        deleteProperty: function (t, k) {
+            const tg = Reflect.get(t, ROW_SYM);
+            if (tg !== undefined && typeof k === "string") return tg.del(tg.key, k) === true;
+            return Reflect.deleteProperty(t, k);
+        },
+        has: function (t, k) {
+            const tg = Reflect.get(t, ROW_SYM);
+            if (tg !== undefined && typeof k === "string") return tg.has(tg.key, k) === true;
+            return Reflect.has(t, k);
+        },
     };
 
     // Normalizes open() options into primitive scalars for the native registry call.

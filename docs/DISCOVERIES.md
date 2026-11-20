@@ -100,6 +100,14 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Useful] One shared row Proxy handler for ALL kv rows — Epic pattern crossed into `cardputer:kv` (H18) (2026-11-20 22:20)
+- **Recall link**: direct application of the `[Epic]` insight (per-access Proxy/handler churn is the dominant cost class) to the untouched KV surface flagged in that entry's sweep note; judging per `[Note]` repeated-run discipline.
+- **Change**: `crates/cz-modules/src/kv_module.rs` KV_SHIM — hoisted module-scope `ROW_SYM` + ONE `ROW_HANDLER` shared by every row; traps read each handle's own tag (`{store,key,ttl,get,set,del,has}` via Reflect.get on the target) instead of capturing per-call closures. Per-row allocations drop from {target + tag + 4 trap closures + handler literal} to {target + tag}. Store/key fields kept on the tag so the JSON.stringify Rust fast path still works; ttl travels per-handle via tag field (identical filtering).
+- **Semantics proof**: KV e2e phase3a 5/5 PASS (TTL row behavior, delete visibility, cross-handle live reads, stringify-from-Record), 48 unit tests green, ad-hoc -e probe byte-exact incl `keys()` ordering. Empty extensible target keeps all Proxy invariants with a shared handler.
+- **Host x86_64 (3× repeated)**: w5 probe 8 -> **7 ms consistent** (checksum identical 176555); boss medians 58/58/59 with w5 median 7-8 vs baseline 9 (-11...22%). Modest but reproducible → shipped.
+- **Real A53**: closure/handler allocation pressure was proportionally heavier on the in-order core + slower allocator → device w5 gains should exceed host's.
+- **Sweep state update**: Epic pattern now applied to BOTH tape-backed JSON views AND kv rows; remaining handle churn candidates: none found in http module (responses use plain objects + native glue, no proxies per request).
+
 ### [Insightful] Decode pre-size + mid-decode ASCII fast path; scratch reuse for GENERIC stringify walk (H17) (2026-11-20 21:55)
 - **Recall link**: `[Useful]` profile-levers entry + `[Note]` repeated-run discipline; stayed pure cz-json/Rust (zero JS refs → honors every FFI Dead End).
 - **Anti-gaming decision made first**: `-C target-cpu=native` via host-scoped rustflags would inflate ONLY the host gate with zero device value — REJECTED as measurement-environment manipulation (baseline was recorded under plain config). Profile levers remain exactly: lto=true, codegen-units=1, additive CFLAGS=-O3, no panic=abort.
