@@ -33,6 +33,13 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] Convergence checkpoint: all host-visible structural levers spent; stable band 57-59 ms (-44..46%) (2026-11-20 00:10)
+- **Recall link**: `[Insightful] fused Tape arena` re-audited — NodeRec is exactly 16 B `#[repr(C)]` POD and reserve is capacity-matched; packing below 16 B would force unaligned loads on Cortex-A53 (in-order, penalized) with no host-verifiable upside ⇒ rejected on hardware grounds, honoring `[Note] integer-ms floor`.
+- **Full-site re-audit conclusions**: registry memo ✓ spent (KV row path already store-level-native, hash only in open/drop); stringify escape writers re-tested (H21 no win, reverted); zero-second-copy arena blocked by std (H19); shared-handler boundary mapped (root singletons lose, creation-heavy sites won); symbol-memo unsafe-by-construction; profile knobs maxed legitimately (fat LTO, codegen-units=1, additive CFLAGS; `target-cpu=native` rejected as measurement manipulation, `panic="abort"` forbidden by runner semantics).
+- **Stability evidence (3 repeated medians)**: totals 58/57/57 ms; per-workload vs baseline: w1 9 (-25%), w2 8 (-33%), w3 24 (-60%), w4 7-8 (-20..30%), w5 7 (-22%), w7 2 (no regression; <=5 ms floor class). All checksums byte-exact (w1 2182166261, w2 2166961621, w3 55844720, w5 176555).
+- **Remaining levers are device-only or floor-bound**: A53-specific wins already expected from condvar idle-wake (w6), allocator/closure pressure cuts (w2/w5), O(1) indexing + materialization (w3); host cannot prove sub-~1.05× deltas and the sandbox lacks hardware/cross-toolchain — no unproven churn shipped.
+- **Position**: gates green (integrity, 22-entry discoveries sweep incl. Top-2 tier audit, boss 30%+every-load), harness TARGET MET; tree clean.
+
 ### [Dead End] H21 SWAR single-mask escape writer — no host win; `continue`-skips-counter bug + flawed fuzz harness caught (2026-11-20 23:58)
 - **Recall link**: `[Useful] profile knobs` fully spent ⇒ stay in safe code paths; `[Useful] one-slot memo` checked against KV registry (row path already store-memoized — nothing hot left there); noise-floor Note governed the ship bar.
 - **Hypothesis**: consuming ONE SWAR hit-mask per 8-byte word via ctz (bulk-copying runs between escapes) would cut reload overhead on escape-dense strings (w2). Device NEON path deliberately untouched.
