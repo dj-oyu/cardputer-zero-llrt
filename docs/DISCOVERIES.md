@@ -33,6 +33,8 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H70 instant duplicate close: fused-Tape arena win valid ONLY on flat stream (div-8 anchor :134, H52/H60) — port hint MOOT per H57 + H28 tree-sink guard stands; H34 direct-byte outputs FINAL (six-site inventory via H46/H49 suites + one-copy safety chain consistent with raw-C table, alias reads proven H44; residual scalar sites quantified cold H68) — unchanged tree 5adfbb8/H43 ⇒ proofs valid as-proven; fresh PASS 56 ms geoMean 7.39; armed reopeners unchanged; zero churn.
+
 ### [Note] H69 instant duplicate close with condition probes: rustc STILL 1.100.0 ⇒ H19 reopener unmet (single-copy floor tape.rs:132 stands; same-ptr=false blocker proof valid); GC-dump quirk class permanently dead (ENABLE_DUMPS !NDEBUG gate + C-stdio loss at process::exit — pivot = retained-live A/B already backed H40) — functional tree unchanged 5adfbb8/H43; fresh PASS 57 ms geoMean 7.55; guards restated (no dump retries, no nightly/alias hacks); zero churn.
 
 ### [Note] H68 instant duplicate close with quantified residual: Symbol-staleness Dead End is SAFE-BY-DESIGN in shipped code (JS-side `Symbol.for` constants are runtime-scoped by QuickJS itself — json shim :39 LAZY, kv :136 ROW_SYM; zero Rust-level JS-value storage exists), and remaining Rust `Symbol::new_global` tag sites :323/:343 fire only on handle creation ≈15 roots + 50 setup rows/run ⇒ cold, permanently below floor; String-borrow Dead End premise already corrected+shipped at H42 (call-scoped CString RAII, rule-consistent per H45/H49) — tree still 5adfbb8/H43 ⇒ valid as-proven; armed reopeners unchanged; zero churn.
