@@ -108,7 +108,8 @@ const KV_SHIM: &str = r#"
 
     // A row handle is a thin Proxy over an EMPTY target. Data field names are NEVER copied onto
     // the JS object; the traps forward to STORE-LEVEL native functions that take (key, field,...).
-    // Per row() we allocate only the Proxy + handler closures — no new Rust closures at all.
+    // Per row() we allocate ONLY a plain target + its tag object: ONE shared ROW_HANDLER (H18)
+    // serves every handle of every store, and zero Rust closures are created per call.
     // The hidden `Symbol.for("cz.kvRow")` tag on the target lets JSON.stringify serialize the
     // record straight from Rust EntryPayload::Record without walking any JS property (symbols are
     // invisible to Object.getOwnPropertyNames, so the zero-copy own-prop proof stays intact).
