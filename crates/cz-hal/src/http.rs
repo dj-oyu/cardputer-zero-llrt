@@ -650,11 +650,21 @@ pub fn serialize_response(
     keep_alive: bool,
 ) -> Vec<u8> {
     let phrase = reason.unwrap_or_else(|| reason_phrase(status));
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(format!("HTTP/1.1 {status} {phrase}\r\n").as_bytes());
+    // H23 (semantics-identical): exact-capacity reserve and direct byte emission instead of a
+    // format! allocation per line. Dedup/skip rules are byte-for-byte the original logic.
+    let mut out: Vec<u8> = Vec::with_capacity(64 + headers.len() * 40 + body.len());
+    {
+        let st = status.to_string();
+        out.reserve(12 + st.len() + phrase.len() + 4);
+        out.extend_from_slice(b"HTTP/1.1 ");
+        out.extend_from_slice(st.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(phrase.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
 
     let mut has_len = false;
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::with_capacity(headers.len());
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();
         if lower == "connection" || lower == "transfer-encoding" || seen.contains(&lower) {
@@ -663,18 +673,30 @@ pub fn serialize_response(
         seen.push(lower.clone());
         // Header names must be field-content safe; skip anything hostile instead of crashing.
         if lower.chars().all(|c| c.is_ascii_graphic() && c != ':') && !value.contains('\n') && !value.contains('\r') {
-            out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            out.reserve(name.len() + value.len() + 4);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
         }
         if lower == "content-length" {
             has_len = true;
         }
     }
     if !has_len {
-        out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        let cl = body.len().to_string();
+        out.reserve(20 + cl.len() + 4);
+        out.extend_from_slice(b"Content-Length: ");
+        out.extend_from_slice(cl.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(
-        format!("Connection: {}\r\n\r\n", if keep_alive { "keep-alive" } else { "close" }).as_bytes(),
-    );
+    {
+        let conn = if keep_alive { "keep-alive" } else { "close" };
+        out.reserve(13 + conn.len() + 4);
+        out.extend_from_slice(b"Connection: ");
+        out.extend_from_slice(conn.as_bytes());
+        out.extend_from_slice(b"\r\n\r\n");
+    }
     out.extend_from_slice(body);
     out
 }

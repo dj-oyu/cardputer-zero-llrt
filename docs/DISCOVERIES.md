@@ -33,6 +33,15 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Useful] H23 serialize_response: capacity reserve + direct byte emission — µs-proven 2.9×, zero format! per line (2026-11-20 00:45)
+- **Recall link**: the two Dead Ends (`raw-C-API` object building, `String<'js>` zero-copy borrow) forbid JS-value lifetime tricks ⇒ kept the win entirely Rust-owned (`Vec<u8>` emission + one final body copy), judged via µs microbench to clear `[Note] integer-ms floor`.
+- **Hypothesis**: w6's per-request `serialize_response` allocated a growing Vec + one `format!` String per header/status/Content-Length/Connection line — pure allocator waste on every response.
+- **Change**: `crates/cz-hal/src/http.rs::serialize_response` — `Vec::with_capacity(64 + headers*40 + body)`, direct `extend_from_slice`/push emission for status line, headers, auto Content-Length and Connection tail. Dedup (`seen`) and hostile-header skip rules left byte-for-byte as before.
+- **Self-catch during work**: a first draft fabricated bogus dedup pseudo-code that DROPPED duplicate-header filtering and the hostile-skip guard; caught by self-review before compiling, hunk reverted via `git checkout`, re-implemented semantics-identically. Lesson: never scaffold logic from memory — diff against the authoritative source text first.
+- **µs-level proof (3 repeats, `/tmp/h23_micro.rs`)**: outputs `byte-exact=true` all runs; 302-307 ns/op -> **103-106 ns/op = ~2.9×** at 1 KB body + 2 headers. Clears the ≥1.05× bar objectively.
+- **Gates**: cz-hal 124 unit tests green (incl. exact frame-by-frame wire assertions), workspace `-D warnings` clean, HTTP e2e phase2 **11/11**, kv phase3a 5/5, hw phase6a 4/4, cz-runner 10/10, boss medians unchanged 58-59 (w6 is not host-measurable; this is a device-side win for w6 plus smaller host-side frame costs), checksums stable.
+- **A53 expectation**: format! allocation pressure is heavier on the A53 allocator; per-response frame build cost drops ~3× → direct w6 improvement alongside the condvar wake already shipped.
+
 ### [Dead End] H22 JS-side child identity memo (Map per lazy handle) — regressed w3; second boundary case for handle-caching patterns (2026-11-20 00:28)
 - **Recall link**: synergy of `[Epic]` materialization (churn class) + `[Useful] raw enumeration` (stable wrappers idea); judged under `[Note]` integer-ms floor.
 - **Hypothesis**: caching object-typed children in a JS Map inside the handle closure would skip FFI+wrap on repeat reads with stable identity.
