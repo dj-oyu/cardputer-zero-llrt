@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H56 duplicate-recall pointer closure: Lever B (custom allocator DOA — vendored QuickJS arena, rquickjs-sys 0.14 unchanged in Cargo.lock so audit stands) + Lever C (startup/install_json structurally outside every Date.now window; mooted by H40's 4 MiB floor) — fresh PASS 56 ms TARGET_MET re-confirms; zero re-litigation warranted (2026-11-20 07:42)
+- Protocol applied per recorded rule for repeat recalls: pointer to authoritative entries — `[Dead End] Lever B` (JS_ARENA_* size-class arenas ≤512 B amortize backing malloc to one refill/4 KiB; extra unsafe slab ≈ 0% delta, DOA) and `[Note] Lever C` (only perf-visible side effect was retained engine state feeding malloc_size — now irrelevant under the raised threshold). Dependency version verified unchanged since both closures ⇒ their evidence cannot have rotted.
+- Fresh verifier this pass: totals **56 ms** (best of session band), TARGET_MET, all checksums byte-exact ⇒ empirical re-confirmation; H45–H54 closure chain still leaves zero host-provable levers open; decisive gate remains device Round-2 measurement (H40 w7 ≤ 42 ms class; H42/R1 device expectations).
+- Nothing opened, nothing weakened, zero churn.
+
 ### [Note] H55 duplicate-recall fast close: H25 trio + both governing rules already audited FINAL this session (H47 token/identity integrity + code-evidence sweeps; H45/H53 rule consolidation with anchor lines) — fresh PASS 58 ms TARGET_MET re-confirms zero drift; no re-work warranted (2026-11-20 07:35)
 - Re-cited pair fully processed by: H47 (doc(id)/peek_store/child_at trio drift-free; monotonic token identity enforced; one LL/SC pair per parse gate-proven), H45 (raw-C table + trap/handle ratio FINAL states), H53 (root-proxy revert shape verified at shim :48/:86 + materialize gate :449). Sweep ledgers from those rounds close every named site; Round-2 edits created no new registries, Proxy surfaces, or raw bindings ⇒ nothing open to transplant.
 - Fresh verifier this pass: totals **58 ms**, TARGET_MET, w1 8, w2 8, w3 24, w4 8, w5 8, w7 2 (floor class), checksums byte-exact every seed ⇒ both recalled classes confirmed still-intact empirically.
