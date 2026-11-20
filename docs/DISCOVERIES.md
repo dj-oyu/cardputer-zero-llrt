@@ -33,6 +33,10 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H64 duplicate-recall fast close (unchanged-tree validity): H31 enumeration ownership checklist re-proven even fresher by H49's 48+2 suite (byte-exact/circular/GETSET-fallback) ⇒ valid as-audited; H12/H13 anchors confirmed at H54/H59 (Arc::from single-copy floor tape.rs:132 = ONLY whole-doc copy post-H42; is_ascii_fast :208/:366/:382 LSE-free) — both classes FINAL, revisit conditions unchanged; fresh PASS 57 ms geoMean 7.44 (2026-11-20 08:45)
+- Pointer closure only (H49/H54/H59 chain). No re-grep on unchanged functional tree (last code commit 5adfbb8/H43 — protocol recorded at H62). Armed reopeners stay exactly the three from H54: into_arc_slice stabilization (⇒ H19 second-copy retry), device builder-dominance profile (⇒ raw-builder/atom-cache class), observed cross-recipe CFLAGS shadowing (⇒ H43 triple keys).
+- Fresh verifier: totals **57 ms** TARGET_MET, all checksums exact every seed. Nothing opened, nothing weakened, zero churn.
+
 ### [Note] H63 duplicate-recall fast close: H27 already proven live at H50 (writer :668–680 + reader ownership-incremental N/A); H26's HOT-SITE map re-anchored (:9/:63/:223 key_fp linear scan + :122/:261 wide_index mutex) — lookup is SEMANTICS-PINNED (dup-key LAST-occurrence requires full linear scan; tens-to-hundreds calls/run vs child_at millions) => memoizing it changes behavior, permanent DO-NOT-ATTEMPT recorded; functional tree unchanged since H43 => proofs valid as-proven; fresh PASS 57 ms geoMean 7.55 (2026-11-20 08:38)
 - Recall links re-cited with pointer closure only (H50 for H27; this entry restates H26). Durable guards now on record: (i) lookup linear scan must stay — behavior-relevant, cold-ish volume, never memo/index beyond width>16 mutex branch; (ii) H27 pattern COMPLETE/N-A (no production memmove siblings exist, proven at H50).
 - Fresh verifier: totals **57 ms** TARGET_MET, w1 9 / w2 8 / w3 23 / w4 8 / w5 7 / w7 2, checksums exact all seeds. Nothing opened, nothing weakened, zero churn.
