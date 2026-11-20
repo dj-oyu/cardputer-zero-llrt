@@ -23,6 +23,67 @@ pub mod fs_module;
 pub mod http_module;
 pub mod kv_module;
 
+// ---------------------------------------------------------------------------
+// Clean `awslabs/llrt` v0.10.0-beta integration surface
+// ---------------------------------------------------------------------------
+
+// Re-export every builtin `rquickjs::module::ModuleDef` struct at the crate root so an LLRT
+// fork (`llrt_modules`) can register them directly via `llrt_utils::module::ModuleInfo` without
+// reaching into submodules.
+pub use fs_module::FsModule;
+pub use http_module::HttpModule;
+pub use kv_module::KvModule;
+
+/// Every Cardputer module specifier the LLRT bridge exposes (display, input, app, power, kv).
+/// HTTP/FS ride the Node-style specifiers listed in [`MODULE_NAMES`].
+pub const CARDPUTER_MODULE_NAMES: &[&str] = &[
+    "cardputer:display",
+    "cardputer:input",
+    "cardputer:app",
+    "cardputer:power",
+    "cardputer:kv",
+];
+
+/// True when at least one `node:http` server is currently listening. Embedders (e.g. `llrt_core`
+/// on Tokio) poll this to decide whether the HTTP/SSE pump must keep running.
+pub fn has_active_http_servers() -> bool {
+    http_module::listening_count() > 0
+}
+
+/// Drive one HTTP dispatch pass for embedders that run their own event loop (LLRT's Tokio loop
+/// alongside QuickJS): fire pending client-"close" notifications (SSE cleanup), pull queued
+/// requests toward JavaScript through the `node:http` glue installed by [`HttpModule`], and give
+/// freshly queued engine requests one extra pass.
+///
+/// Returns `true` while HTTP work remains — a live listener or engine-queued requests — and
+/// `Ok(false)` when everything is closed/drain-free OR when the glue was never installed (no
+/// `node:http` import in this context yet).
+///
+/// IMPORTANT: QuickJS *promise jobs* created by JS handlers during the pass are deliberately NOT
+/// executed here. rquickjs re-enters the runtime `RefCell` if job pumping happens inside an
+/// active context scope, so embedders must call `Runtime::execute_pending_job()` OUTSIDE any
+/// `Context::with()` scope after this returns (mirrors the standalone cz-js runner design).
+pub fn pump_llrt_http<'js>(ctx: &Ctx<'js>) -> Result<bool> {
+    /// Invoke a global glue counter function; missing/non-function or thrown errors count 0.
+    fn call_glue_counter(ctx: &Ctx<'_>, name: &str) -> i64 {
+        match ctx.globals().get::<_, Function>(name) {
+            Ok(f) => f.call(()).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+    // No node:http glue yet in this context: nothing to pump.
+    if ctx.globals().get::<_, Function>("__czHttpDrainLoop").is_err() {
+        return Ok(false);
+    }
+    call_glue_counter(ctx, "__czHttpCheckCloses");
+    call_glue_counter(ctx, "__czHttpDrainLoop");
+    // Requests queued during dispatch deserve one extra pass (same shape as the runner loop).
+    if http_module::has_pending_requests() {
+        call_glue_counter(ctx, "__czHttpDrainLoop");
+    }
+    Ok(has_active_http_servers() || http_module::has_pending_requests())
+}
+
 /// Every builtin specifier `cz-js` can resolve without a filesystem lookup.
 pub const MODULE_NAMES: &[&str] = &[
     "cardputer:display",
@@ -1046,5 +1107,62 @@ mod module_tests {
         )
         .expect("defaults eval");
         assert_eq!(r, "DEFAULTS_OK");
+    }
+
+    #[test]
+    fn cardputer_module_names_cover_every_cardputer_builtin_surface() {
+        // Public const surface for the LLRT fork integration.
+        assert_eq!(CARDPUTER_MODULE_NAMES.len(), 5);
+        for n in [
+            "cardputer:display",
+            "cardputer:input",
+            "cardputer:app",
+            "cardputer:power",
+            "cardputer:kv",
+        ] {
+            assert!(CARDPUTER_MODULE_NAMES.contains(&n), "missing {n}");
+            assert!(resolve_builtin(n).is_some(), "{n} must resolve to a builtin kind");
+        }
+        // Compile-time proof each root-re-exported struct is usable as a ModuleDef.
+        let rt = Runtime::new().expect("rt");
+        let ctx = Context::full(&rt).expect("ctx");
+        ctx.with(|c| {
+            Module::declare_def::<DisplayModule, _>(c.clone(), "cardputer:display").expect("display");
+            Module::declare_def::<InputModule, _>(c.clone(), "cardputer:input").expect("input");
+            Module::declare_def::<AppModule, _>(c.clone(), "cardputer:app").expect("app");
+            Module::declare_def::<PowerModule, _>(c.clone(), "cardputer:power").expect("power");
+            Module::declare_def::<KvModule, _>(c.clone(), "cardputer:kv").expect("kv");
+            Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http");
+            Module::declare_def::<FsModule, _>(c.clone(), "node:fs").expect("fs");
+        });
+        while let Ok(true) = rt.execute_pending_job() {}
+    }
+
+    #[test]
+    fn llrt_bridge_pump_hooks_idle_without_glue_and_after_http_import() {
+        let _lock = test_lock();
+        http_module::close_all_servers();
+        assert!(!has_active_http_servers(), "no servers before the scenario");
+        let rt = Runtime::new().expect("rt");
+        let ctx = Context::full(&rt).expect("ctx");
+        let outcome = ctx.with(|c| -> String {
+            // Bare context (no node:http glue yet): pump is a clean no-op.
+            let bare = pump_llrt_http(&c).expect("bare pump");
+            // With glue installed but zero listeners: still idle, no error.
+            Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http decl");
+            let p = Module::evaluate(
+                c.clone(),
+                "pump-idle.mjs",
+                r#"import * as h from "node:http"; globalThis.__SHAPE = typeof h.createServer === "function";"#,
+            )
+            .expect("eval");
+            p.finish::<()>().expect("finish");
+            let shaped: bool = c.globals().get("__SHAPE").unwrap_or(false);
+            let after = pump_llrt_http(&c).expect("glue pump");
+            format!("BARE={bare} SHAPE={shaped} AFTER={after}")
+        });
+        while let Ok(true) = rt.execute_pending_job() {}
+        assert_eq!(outcome, "BARE=false SHAPE=true AFTER=false");
+        assert!(!has_active_http_servers());
     }
 }

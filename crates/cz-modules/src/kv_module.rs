@@ -2,10 +2,14 @@
 //!
 //! Every method on a returned `KvStore` handle is backed by a closure capturing the store's
 //! shared [`std::sync::Arc`] into [`cz_hal::kv`]; payloads live entirely on the Rust heap and never
-//! inside a JS `Map`/object. `row()` returns a **zero-copy** JS `Proxy` over an empty target whose
-//! `get`/`set`/`deleteProperty`/`has` traps call native getter/setter/delete field functions, so
-//! no stored field name is ever copied onto the JS object and multiple handles share one live
-//! Rust record (plus native `incr()` stays immediately visible).
+//! inside a JS `Map`/object. The four row-trap natives — `(key, field, ...)` shaped
+//! `getField`/`setField`/`delField`/`hasField` — are created ONCE per `kv.open()` store inside
+//! [`store_methods`]. The shim defines `row(key, ttl?)` **once per store** as a thin JS wrapper
+//! calling the global `__czKvMakeRow(key, ttl, getF, setF, delF, hasF)`, which wraps those shared
+//! natives in a slim JS `Proxy` over an empty target — **zero new Rust closures per `row()`**.
+//! No stored
+//! field name is ever copied onto the JS object and multiple handles share one live Rust record
+//! (plus native `incr()` stays immediately visible).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -100,16 +104,20 @@ fn build_stats_object<'js>(ctx: &Ctx<'js>, st: &Stats) -> Result<Object<'js>> {
 /// wrapper that extracts the option fields into primitives for the native open function.
 const KV_SHIM: &str = r#"
 (function () {
-    if (globalThis.__czKvInstalled) return;
+    if (globalThis.__czKvInstalledV2) return;
 
     // A row handle is a thin Proxy over an EMPTY target. Data field names are NEVER copied onto
-    // the JS object; get/set/deleteProperty/has forward straight to native store functions.
-    globalThis.__czKvMakeRow = function (getF, setF, delF, hasF) {
+    // the JS object; the traps forward to STORE-LEVEL native functions that take (key, field,...).
+    // Per row() we allocate only the Proxy + handler closures — no new Rust closures at all.
+    globalThis.__czKvMakeRow = function (key, ttl, getF, setF, delF, hasF) {
+        // NaN sentinel when unset: rquickjs rejects an EXPLICIT undefined for Opt<f64>, but a
+        // plain number always converts; ttl_opt() filters non-finite to None on the native side.
+        const useTtl = (typeof ttl === "number" && isFinite(ttl) && ttl > 0) ? ttl : NaN;
         return new Proxy({}, {
-            get:    function (t, k) { if (typeof k === "string") return getF(k); return Reflect.get(t, k); },
-            set:    function (t, k, v) { if (typeof k === "string") { setF(k, v); return true; } return Reflect.set(t, k, v); },
-            deleteProperty: function (t, k) { if (typeof k === "string") return delF(k) === true; return Reflect.deleteProperty(t, k); },
-            has:    function (t, k) { if (typeof k === "string") return hasF(k) === true; return Reflect.has(t, k); },
+            get:    function (t, k) { if (typeof k === "string") return getF(key, k); return Reflect.get(t, k); },
+            set:    function (t, k, v) { if (typeof k === "string") { setF(key, k, v, useTtl); return true; } return Reflect.set(t, k, v); },
+            deleteProperty: function (t, k) { if (typeof k === "string") return delF(key, k) === true; return Reflect.deleteProperty(t, k); },
+            has:    function (t, k) { if (typeof k === "string") return hasF(key, k) === true; return Reflect.has(t, k); },
         });
     };
 
@@ -121,10 +129,17 @@ const KV_SHIM: &str = r#"
         let mb = (typeof o.maxBytes === "number" && isFinite(o.maxBytes)) ? o.maxBytes : -1;
         let me = (typeof o.maxEntries === "number" && isFinite(o.maxEntries)) ? o.maxEntries : -1;
         let pp = (typeof o.persistPath === "string") ? o.persistPath : "";
-        return __czKvOpenNative(String(name), mb, me, pp);
+        const s = __czKvOpenNative(String(name), mb, me, pp);
+        // Attach `row` ONCE per store: it reuses the store-level natives (getField/setField/
+        // delField/hasField, all `(key, field, ...)` shaped) so row() allocates zero Rust
+        // closures — only a thin Proxy over an empty target per call.
+        s.row = function (key, ttl) {
+            return __czKvMakeRow(String(key), ttl, this.getField, this.setField, this.delField, this.hasField);
+        };
+        return s;
     };
 
-    globalThis.__czKvInstalled = true;
+    globalThis.__czKvInstalledV2 = true;
 })();
 "#;
 
@@ -210,7 +225,21 @@ fn store_methods<'js>(ctx: &Ctx<'js>, store: Arc<Mutex<KvStore>>) -> Result<Obje
         st.clear();
     })?;
 
-    // row(key, ttlSec?) builds a zero-copy Proxy backed by per-handle native traps.
+    // Row-trap natives live at STORE level: they take (key, field, ...) and are created ONCE
+    // per kv.open() store, then reused by every row() call through the shim (zero Rust
+    // closures per row). `hasField` mirrors the row `in` trap semantics (live field present).
+    let s = store.clone();
+    let del_field_fn = Function::new(ctx.clone(), move |key: String, field: String| -> bool {
+        let mut st = s.lock().expect("kv store lock");
+        st.del_field(&key, &field)
+    })?;
+
+    let s = store.clone();
+    let has_field_fn = Function::new(ctx.clone(), move |key: String, field: String| -> bool {
+        let mut st = s.lock().expect("kv store lock");
+        st.get_field(&key, &field).is_some()
+    })?;
+
     obj.set("set", set_fn)?;
     obj.set("get", get_fn)?;
     obj.set("has", has_fn)?;
@@ -222,52 +251,10 @@ fn store_methods<'js>(ctx: &Ctx<'js>, store: Arc<Mutex<KvStore>>) -> Result<Obje
     obj.set("stats", stats_fn)?;
     obj.set("flush", flush_fn)?;
     obj.set("clear", clear_fn)?;
-
-    let s_row = store.clone();
-    let row_fn = Function::new(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, key: String, ttl: Opt<f64>| -> Result<Value<'js>> {
-            let builder: Function<'js> = ctx.globals().get("__czKvMakeRow")?;
-            let use_ttl = ttl_opt(ttl.0);
-
-            let g = s_row.clone();
-            let get_key = key.clone();
-            let get_f = Function::new(ctx.clone(), move |c: Ctx<'js>, field: String| -> Result<Value<'js>> {
-                let mut st = g.lock().expect("kv store lock");
-                opt_kv_to_js(&c, st.get_field(&get_key, &field))
-            })?;
-
-            let k2 = key.clone();
-            let s2 = s_row.clone();
-            let set_f = Function::new(
-                ctx.clone(),
-                move |_c: Ctx<'js>, field: String, value: Value<'js>| -> bool {
-                    let mut st = s2.lock().expect("kv store lock");
-                    st.set_field(&k2, &field, value_to_kv(&value), ttl_opt(use_ttl));
-                    true
-                },
-            )?;
-
-            let k3 = key.clone();
-            let s3 = s_row.clone();
-            let del_f = Function::new(ctx.clone(), move |field: String| -> bool {
-                let mut st = s3.lock().expect("kv store lock");
-                st.del_field(&k3, &field)
-            })?;
-
-            let k4 = key.clone();
-            let s4 = s_row.clone();
-            let has_f = Function::new(ctx.clone(), move |field: String| -> bool {
-                let mut st = s4.lock().expect("kv store lock");
-                st.get_field(&k4, &field).is_some()
-            })?;
-
-            // The builder returns a Proxy object value directly; return it unchanged (no data
-            // properties live on the JS object — only native traps back the reads/writes).
-            Ok(builder.call((get_f, set_f, del_f, has_f))?)
-        },
-    )?;
-    obj.set("row", row_fn)?;
+    obj.set("delField", del_field_fn)?;
+    obj.set("hasField", has_field_fn)?;
+    // NOTE: `row` is attached once per store by the shim's __czKvOpen wrapper (see KV_SHIM),
+    // reusing these store-level natives — no Rust closure is created per row() call.
 
     Ok(obj)
 }
@@ -380,6 +367,60 @@ mod kv_module_tests {
             ),
             "KV_ROW_OK"
         );
+    }
+
+    #[test]
+    fn row_2000_calls_reuse_store_level_natives_without_per_call_state() {
+        // 2,000 row() calls on one key must share the store-level natives: every handle sees the
+        // same live record, own props stay empty (zero-copy), and views lands exactly at 2000.
+        let out = run_script(
+            r#"
+            import * as kv from "cardputer:kv";
+            const s = kv.open("m_row_stress", { maxEntries: 8 });
+            const warm = s.row("u0");
+            warm.views = 0;
+            for (let i = 0; i < 2000; i++) {
+                const r = s.row("u0");
+                if (r.missing !== undefined) throw new Error("stale value at " + i);
+                r.views++;
+            }
+            const fin = s.getField("u0", "views");
+            if (fin !== 2000) throw new Error("views=" + fin);
+            const lastRow = s.row("u0");
+            if (lastRow.views !== 2000) throw new Error("fresh row mismatch " + lastRow.views);
+            if (Object.getOwnPropertyNames(lastRow).length !== 0) throw new Error("own props leaked");
+            lastRow.tag = "live";
+            if (s.row("u0").tag !== "live") throw new Error("shared record broken");
+            if (!("tag" in s.row("u0"))) throw new Error("has trap broken");
+            delete s.row("u0").tag;
+            if ("tag" in s.row("u0")) throw new Error("delete trap broken");
+            globalThis.__R = "ROW_REUSE_OK";
+            "#,
+        );
+        assert_eq!(out, "ROW_REUSE_OK");
+    }
+
+    #[test]
+    fn row_ttl_applies_per_row_via_shared_setter() {
+        // Rows created with a TTL expire through the shared store-level setter; rows created
+        // without one keep fields indefinitely.
+        let out = run_script(
+            r#"
+            import * as kv from "cardputer:kv";
+            const s = kv.open("m_row_ttl");
+            const shortRow = s.row("eph", 0.12);
+            shortRow.a = 1;
+            const plainRow = s.row("keep");
+            plainRow.b = 2;
+            if (shortRow.a !== 1 || plainRow.b !== 2) throw new Error("initial reads");
+            const until = Date.now() + 300;
+            while (Date.now() < until) { }
+            if (s.getField("eph", "a") !== undefined) throw new Error("row ttl not applied");
+            if (plainRow.b !== 2) throw new Error("plain row ttl leaked");
+            globalThis.__R = "ROW_TTL_OK";
+            "#,
+        );
+        assert_eq!(out, "ROW_TTL_OK");
     }
 
     #[test]

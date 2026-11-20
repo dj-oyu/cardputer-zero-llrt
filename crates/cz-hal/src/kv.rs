@@ -6,8 +6,9 @@
 //!
 //! - [`KvValue`] is a tagged enum (`Null`/`Bool`/`Int`/`Float`/`Str`/`Bytes`) with exact byte
 //!   accounting so `store.stats().bytes` reflects real native footprint.
-//! - An [`Entry`] holds either a scalar value OR a structured field map (a record read through a
-//!   zero-copy row handle), plus a monotonic LRU `seq` and optional absolute TTL expiry in
+//! - An [`Entry`] holds exactly one [`EntryPayload`] — a scalar value OR a structured field map
+//!   (a record read through a zero-copy row handle) — bounded to 72 bytes so scalar entries do
+//!   not pay for an empty `HashMap`, plus a monotonic LRU `seq` and optional absolute TTL in
 //!   wall-clock epoch milliseconds (so snapshots survive a reboot).
 //! - [`KvStore`] enforces `max_bytes` (default 1 MiB) and `max_entries` (default 1024): inserts
 //!   evict least-recently-used entries until within limits and bump `evictions`. Expired entries
@@ -196,17 +197,26 @@ impl<'a> Reader<'a> {
 // Entry: either scalar value OR structured field map, with LRU + TTL bookkeeping
 // ---------------------------------------------------------------------------
 
+/// Unified entry payload: exactly ONE of a bare scalar OR a structured field map lives inline.
+/// The old dual `Option<KvValue>` + `HashMap` layout paid ~48 bytes of empty-map overhead on
+/// every scalar entry; this enum shares one 48-byte slot instead.
+#[derive(Clone, Debug)]
+pub enum EntryPayload {
+    Scalar(KvValue),
+    Record(HashMap<Box<str>, KvValue>),
+}
+
 /// One stored record: a scalar value OR a structured field map, plus LRU/TTL/byte bookkeeping.
+/// `payload` replaces the previous `scalar` + `fields` pair, bounding `Entry` to <= 72 bytes
+/// on 64-bit targets (`seq` 8 + `expires_at_ms` 16 + `EntryPayload` 48).
 #[derive(Clone, Debug)]
 pub struct Entry {
     /// Monotonic sequence counter (recency); lowest seq is evicted first under LRU.
     pub seq: u64,
     /// Absolute expiry in epoch milliseconds (`None` = no TTL). Persisted for reboot survival.
     pub expires_at_ms: Option<u64>,
-    /// Scalar payload present when this entry is *not* a structured record.
-    pub scalar: Option<KvValue>,
-    /// Structured field map (present for row-handle records and `setField`).
-    pub fields: HashMap<Box<str>, KvValue>,
+    /// The live payload: either a scalar value or a structured field map (never both).
+    pub payload: EntryPayload,
 }
 
 impl Entry {
@@ -214,24 +224,26 @@ impl Entry {
         Self {
             seq,
             expires_at_ms,
-            scalar: None,
-            fields: HashMap::new(),
+            // A fresh entry starts as a zero-cost Null scalar until `set`/`setField` fills it.
+            payload: EntryPayload::Scalar(KvValue::Null),
         }
     }
 
     /// True when the record carries a structured field map (vs a bare scalar).
     pub fn is_structured(&self) -> bool {
-        !self.fields.is_empty()
+        matches!(&self.payload, EntryPayload::Record(map) if !map.is_empty())
     }
 
-    /// Exact native byte footprint: key length + value sizes (scalar or all field names/values).
+    /// Exact native byte footprint: key length + value sizes (scalar OR all field names/values).
     fn byte_cost(&self, key_len: usize) -> usize {
         let mut c = key_len;
-        if let Some(v) = &self.scalar {
-            c += v.size();
-        }
-        for (k, v) in &self.fields {
-            c += k.len() + v.size();
+        match &self.payload {
+            EntryPayload::Scalar(v) => c += v.size(),
+            EntryPayload::Record(map) => {
+                for (k, v) in map {
+                    c += k.len() + v.size();
+                }
+            }
         }
         c
     }
@@ -382,8 +394,11 @@ impl KvStore {
         if let Some(old) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old.byte_cost(key.len()) as u64);
         }
-        let mut e = Entry::new(now_seq, ttl_ms);
-        e.scalar = Some(value);
+        let e = Entry {
+            seq: now_seq,
+            expires_at_ms: ttl_ms,
+            payload: EntryPayload::Scalar(value),
+        };
         let cost = e.byte_cost(key.len()) as u64;
         self.bytes += cost;
         self.entries.insert(key, e);
@@ -401,8 +416,12 @@ impl KvStore {
         self.purge_expired();
         if self.touch(key) {
             self.hits += 1;
-            // Scalar entries return their scalar; structured records return Null via `get`.
-            self.entries.get(key).and_then(|e| e.scalar.clone())
+            // Scalar payloads return their value; structured records return None via `get`
+            // (identical to the old dual-field layout, which stored no scalar for records).
+            self.entries.get(key).and_then(|e| match &e.payload {
+                EntryPayload::Scalar(v) => Some(v.clone()),
+                EntryPayload::Record(_) => None,
+            })
         } else {
             self.misses += 1;
             None
@@ -455,14 +474,22 @@ impl KvStore {
         self.seq += 1;
         let seq = self.seq;
         let expiry = ttl_to_expiry_ms(ttl_sec, now);
-        let entry = self.entries.entry(key.to_string()).or_insert_with(|| Entry::new(seq, None));
+        let entry = self
+            .entries
+            .entry(key.to_string())
+            .or_insert_with(|| Entry::new(seq, None));
         entry.seq = seq;
-        // Switching to a structured record drops any prior scalar payload; drop old bytes first.
-        entry.scalar = None;
+        // Switching to a structured record drops any prior scalar payload (byte totals are
+        // recomputed below).
+        if !matches!(entry.payload, EntryPayload::Record(_)) {
+            entry.payload = EntryPayload::Record(HashMap::new());
+        }
         if let Some(ex) = expiry {
             entry.expires_at_ms = Some(ex);
         }
-        entry.fields.insert(field.into(), value);
+        if let EntryPayload::Record(map) = &mut entry.payload {
+            map.insert(field.into(), value);
+        }
         // Recompute the running byte total accurately after the in-place field mutation.
         self.bytes = self.recount_total_bytes();
         self.enforce_limits();
@@ -476,7 +503,10 @@ impl KvStore {
             return None;
         }
         self.hits += 1;
-        self.entries.get(key).and_then(|e| e.fields.get(field)).cloned()
+        self.entries.get(key).and_then(|e| match &e.payload {
+            EntryPayload::Record(map) => map.get(field).cloned(),
+            EntryPayload::Scalar(_) => None,
+        })
     }
 
     /// Remove one field from a record. Returns whether it existed.
@@ -486,7 +516,10 @@ impl KvStore {
             return false;
         }
         let removed = match self.entries.get_mut(key) {
-            Some(e) => e.fields.remove(field).is_some(),
+            Some(e) => match &mut e.payload {
+                EntryPayload::Record(map) => map.remove(field).is_some(),
+                EntryPayload::Scalar(_) => false,
+            },
             None => false,
         };
         // Recompute running bytes since the field's footprint vanished.
@@ -501,16 +534,28 @@ impl KvStore {
         self.seq += 1;
         let seq = self.seq;
         let expiry = ttl_to_expiry_ms(ttl_sec, now);
-        let entry = self.entries.entry(key.to_string()).or_insert_with(|| Entry::new(seq, None));
+        let entry = self
+            .entries
+            .entry(key.to_string())
+            .or_insert_with(|| Entry::new(seq, None));
         entry.seq = seq;
         if let Some(ex) = expiry {
             entry.expires_at_ms = Some(ex);
         }
-        entry.scalar = None;
-        let cur = entry.fields.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // `incr` always targets a structured field, so the entry becomes (or stays) a Record.
+        if !matches!(entry.payload, EntryPayload::Record(_)) {
+            entry.payload = EntryPayload::Record(HashMap::new());
+        }
+        let cur = match &entry.payload {
+            EntryPayload::Record(map) => map.get(field).and_then(|v| v.as_f64()),
+            EntryPayload::Scalar(_) => None,
+        }
+        .unwrap_or(0.0);
         let step = if delta.is_finite() { delta } else { 1.0 };
         let next = cur + step;
-        entry.fields.insert(field.into(), KvValue::from_f64(next));
+        if let EntryPayload::Record(map) = &mut entry.payload {
+            map.insert(field.into(), KvValue::from_f64(next));
+        }
         self.bytes = self.recount_total_bytes();
         self.enforce_limits();
         next
@@ -573,15 +618,24 @@ impl KvStore {
             }
             if e.is_structured() {
                 out.push(1u8); // structured
-                write_u32(&mut out, e.fields.len() as u32);
-                for (fk, fv) in &e.fields {
+                // Only a non-empty Record can be structured (is_structured checked above).
+                let map = match &e.payload {
+                    EntryPayload::Record(m) => m,
+                    EntryPayload::Scalar(_) => unreachable!("structured entry has record payload"),
+                };
+                write_u32(&mut out, map.len() as u32);
+                for (fk, fv) in map {
                     write_u32(&mut out, fk.len() as u32);
                     out.extend_from_slice(fk.as_bytes());
                     write_value(&mut out, fv);
                 }
             } else {
-                out.push(0u8); // scalar
-                write_value(&mut out, e.scalar.as_ref().unwrap_or(&KvValue::Null));
+                out.push(0u8); // scalar (an emptied Record persists as Null, like before)
+                let v = match &e.payload {
+                    EntryPayload::Scalar(v) => v,
+                    EntryPayload::Record(_) => &KvValue::Null,
+                };
+                write_value(&mut out, v);
             }
         }
         out
@@ -614,17 +668,19 @@ impl KvStore {
             let ef = r.u8()?;
             let expires = if ef == 1 { Some(r.u64()?) } else { None };
             let kind = r.u8()?;
-            let mut e = Entry::new(0, expires);
-            if kind == 1 {
+            let payload = if kind == 1 {
                 let nfields = r.u32()?;
+                let mut map: HashMap<Box<str>, KvValue> = HashMap::new();
                 for _ in 0..nfields {
                     let fk = r.string()?;
                     let fv = r.value()?;
-                    e.fields.insert(fk.into(), fv);
+                    map.insert(fk.into(), fv);
                 }
+                EntryPayload::Record(map)
             } else {
-                e.scalar = Some(r.value()?);
-            }
+                EntryPayload::Scalar(r.value()?)
+            };
+            let e = Entry { seq: 0, expires_at_ms: expires, payload };
             if !e.expired_at(now) {
                 self.entries.insert(key, e);
             }
@@ -1034,10 +1090,63 @@ mod tests {
 
     #[test]
     fn byte_cost_includes_field_names_and_values() {
-        let mut e = Entry::new(1, None);
-        e.fields.insert("views".into(), KvValue::Int(1));
-        e.fields.insert("name".into(), KvValue::Str("bob".into()));
+        let mut map: HashMap<Box<str>, KvValue> = HashMap::new();
+        map.insert("views".into(), KvValue::Int(1));
+        map.insert("name".into(), KvValue::Str("bob".into()));
+        let e = Entry { seq: 1, expires_at_ms: None, payload: EntryPayload::Record(map) };
         // key len 2 + (views5+int8) + (name4+str3)
         assert_eq!(e.byte_cost(2), 2 + (5 + 8) + (4 + 3));
+        // A bare scalar costs only its own bytes — no empty-map overhead.
+        let s = Entry {
+            seq: 1,
+            expires_at_ms: None,
+            payload: EntryPayload::Scalar(KvValue::Str("abcd".into())),
+        };
+        assert_eq!(s.byte_cost(2), 6);
+    }
+
+    /// Layout guard: `Entry` must stay at <= 72 bytes on 64-bit targets after the
+    /// `EntryPayload` unification (seq 8 + Option<u64> 16 + payload 48).
+    #[test]
+    fn entry_payload_layout_stays_within_72_bytes() {
+        assert_eq!(std::mem::size_of::<usize>(), 8, "64-bit target expected");
+        assert!(std::mem::size_of::<EntryPayload>() <= 48);
+        let size = std::mem::size_of::<Entry>();
+        assert!(size <= 72, "Entry grew to {size} bytes (target <= 72)");
+        // The old dual-field layout was strictly larger than the unified enum.
+        let old_like = std::mem::size_of::<(u64, Option<u64>, Option<KvValue>, HashMap<Box<str>, KvValue>)>();
+        assert!(size < old_like, "unified Entry ({size}) should beat dual layout ({old_like})");
+    }
+
+    #[test]
+    fn scalar_to_record_payload_conversion_drops_scalar_and_keeps_liveness() {
+        let mut s = fresh_store("payload_conv", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        s.set("u", KvValue::Str("12345".into()), None);
+        assert_eq!(s.get("u"), Some(KvValue::Str("12345".into())));
+        assert_eq!(s.stats().bytes, ("u".len() + 5) as u64);
+        s.set_field("u", "views", KvValue::Int(8), None);
+        assert!(s.entries.get("u").map(|e| e.is_structured()).unwrap_or(false));
+        // Structured records never resurrect a stale scalar (same semantics as before).
+        assert_eq!(s.get("u"), None);
+        assert!(s.has("u"));
+        assert_eq!(s.stats().bytes, ("u".len() + "views".len() + 8) as u64);
+        assert_eq!(s.get_field("u", "views"), Some(KvValue::Int(8)));
+        // Deleting the last field keeps the entry live as an emptied Record.
+        assert!(s.del_field("u", "views"));
+        assert!(s.has("u"));
+        assert_eq!(s.get_field("u", "views"), None);
+    }
+
+    #[test]
+    fn record_payload_survives_snapshot_roundtrip_and_stays_record() {
+        let mut s = fresh_store("payload_snap", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        s.set_field("rec", "a", KvValue::Int(2), None);
+        s.set_field("rec", "b", KvValue::Bool(true), None);
+        let snap = s.encode_snapshot();
+        let mut t = fresh_store("payload_snap_b", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        t.apply_snapshot(&snap).expect("apply");
+        assert!(t.entries.get("rec").map(|e| matches!(e.payload, EntryPayload::Record(_))).unwrap_or(false));
+        assert_eq!(t.get_field("rec", "a"), Some(KvValue::Int(2)));
+        assert_eq!(t.get_field("rec", "b"), Some(KvValue::Bool(true)));
     }
 }

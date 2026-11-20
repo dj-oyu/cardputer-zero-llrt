@@ -2,3 +2,4 @@
 .pi/DONE.json
 *.deb
 *.png
+dist/

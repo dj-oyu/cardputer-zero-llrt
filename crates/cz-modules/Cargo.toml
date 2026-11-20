@@ -9,3 +9,7 @@ cz-hal = { path = "../cz-hal" }
 cz-gfx = { path = "../cz-gfx" }
 rquickjs.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+# Integration tests exercise the public LLRT bridge surface against rquickjs directly.
+rquickjs.workspace = true
