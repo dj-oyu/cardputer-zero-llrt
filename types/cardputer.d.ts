@@ -193,6 +193,20 @@ declare module "cardputer:input" {
   export default input;
 }
 
+/** QuickJS heap usage snapshot from `cardputer:app.memoryUsage()` (`JS_ComputeMemoryUsage`). */
+interface CzMemoryUsage {
+  /** Total bytes currently malloc'd by the QuickJS runtime (JS-tracked allocations only). */
+  mallocSize: number;
+  /** Number of live JS-tracked allocations. */
+  mallocCount: number;
+  /** Memory used by the GC-visible arena. */
+  memoryUsedSize: number;
+  /** Count of JS objects. */
+  objCount: number;
+  /** Count of JS strings. */
+  strCount: number;
+}
+
 declare module "cardputer:app" {
   /** Static device/runtime info (device, arch, cpu, displayWidth, displayHeight, runtime). */
   export function info(): CzAppInfo;
@@ -209,12 +223,16 @@ declare module "cardputer:app" {
   /** Install SIGINT/SIGTERM handlers that set the quit flag; returns success. */
   export function installSignalHandlers(): boolean;
 
+  /** QuickJS runtime memory usage via `JS_ComputeMemoryUsage` (Rust-native KV data never counts here). */
+  export function memoryUsage(): CzMemoryUsage;
+
   const app: {
     info: typeof info;
     getConfig: typeof getConfig;
     shouldQuit: typeof shouldQuit;
     requestQuit: typeof requestQuit;
     installSignalHandlers: typeof installSignalHandlers;
+    memoryUsage: typeof memoryUsage;
   };
   export default app;
 }
@@ -227,6 +245,69 @@ declare module "cardputer:power" {
     status: typeof status;
   };
   export default power;
+}
+
+/** A value stored natively in `cardputer:kv` (never a JS Map/object). */
+type CzKvValue = null | boolean | number | string | Uint8Array;
+
+/** Bookkeeping snapshot from `store.stats()`. */
+interface CzKvStats {
+  name: string;
+  entries: number;
+  bytes: number;
+  maxBytes: number;
+  maxEntries: number;
+  evictions: number;
+  hits: number;
+  misses: number;
+}
+
+/** Options accepted by `kv.open(name, options?)`. */
+interface CzKvOpenOptions {
+  /** Native byte budget; defaults to 1 MiB (1048576). */
+  maxBytes?: number;
+  /** Entry budget; defaults to 1024. */
+  maxEntries?: number;
+  /** Power-loss-safe persistence file (`tmp` -> `fsync` -> atomic `rename`). */
+  persistPath?: string;
+}
+
+/** A named Rust-native KV store handle. */
+interface KvStore {
+  /** Insert/replace a scalar value with optional fractional-second TTL. */
+  set(key: string, value: CzKvValue, ttlSec?: number): void;
+  /** Read a scalar value; `undefined` when missing or expired. */
+  get(key: string): CzKvValue | undefined;
+  has(key: string): boolean;
+  del(key: string): boolean;
+  /** Live keys, optionally prefix-filtered. */
+  keys(prefix?: string): string[];
+  /** Set one field on a structured record (optional TTL). */
+  setField(key: string, field: string, value: CzKvValue, ttlSec?: number): void;
+  /** Read one field; `undefined` when missing/expired. */
+  getField(key: string, field: string): CzKvValue | undefined;
+  /** Increment a numeric field (missing treated as 0); default delta is 1. Returns the new value. */
+  incr(key: string, field: string, delta?: number, ttlSec?: number): number;
+  /** Zero-copy native row handle (a Proxy over an empty target; no data fields copied onto JS). */
+  row(key: string, ttlSec?: number): Record<string, any>;
+  stats(): CzKvStats;
+  /** Atomic persist; `true` when a `persistPath` exists, `false` for in-memory-only stores. */
+  flush(): boolean;
+  /** Drop all entries from memory (does not delete a persisted file). */
+  clear(): void;
+}
+
+declare module "cardputer:kv" {
+  /** Open (or reuse) a named Rust-native store; loads an existing snapshot when `persistPath` is set. */
+  export function open(name: string, options?: CzKvOpenOptions): KvStore;
+  /** Remove/free a named store from the native registry; returns whether it existed. */
+  export function drop(name: string): boolean;
+
+  const kv: {
+    open: typeof open;
+    drop: typeof drop;
+  };
+  export default kv;
 }
 
 /** Bound socket address reported by `server.address()` (null before listen / after close). */

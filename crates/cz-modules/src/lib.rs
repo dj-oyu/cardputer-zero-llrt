@@ -21,6 +21,7 @@ use cz_hal::power::PowerStatus;
 
 pub mod fs_module;
 pub mod http_module;
+pub mod kv_module;
 
 /// Every builtin specifier `cz-js` can resolve without a filesystem lookup.
 pub const MODULE_NAMES: &[&str] = &[
@@ -28,6 +29,7 @@ pub const MODULE_NAMES: &[&str] = &[
     "cardputer:input",
     "cardputer:app",
     "cardputer:power",
+    "cardputer:kv",
     "node:http",
     "http",
     "node:fs",
@@ -43,6 +45,7 @@ pub enum ModuleKind {
     Power,
     Http,
     Fs,
+    Kv,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -55,6 +58,7 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "cardputer:power" => Some(ModuleKind::Power),
         "node:http" | "http" => Some(ModuleKind::Http),
         "node:fs" | "fs" => Some(ModuleKind::Fs),
+        "cardputer:kv" => Some(ModuleKind::Kv),
         _ => None,
     }
 }
@@ -72,6 +76,7 @@ pub fn declare_builtin<'js>(
         ModuleKind::Power => rquickjs::Module::declare_def::<PowerModule, _>(ctx.clone(), name),
         ModuleKind::Http => rquickjs::Module::declare_def::<http_module::HttpModule, _>(ctx.clone(), name),
         ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
+        ModuleKind::Kv => rquickjs::Module::declare_def::<kv_module::KvModule, _>(ctx.clone(), name),
     }
 }
 
@@ -273,6 +278,42 @@ pub(crate) fn build_info_object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
     Ok(obj)
 }
 
+/// Build the QuickJS memory-usage snapshot directly from the runtime behind this context.
+///
+/// We read the raw `JSRuntime*` via `JS_GetRuntime` and fill a `JSMemoryUsage` with
+/// `JS_ComputeMemoryUsage` INSIDE the active `ctx.with()` scope. This deliberately avoids
+/// calling `Runtime::memory_usage()` (which would try to re-lock the runtime `RefCell` already
+/// held by the surrounding scope and panic with "RefCell already borrowed"). Only JS-tracked
+/// allocations are counted, so Rust-native KV payloads never inflate these numbers.
+pub(crate) fn build_memory_usage_object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
+    use rquickjs::qjs;
+    let ctx_ptr = ctx.as_raw().as_ptr();
+    let rt_ptr = unsafe { qjs::JS_GetRuntime(ctx_ptr) };
+    if rt_ptr.is_null() {
+        // No runtime reachable: report zeros rather than crash.
+        let obj = Object::new(ctx.clone())?;
+        for key in [
+            "mallocSize",
+            "mallocCount",
+            "memoryUsedSize",
+            "objCount",
+            "strCount",
+        ] {
+            obj.set(key, 0f64)?;
+        }
+        return Ok(obj);
+    }
+    let mut usage: qjs::JSMemoryUsage = unsafe { std::mem::zeroed() };
+    unsafe { qjs::JS_ComputeMemoryUsage(rt_ptr, &mut usage) };
+    let obj = Object::new(ctx.clone())?;
+    obj.set("mallocSize", usage.malloc_size as f64)?;
+    obj.set("mallocCount", usage.malloc_count as f64)?;
+    obj.set("memoryUsedSize", usage.memory_used_size as f64)?;
+    obj.set("objCount", usage.obj_count as f64)?;
+    obj.set("strCount", usage.str_count as f64)?;
+    Ok(obj)
+}
+
 /// Poll the keyboard state (lazily constructed) returning a JS array of KeyEvent objects.
 pub(crate) fn js_poll<'js>(ctx: &Ctx<'js>) -> Result<Value<'js>> {
     let mut guard = input_state().lock().expect("input lock");
@@ -297,7 +338,7 @@ pub struct AppModule;
 
 impl rquickjs::module::ModuleDef for AppModule {
     fn declare<'js>(decl: &rquickjs::module::Declarations<'js>) -> Result<()> {
-        for name in ["info", "getConfig", "shouldQuit", "requestQuit", "installSignalHandlers", "default"] {
+        for name in ["info", "getConfig", "shouldQuit", "requestQuit", "installSignalHandlers", "memoryUsage", "default"] {
             decl.declare(name)?;
         }
         Ok(())
@@ -316,6 +357,9 @@ impl rquickjs::module::ModuleDef for AppModule {
             QUIT.store(true, Ordering::SeqCst);
         })?;
         let install_fn = Function::new(ctx.clone(), || -> bool { install_signal_handlers() })?;
+        let memory_usage_fn = Function::new(ctx.clone(), |ctx: Ctx<'js>| -> Result<Object<'js>> {
+            build_memory_usage_object(&ctx)
+        })?;
 
         let values: Vec<(&'static str, Value<'js>)> = vec![
             ("info", info_fn.into_value()),
@@ -323,6 +367,7 @@ impl rquickjs::module::ModuleDef for AppModule {
             ("shouldQuit", should_quit_fn.into_value()),
             ("requestQuit", request_quit_fn.into_value()),
             ("installSignalHandlers", install_fn.into_value()),
+            ("memoryUsage", memory_usage_fn.into_value()),
         ];
         for (name, value) in &values {
             exports.export(*name, value.clone())?;

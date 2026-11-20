@@ -23,6 +23,7 @@ pub mod fb;
 pub mod http;
 pub mod http_server;
 pub mod input;
+pub mod kv;
 pub mod power;
 
 /// Non-empty environment variable as a string, `None` when unset or empty.
