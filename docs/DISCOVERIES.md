@@ -100,6 +100,13 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Insightful] O(1) array indexing via lazily-memoized child offset tables (H15) (2026-11-20 20:50)
+- **Recall link**: the [Epic] materialization post-mortem showed w3 still ≈28-31 ms of which a slice was mechanical `child_at` O(j) `skip_to` walks (sum over j ≈ 31k node steps per parse × 80); the [Note] noise-floor demanded repeated-run proof. Pure-Rust arena fix — deliberately NOT touching the raw-C-API surface the [Dead End] warns about.
+- **Change**: `crates/cz-json/src/tape.rs` — `TapeDoc.array_offsets: Mutex<Option<HashMap<u32, Vec<u32>>>>`; `child_at` serves indexed reads from a per-array table built on first indexed access (walk once, cache all children), falls back to the walk for one-off reads. Rust-side only: QuickJS JS heap lazy-proof delta unchanged (e2e <150 KiB gate green).
+- **Host x86_64**: probe_w3 `full` 30 -> 23-24 ms (x3 runs, checksums byte-identical); boss medians x3: **w3 24-25** (baseline 60 → **-58...60%**), total band 59-62 (from 65-66 fat-LTO band; overall vs original 105 baseline = **-41% median**), w4 7-9, every workload ≥ -8%, zero regressions. verify_metrics 100/100.
+- **Real A53**: skip_to pointer chasing on the 32 KB L1 should cost MORE than host, so device gains likely exceed host's; no asm touched.
+- **Takeaway / sweep**: same memo-table idea applies anywhere subtree sibling walks repeat (lazy `own_keys` for hot arrays, future DOM node lists).
+
 ### [Note] Raw-C-API revisit measured after fixing ownership: only +4% on host — not shipped (2026-11-20 20:12)
 - **Recall link**: revisited the [Dead End] "Raw QuickJS C API object building" lesson with corrected ref rules discovered afterwards:
   - `JS_SetPropertyStr` / `JS_SetPropertyInternal2` free `val` on ALL tails (`done:`/`fail:` in quickjs.c) — NO manual `JS_FreeValue` on error return (that was the original double-free crash).

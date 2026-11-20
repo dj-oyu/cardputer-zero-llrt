@@ -103,6 +103,9 @@ pub struct TapeDoc {
     recs: Vec<Rec>,
     /// Per-object key indexes for wide objects, built on first lookup and cached here.
     wide_index: Mutex<Option<HashMap<u32, HashMap<u64, u32>>>>,
+    /// Per-array child offset tables (node index -> [child0, child1, ...]), built on the FIRST
+    /// indexed access of an array so repeated `arr[j]` reads become O(1) instead of O(j) walks.
+    array_offsets: Mutex<Option<HashMap<u32, Vec<u32>>>>,
 }
 
 impl TapeDoc {
@@ -118,6 +121,7 @@ impl TapeDoc {
             raw,
             recs: sink.recs,
             wide_index: Mutex::new(None),
+            array_offsets: Mutex::new(None),
         })
     }
 
@@ -269,9 +273,33 @@ impl TapeDoc {
         if index >= n.child_count() {
             return None;
         }
+        // Fast path: memoized child offset table (built once per array on first indexed read).
+        {
+            let guard = self.array_offsets.lock().expect("array offsets lock");
+            if let Some(map) = guard.as_ref() {
+                if let Some(tab) = map.get(&arr) {
+                    return tab.get(index).copied();
+                }
+            }
+        }
         let mut cur = arr + 1;
         for _ in 0..index {
             cur = self.node(cur).skip_to;
+        }
+        // Build the full table for this array now that it is being indexed repeatedly.
+        {
+            let mut guard = self.array_offsets.lock().expect("array offsets lock");
+            let map = guard.get_or_insert_with(HashMap::new);
+            if !map.contains_key(&arr) {
+                let count = n.child_count();
+                let mut tab = Vec::with_capacity(count);
+                let mut c = arr + 1;
+                for _ in 0..count {
+                    tab.push(c);
+                    c = self.node(c).skip_to;
+                }
+                map.insert(arr, tab);
+            }
         }
         Some(cur)
     }
