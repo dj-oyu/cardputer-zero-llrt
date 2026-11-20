@@ -8,13 +8,13 @@
     },
     {
       "name": "rust-warnings-and-unit-tests",
-      "command": "bash /refs/verify/check_rust_p3a.sh",
-      "weight": 25
+      "command": "bash /refs/verify/check_rust_p4a.sh",
+      "weight": 30
     },
     {
-      "name": "js-all-regression-and-kv-native-proof-e2e",
-      "command": "bash /refs/verify/check_e2e_p3a.sh",
-      "weight": 50
+      "name": "js-all-regression-and-llrt-bridge-e2e",
+      "command": "bash /refs/verify/check_e2e_p4a.sh",
+      "weight": 45
     },
     {
       "name": "ts-declarations-phase3a",
