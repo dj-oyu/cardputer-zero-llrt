@@ -92,6 +92,14 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Host x86_64**: w4 probe parseOnly 12 -> 8-9 ms (full 10 -> 9 median); boss medians x3: w4 9/10/10 with total 66-72; the verifier gate passed at 100/100 including w4 verdict run.
 - **Real A53**: NEON ASCII check should pay off even more (in-order pipeline, byte-loop validation was costly); device re-measure pending.
 
+### [Useful] Fat LTO (`lto = true`) upgrade over thin — verified against noise floor (2026-11-20 20:32)
+- **Recall link**: `[Useful] profile.release lto=thin` flagged remaining profile levers; `panic="abort"` was rejected there (cz-runner catches JS errors via Result — must keep unwind). This experiment tests the one left: fat LTO.
+- **Change**: root `Cargo.toml` — `lto = "thin"` -> `lto = true` (opt-level 3, codegen-units 1 unchanged).
+- **Method (noise-floor discipline)**: 3 repeated boss median runs + hot-cache build timing, not single runs.
+- **Host x86_64**: medians thin-band ≈66-72 ms -> fat 65/66/65 ms (~-4...6% total); w3 28-29 (from 29-33), w4 hit 8 twice, w1/w7 unchanged-or-better, zero regressions. Cold relink cost ~30 s once; HOT builds stay ~0.48 s so `verify_boss_all.sh` is unaffected. verify_metrics full harness 100/100 with fat LTO in tree.
+- **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
+- **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
+
 ### [Note] Raw-C-API revisit measured after fixing ownership: only +4% on host — not shipped (2026-11-20 20:12)
 - **Recall link**: revisited the [Dead End] "Raw QuickJS C API object building" lesson with corrected ref rules discovered afterwards:
   - `JS_SetPropertyStr` / `JS_SetPropertyInternal2` free `val` on ALL tails (`done:`/`fail:` in quickjs.c) — NO manual `JS_FreeValue` on error return (that was the original double-free crash).
