@@ -38,6 +38,12 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Attempted extra proof**: /tmp/h37 standalone microbench replicating from_str vs JS_NewStringLen externally — blocked by rquickjs API shape differences outside our wrapper stack (Context/Ctx constructors, GC helpers). Recognized as bench-side churn, abandoned per the fuzz/harness-artifact precedent rather than hacked; authoritative H34 evidence stays the in-repo byte-exact checksums (w1/w2/w3 exact, chkE stable) + sustained 57 ms medians resolved at 3-seed level.
 - **No code changes this round.**
 
+### [Note] H39 audit: H17 siblings exhausted — lazy.serialize is cold-path, KV scalar strings are cost-neutral (2026-11-20 05:24)
+- **Recall link**: [Insightful] H17 pointed at two unported siblings (output pre-size, fast creation); [Note] integer-ms floor governed the go/no-go. Both measured structurally cold or cost-neutral before any code touched.
+- **lazy.serialize reservation**: the HOT stringify branch is subtree_is_clean passthrough (raw byte copy); the growth-emission path only runs for DIRTY subtrees, which no boss workload mutates inside its timing loop => pre-sizing would chase a cold path. Skipped with structural justification.
+- **KV scalar get -> JS string**: stored KvValue::Str values are already-valid Rust Strings; String::from_str and JS_NewStringLen both perform one utf8-decode + one copy, and unlike H34 there is NO separate ascii() validation layer here to remove => same-cost class; direct-bytes port would be a no-op. Abandoned pre-churn; standalone replication would hit the h37 external-API wall anyway.
+- **Floor discipline honored**: zero code changes this round; hot-site map re-confirmed complete.
+
 ### [Note] H38 audit: shared-row handler healthy; handle POOLING forbidden on JS-identity grounds; H15 enumeration paths cold (2026-11-20 05:08)
 - **Recall link**: [Useful] shared row handler (H18) + [Insightful] O(1) indexing (H15) asked for a further creation-pressure sibling. Health check confirmed KV_SHIM still ships ONE shared ROW_HANDLER for all handles (target+tag allocations only); a stale doc comment claiming per-row "handler closures" was corrected to the true allocation shape {target, tag}.
 - **New durable boundary**: handle POOLING (reusing the same Proxy for repeated row(key) calls) would silently change JS object identity (===), which no spec or e2e sanctions; conservative rule recorded — creation floors may be lowered (H18) but identity semantics must not shift. Not implemented.
