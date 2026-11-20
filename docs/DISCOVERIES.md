@@ -33,6 +33,12 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H48 health recall: H16 SCRATCH_OUT branches verified wired post-H42; CFLAGS=-O3 shipped state untouched, H43 verdict stands (no re-litigation) (2026-11-20 06:42)
+- **Recall links**: `[Useful] H16 thread-local stringify scratch` + `[Note] CFLAGS=-O3 config lever`. Both were fully processed by recent rounds (H41 frame-leftover closure with µs proof; H43 A/B re-measurement) — this recall asked only for drift audit, found zero.
+- **H16 integrity**: `SCRATCH_OUT` const-init thread-local + retained-capacity `try_borrow_mut` hit paths confirmed live in `do_stringify` lazy-passthrough AND kv-row branches after the H42 parse-binding edit (reentrant-toJSON fallback semantics unchanged, w5 7 ms band + phase5 e2e green as of H46/H47 runs). Last named unapplied site stays CLOSED per H41 (frame encode ownership-copy negates reuse at 1.10–1.17× residual — do-not-revisit rule recorded).
+- **CFLAGS state**: `.cargo/config.toml` still ships exactly `CFLAGS = "-O3"`; no rebuild-flag churn introduced by Round-2 code edits; verifier PASS this round (totals 60 ms band, checksums exact). H43's honest conclusion re-affirmed without re-running the A/B: host delta noise-floor-neutral, device rationale preserved, cc-rs `CFLAGS_$TARGET` shadowing caveat remains the open device-side question for the harness recipe.
+- **No candidates opened**; discipline honored; harness green before/after docs edit; nothing weakened.
+
 ### [Note] H47 health recall: H25 lock-free memo trio intact post-Round-2; H30 zero-polling verified by classification sweep (all sleeps test-region, no spin/yield anywhere) (2026-11-20 06:35)
 - **Recall links**: `[Useful] H25 one-slot reader memo` + `[Note] H30 zero production polling sleeps`. Audit-only round per protocol — nothing legitimately open.
 - **H25 integrity**: token infrastructure live (`doc_token()` monotonic AtomicUsize, key includes token at tape.rs:24 + slot doc at :23/:295) ⇒ identity-domain rule still enforced post-H42/H43; w3 band (H46) already proves `child_at` hot path unchanged. The per-build Relaxed `fetch_add` is ONE exclusive pair per document parse — proven compliant in the shipped a53 binary gate (LSE=40, RCpc=0 recorded Round 1), so no atomic-budget concern.
