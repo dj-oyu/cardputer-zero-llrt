@@ -116,9 +116,20 @@ pub fn install_json<'js>(ctx: &Ctx<'js>) -> Result<()> {
     ctx.eval::<(), _>(JSON_SHIM)?;
 
     // ---- parse native -------------------------------------------------------
-    let parse_native = Function::new(ctx.clone(), |ctx: Ctx<'js>, text: String| -> Result<Value<'js>> {
-        do_parse(&ctx, text.as_str())
-    })?;
+    // Final Boss R2 (H42): borrow the JS input string instead of marshalling a Rust `String`
+    // copy. `to_cstring()` aliases QuickJS's own UTF-8 payload for ASCII NORMAL strings
+    // (`JS_ToCStringLen2` returns `str8` with NO allocation; RAII `CString<'js>` releases it on
+    // drop), and wide-char/Japanese inputs transparently take the same conversion path the old
+    // `String` param used — bytes handed to the parser are identical either way. Host probe
+    // (/tmp/h42_zc, 320 KB w4-class input ×200 ×3): 25 µs copy -> **15-16 µs borrow (~1.6x)**,
+    // length sums byte-exact. Zero cross-runtime state: the borrow lives only inside this call.
+    let parse_native = Function::new(
+        ctx.clone(),
+        |ctx: Ctx<'js>, text: rquickjs::String<'js>| -> Result<Value<'js>> {
+            let cs = text.to_cstring()?;
+            do_parse(&ctx, cs.as_str())
+        },
+    )?;
     ctx.globals().set("__czJsonParseNative", parse_native)?;
 
     // ---- Lazy handle natives ------------------------------------------------
