@@ -13,18 +13,82 @@ use rquickjs::{Array, Ctx, Function, IntoJs, Object, Result, Value};
 
 use cz_gfx::{Canvas, FontFace};
 use cz_hal::backlight::Backlight;
+
 use cz_hal::config::LauncherConfig;
 use cz_hal::fb::Framebuffer;
 use cz_hal::input::{InputState, KeyEvent as HalKeyEvent, Mods};
 use cz_hal::power::PowerStatus;
 
-/// All builtin module names registered by the runner.
+pub mod fs_module;
+pub mod http_module;
+
+/// Every builtin specifier `cz-js` can resolve without a filesystem lookup.
 pub const MODULE_NAMES: &[&str] = &[
     "cardputer:display",
     "cardputer:input",
     "cardputer:app",
     "cardputer:power",
+    "node:http",
+    "http",
+    "node:fs",
+    "fs",
 ];
+
+/// Which builtin implementation answers a resolved specifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleKind {
+    Display,
+    Input,
+    App,
+    Power,
+    Http,
+    Fs,
+}
+
+/// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
+/// `"http"`/`"fs"` are Node-style aliases of `"node:http"`/`"node:fs"`.
+pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
+    match name {
+        "cardputer:display" => Some(ModuleKind::Display),
+        "cardputer:input" => Some(ModuleKind::Input),
+        "cardputer:app" => Some(ModuleKind::App),
+        "cardputer:power" => Some(ModuleKind::Power),
+        "node:http" | "http" => Some(ModuleKind::Http),
+        "node:fs" | "fs" => Some(ModuleKind::Fs),
+        _ => None,
+    }
+}
+
+/// Declare a builtin module instance for `name` in this context (caller then evaluates it).
+pub fn declare_builtin<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    kind: ModuleKind,
+    name: &str,
+) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>> {
+    match kind {
+        ModuleKind::Display => rquickjs::Module::declare_def::<DisplayModule, _>(ctx.clone(), name),
+        ModuleKind::Input => rquickjs::Module::declare_def::<InputModule, _>(ctx.clone(), name),
+        ModuleKind::App => rquickjs::Module::declare_def::<AppModule, _>(ctx.clone(), name),
+        ModuleKind::Power => rquickjs::Module::declare_def::<PowerModule, _>(ctx.clone(), name),
+        ModuleKind::Http => rquickjs::Module::declare_def::<http_module::HttpModule, _>(ctx.clone(), name),
+        ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
+    }
+}
+
+/// Servers currently listening (event-loop liveness).
+pub fn http_listening_count() -> usize {
+    http_module::listening_count()
+}
+
+/// Engine-queued requests not yet pulled toward JavaScript.
+pub fn http_has_pending() -> bool {
+    http_module::has_pending_requests()
+}
+
+/// Idle pause for event-loop passes (~5ms, keeps CardputerZero CPU usage low while waiting).
+pub fn http_idle_pause() {
+    std::thread::sleep(http_module::IDLE_SLEEP);
+}
 
 // ---------------------------------------------------------------------------
 // Process-wide lazily initialized state
@@ -72,9 +136,20 @@ pub fn install_signal_handlers() -> bool {
     sigint != libc::SIG_ERR && sigterm != libc::SIG_ERR
 }
 
-#[cfg(test)]
-pub(crate) fn set_quit_flag(value: bool) {
-    QUIT.store(value, Ordering::SeqCst);
+/// Rust-side view of the shared quit flag (`app.requestQuit()` / SIGINT / SIGTERM).
+pub fn should_quit() -> bool {
+    QUIT.load(Ordering::SeqCst)
+}
+
+/// Rust-side equivalent of `app.requestQuit()` (sets the shared quit flag). The runner event
+/// loop returns as soon as this is set, matching Ctrl-C / SIGTERM shutdown semantics.
+pub fn request_quit() {
+    QUIT.store(true, Ordering::SeqCst);
+}
+
+/// Clear the shared quit flag (used by the runner after a handled shutdown and by tests).
+pub fn reset_quit_flag() {
+    QUIT.store(false, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +908,7 @@ mod module_tests {
     #[test]
     fn app_module_info_config_and_quit_flow() {
         let _lock = test_lock();
-        set_quit_flag(false);
+        reset_quit_flag();
         std::env::set_var("CARDPUTER_CONFIG_PATH", "/refs/fixtures/config_nested.json");
 
         let src = r#"
@@ -856,7 +931,7 @@ mod module_tests {
         "#;
         let r = run_module_script(&[("cardputer:app", DECL_APP)], src).expect("app eval");
         assert_eq!(r, "APP_OK");
-        set_quit_flag(false);
+        reset_quit_flag();
         std::env::remove_var("CARDPUTER_CONFIG_PATH");
     }
 

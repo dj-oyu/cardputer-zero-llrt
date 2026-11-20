@@ -10,11 +10,18 @@
 //! - `CARDPUTER_CONFIG_PATH` — APPLaunch `config.json` (`$HOME/.config/cardputerzero/config.json`)
 //! - `CARDPUTER_POWER_DIR` — BQ27220 battery sysfs directory
 //!
+//! [`http`] is transport-agnostic HTTP/1.1 protocol code (request parser, chunked decoding, the
+//! 1 MiB body cap and response serialization) used by the `node:http` module in `cz-modules`.
+//! [`http_server`] adds the multi-client TCP engine: one poll-parked accept thread per listening
+//! socket plus one reader thread per connection, forwarding parsed requests toward JavaScript.
+//!
 //! No panics: hardware failures surface as `std::io::Error` / structured defaults.
 
 pub mod backlight;
 pub mod config;
 pub mod fb;
+pub mod http;
+pub mod http_server;
 pub mod input;
 pub mod power;
 

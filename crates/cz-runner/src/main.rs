@@ -34,7 +34,9 @@ impl Resolver for CzResolver {
         name: &str,
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        if name.starts_with("cardputer:") {
+        // Builtins pass through unchanged: cardputer:* plus Node-style "node:http"/"http" and
+        // "node:fs"/"fs" so plain bundler-free web-server scripts import like real Node.
+        if cz_modules::resolve_builtin(name).is_some() {
             return Ok(name.to_string());
         }
         if name.starts_with('.') {
@@ -102,15 +104,8 @@ impl Loader for CzLoader {
         name: &str,
         attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, rquickjs::module::Declared>> {
-        if let Some(idx) = cz_modules::MODULE_NAMES.iter().position(|m| *m == name) {
-            let module = match idx {
-                0 => Module::declare_def::<cz_modules::DisplayModule, _>(ctx.clone(), name)?,
-                1 => Module::declare_def::<cz_modules::InputModule, _>(ctx.clone(), name)?,
-                2 => Module::declare_def::<cz_modules::AppModule, _>(ctx.clone(), name)?,
-                3 => Module::declare_def::<cz_modules::PowerModule, _>(ctx.clone(), name)?,
-                _ => return Err(Error::new_loading(name)),
-            };
-            return Ok(module);
+        if let Some(kind) = cz_modules::resolve_builtin(name) {
+            return cz_modules::declare_builtin(ctx, kind, name);
         }
         self.script.load(ctx, name, attributes)
     }
@@ -173,9 +168,152 @@ fn eval_module(ctx: &Ctx<'_>, name: &str, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Drain pending QuickJS jobs. Call only when no context scope is active.
+/// Drain pending QuickJS jobs. Call only when no context scope is active — pumping jobs while a
+/// `Context::with` scope is open re-enters the runtime lock and panics inside rquickjs.
 fn drain_jobs(rt: &Runtime) {
     while let Ok(true) = rt.execute_pending_job() {}
+}
+
+
+/// Install Node-compatible timers on `globalThis`. Backed by a JS registry that the Rust event
+/// loop advances with `__czTimersTick()` (Date.now() based; returns the remaining count).
+fn bind_timers(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+    let shim = r#"
+        (function () {
+            if (globalThis.__czTimersInstalled) return;
+            const timers = new Map();
+            let nextId = 1;
+            function delayOf(d) {
+                const n = Number(d);
+                return Number.isFinite(n) && n > 0 ? n : 0;
+            }
+            globalThis.setTimeout = function (fn, delay) {
+                if (typeof fn !== "function") throw new TypeError("setTimeout callback must be a function");
+                const extra = Array.prototype.slice.call(arguments, 2);
+                const id = nextId++;
+                timers.set(id, { fn: fn, at: Date.now() + delayOf(delay), every: null, extra: extra });
+                return id;
+            };
+            globalThis.setInterval = function (fn, delay) {
+                if (typeof fn !== "function") throw new TypeError("setInterval callback must be a function");
+                const extra = Array.prototype.slice.call(arguments, 2);
+                const id = nextId++;
+                const step = delayOf(delay);
+                timers.set(id, { fn: fn, at: Date.now() + (step > 0 ? step : 1), every: step > 0 ? step : 1, extra: extra });
+                return id;
+            };
+            globalThis.clearTimeout = function (id) { timers.delete(id); };
+            globalThis.clearInterval = function (id) { timers.delete(id); };
+            globalThis.__czTimerCount = function () { return timers.size; };
+            globalThis.__czTimersTick = function () {
+                const now = Date.now();
+                const due = [];
+                for (const entry of timers.entries()) {
+                    if (entry[1].at <= now) due.push(entry);
+                }
+                due.sort(function (a, b) { return a[1].at - b[1].at; });
+                for (const pair of due) {
+                    const id = pair[0], t = pair[1];
+                    // A callback may clear/replace timers, so re-check membership before firing.
+                    if (!timers.has(id)) continue;
+                    if (t.every !== null) timers.set(id, { fn: t.fn, at: Date.now() + t.every, every: t.every, extra: t.extra });
+                    else timers.delete(id);
+                    try { t.fn.apply(undefined, t.extra); }
+                    catch (e) {
+                        const msg = (e && e.stack) ? e.stack : String((e && e.message) || e);
+                        if (globalThis.console && console.error) console.error(msg);
+                    }
+                }
+                return timers.size;
+            };
+            globalThis.__czTimersInstalled = true;
+        })();
+    "#;
+    ctx.eval::<(), _>(shim)?;
+    Ok(())
+}
+
+/// Invoke `fnName()` returning an i64 count; missing/non-function yields `fallback`.
+fn call_js_i64(ctx: &Ctx<'_>, fn_name: &str, fallback: i64) -> i64 {
+    match ctx.globals().get::<_, Function>(fn_name) {
+        Ok(f) => {
+            // Annotated binding (not a partial turbofish) so both generic parameters infer.
+            let n: i64 = f.call(()).unwrap_or(fallback);
+            n
+        }
+        Err(_) => fallback,
+    }
+}
+
+/// True when the JS HTTP dispatch glue exists in this context (node:http was imported).
+fn has_http_glue(ctx: &Ctx<'_>) -> bool {
+    ctx.globals().get::<_, Function>("__czHttpDrainLoop").is_ok()
+}
+
+/// One event-loop iteration: dispatch queued HTTP requests (which delivers `data`/`end` through
+/// JS jobs), flush their responses, then fire due timers.
+///
+/// CRITICAL rquickjs rule learned from a panic backtrace: every `Runtime` API that locks the
+/// runtime (`execute_pending_job`, `is_job_pending`) must be called OUTSIDE an active
+/// `Context::with()` scope, otherwise the runtime `RefCell` is re-entered and panics with
+/// "RefCell already borrowed". So scopes are opened, closed, and only then jobs are pumped.
+fn loop_pass(rt: &Runtime, ctx: &Context) {
+    // 1. Serve any queued HTTP requests inside a short scope.
+    ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
+    drain_jobs(rt);
+
+    // 2. Fire due timers (callbacks may schedule more timers/jobs or close servers).
+    ctx.with(|c| call_js_i64(&c, "__czTimersTick", 0));
+    drain_jobs(rt);
+
+    // 3. Give promise jobs created by timers one more dispatch pass in this iteration.
+    if rt.is_job_pending() || cz_modules::http_has_pending() {
+        ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
+        drain_jobs(rt);
+    }
+}
+
+/// Liveness snapshot: listening servers, pending JS timers, plus queued engine requests or
+/// pending QuickJS jobs. Runtime queries run outside any context scope.
+fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool) {
+    let listening = cz_modules::http_listening_count();
+    let queued = cz_modules::http_has_pending();
+    let job_pending = rt.is_job_pending();
+    let timers = ctx.with(|c| call_js_i64(&c, "__czTimerCount", 0));
+    (listening, timers, queued || job_pending)
+}
+
+/// Keep the process alive while any HTTP server listens or any timer is pending. The idle pause
+/// (~5ms) keeps CardputerZero CPU usage low; SIGINT/SIGTERM set the shared quit flag.
+fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
+    if cz_modules::should_quit() {
+        return Ok(());
+    }
+    let has_http = ctx.with(|c| has_http_glue(&c));
+    if cz_modules::http_listening_count() > 0 && !cz_modules::install_signal_handlers() {
+        eprintln!("cz-js: warning: could not install SIGINT/SIGTERM handlers");
+    }
+    let started = std::time::Instant::now();
+    // Safety valve: a wedged handler must not spin the process forever.
+    loop {
+        if cz_modules::should_quit() {
+            break;
+        }
+        loop_pass(rt, ctx);
+        let (listening, timers, extra_work) = loop_liveness(rt, ctx);
+        if listening == 0 && timers <= 0 && !extra_work {
+            break;
+        }
+        if !has_http && listening == 0 && timers <= 0 {
+            break;
+        }
+        if started.elapsed().as_secs() > 3600 {
+            eprintln!("cz-js: event loop exceeded the 1h safety valve; exiting");
+            break;
+        }
+        cz_modules::http_idle_pause();
+    }
+    Ok(())
 }
 
 /// Render a caught JS/Rust error with message and stack where available.
@@ -227,13 +365,24 @@ fn main() {
 
     let run_result = ctx.with(|ctx| -> Result<(), String> {
         bind_console(&ctx).map_err(|e| format!("{e}"))?;
+        bind_timers(&ctx).map_err(|e| format!("{e}"))?;
         eval_module(&ctx, &name, &source)
     });
     // Drain any remaining QuickJS jobs outside the context scope.
     drain_jobs(&rt);
 
     match run_result {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => {
+            // Stay alive while an HTTP server is listening or timers are pending, then exit 0.
+            if let Err(msg) = run_event_loop(&rt, &ctx) {
+                eprintln!("cz-js: {msg}");
+                std::process::exit(1);
+            }
+            drain_jobs(&rt);
+            std::io::stdout().flush().ok();
+            std::io::stderr().flush().ok();
+            std::process::exit(0);
+        }
         Err(msg) => {
             eprintln!("cz-js: {msg}");
             std::process::exit(1);
@@ -245,6 +394,7 @@ fn main() {
 #[cfg(test)]
 mod runner_tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn version_string_shape() {
@@ -327,6 +477,177 @@ mod runner_tests {
         drain_jobs(&rt);
         let err = res.expect_err("missing module import must error");
         assert!(err.contains("definitely-missing-module"), "err was: {err}");
+    }
+
+    fn loop_setup() -> (Runtime, Context) {
+        let rt = Runtime::new().unwrap();
+        rt.set_loader(CzResolver::new(), CzLoader::new());
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|c| {
+            bind_console(&c).unwrap();
+            bind_timers(&c).unwrap();
+        });
+        (rt, ctx)
+    }
+
+    /// The quit flag and event-loop liveness are *process-wide* statics (real Ctrl-C semantics),
+    /// so tests that drive `run_event_loop` must not run concurrently with each other.
+    fn event_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn event_loop_fires_timeout_then_exits_promptly() {
+        let _lock = event_test_lock();
+        cz_modules::reset_quit_flag();
+        let (rt, ctx) = loop_setup();
+        ctx.with(|c| {
+            eval_module(
+                &c,
+                "inline_timeout.mjs",
+                r#"
+                    globalThis.globalA = null;
+                    setTimeout((tag) => { globalThis.globalA = tag; }, 10, "fired");
+                    globalThis.__touched = true;
+                "#,
+            )
+            .unwrap();
+        });
+        drain_jobs(&rt);
+        let started = std::time::Instant::now();
+        run_event_loop(&rt, &ctx).unwrap();
+        assert!(started.elapsed().as_millis() < 2000, "loop hung: {:?}", started.elapsed());
+        let got = ctx.with(|c| c.eval::<Option<String>, _>("globalThis.globalA").unwrap());
+        assert_eq!(got.as_deref(), Some("fired"), "timeout callback must run via the loop");
+    }
+
+    #[test]
+    fn event_loop_fires_interval_ticks_and_exits_after_self_clear() {
+        let _lock = event_test_lock();
+        cz_modules::reset_quit_flag();
+        let (rt, ctx) = loop_setup();
+        ctx.with(|c| {
+            eval_module(
+                &c,
+                "inline_interval.mjs",
+                r#"
+                    globalThis.globalB = 0;
+                    const id = setInterval(() => {
+                        globalThis.globalB += 1;
+                        if (globalThis.globalB >= 3) clearInterval(id);
+                    }, 4);
+                "#,
+            )
+            .unwrap();
+        });
+        drain_jobs(&rt);
+        let started = std::time::Instant::now();
+        run_event_loop(&rt, &ctx).unwrap();
+        let ticks = ctx.with(|c| c.eval::<i64, _>("globalThis.globalB").unwrap());
+        assert!(ticks >= 3, "interval must tick at least 3 times, got {ticks}");
+        assert!(started.elapsed().as_millis() < 4000, "interval loop too slow: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn event_loop_serves_one_request_then_exits_when_server_closes() {
+        let _lock = event_test_lock();
+        cz_modules::reset_quit_flag();
+        let (rt, ctx) = loop_setup();
+        ctx.with(|c| {
+            eval_module(
+                &c,
+                "inline_http.mjs",
+                r#"
+                    import { createServer } from "node:http";
+                    globalThis.globalC = null;
+                    const seen = [];
+                    const server = createServer((req, res) => {
+                        seen.push(req.url);
+                        globalThis.globalC = seen.slice();
+                        res.writeHead(201, { "Content-Type": "text/plain", "X-CZ": "yes" });
+                        res.end("PONG_BODY");
+                        setTimeout(() => server.close(), 20);
+                    });
+                    server.listen(0, "127.0.0.1");
+                    globalThis.__port = server.address().port;
+                "#,
+            )
+            .unwrap();
+        });
+        drain_jobs(&rt);
+        let port = ctx.with(|c| c.eval::<u16, _>("globalThis.__port").unwrap());
+        assert!(port > 0, "ephemeral port should be reported");
+        let client = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            use std::io::{Read, Write};
+            stream
+                .write_all(b"GET /api/ping HTTP/1.1
+Host: z
+Connection: close
+
+")
+                .unwrap();
+            let mut buf = String::new();
+            loop {
+                let mut chunk = [0u8; 512];
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            }
+            buf
+        });
+        let started = std::time::Instant::now();
+        run_event_loop(&rt, &ctx).unwrap();
+        let raw = client.join().unwrap();
+        assert!(raw.starts_with("HTTP/1.1 201 Created"), "status line was: {raw:?}");
+        assert!(raw.contains("PONG_BODY") && raw.contains("X-CZ: yes"), "response was: {raw:?}");
+        let urls = ctx.with(|c| c.eval::<Option<String>, _>("JSON.stringify(globalThis.globalC)").unwrap());
+        assert_eq!(urls.as_deref(), Some("[\"/api/ping\"]"));
+        assert_eq!(cz_modules::http_listening_count(), 0, "closed server must leave the registry");
+        assert!(started.elapsed().as_millis() < 5000, "http loop did not exit: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn quit_flag_stops_a_listening_loop_immediately() {
+        let _lock = event_test_lock();
+        cz_modules::reset_quit_flag();
+        let (rt, ctx) = loop_setup();
+        ctx.with(|c| {
+            eval_module(
+                &c,
+                "inline_quit.mjs",
+                r#"
+                    import { createServer } from "node:http";
+                    const server = createServer((req, res) => { res.end("x"); });
+                    server.listen(0, "127.0.0.1");
+                    globalThis.__srv = server;
+                "#,
+            )
+            .unwrap();
+        });
+        drain_jobs(&rt);
+        assert!(cz_modules::http_listening_count() > 0, "server should be listening");
+        // Ctrl-C / SIGTERM semantics: setting the quit flag makes run_event_loop return at once
+        // even though a server is still bound.
+        cz_modules::request_quit();
+        let started = std::time::Instant::now();
+        run_event_loop(&rt, &ctx).unwrap();
+        assert!(started.elapsed().as_millis() < 500, "quit flag must short-circuit the loop");
+        // Close through JS with proper `this` binding (the shim's close() reads this._id).
+        ctx.with(|c| -> rquickjs::Result<()> { c.eval::<(), _>("globalThis.__srv.close();") })
+            .expect("close should succeed");
+        let until_idle = std::time::Instant::now();
+        while cz_modules::http_listening_count() > 0 && until_idle.elapsed().as_millis() < 1000 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(cz_modules::http_listening_count(), 0);
+        cz_modules::reset_quit_flag();
     }
 
     // Compile-time usage guard for the console value plumbing types.

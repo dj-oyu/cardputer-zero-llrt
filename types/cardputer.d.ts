@@ -228,3 +228,156 @@ declare module "cardputer:power" {
   };
   export default power;
 }
+
+/** Bound socket address reported by `server.address()` (null before listen / after close). */
+interface CzServerAddress {
+  /** Wildcard bind means external peers (e.g. Tailscale) can connect. */
+  address: string;
+  family: "IPv4" | "IPv6";
+  port: number;
+}
+
+/** Peer/local socket info exposed as `req.socket` (Node.js compatible shape). */
+interface CzSocketInfo {
+  remoteAddress: string;
+  remotePort: number;
+  localAddress: string;
+  localPort: number;
+}
+
+/** Incoming request object passed to a `"request"` listener (`node:http`). */
+interface IncomingMessage {
+  /** Uppercase method token, e.g. "GET", "POST". */
+  method: string;
+  /** Raw request target including the query string, e.g. "/api/status?v=1". */
+  url: string;
+  /** HTTP version digits, e.g. "1.1". */
+  httpVersion: string;
+  /** Header fields with names lowercased (duplicates joined with ", "). */
+  headers: Record<string, string>;
+  socket: CzSocketInfo;
+  /** Set body chunk decoding ("utf8" / "utf-8" yields string chunks). Returns this. */
+  setEncoding(encoding: string): IncomingMessage;
+  /** Register a body listener; late registration replays already-delivered data/end. */
+  on(event: "data", listener: (chunk: string | Uint8Array) => void): IncomingMessage;
+  on(event: "end" | "close", listener: () => void): IncomingMessage;
+  on(event: "error", listener: (err: Error) => void): IncomingMessage;
+}
+
+/** Outgoing response object passed to a `"request"` listener (`node:http`). */
+interface ServerResponse {
+  statusCode: number;
+  statusMessage?: string;
+  /** Becomes true once the response has been finalized/sent. */
+  headersSent: boolean;
+  /** True after `end()` has been called (repeated end() calls are safe no-ops). */
+  writableEnded: boolean;
+  socket: CzSocketInfo;
+  /** Case-insensitive header set; returns this for chaining. */
+  setHeader(name: string, value: string | number): ServerResponse;
+  getHeader(name: string): string | undefined;
+  hasHeader(name: string): boolean;
+  removeHeader(name: string): void;
+  /** Status plus optional reason phrase or header record. */
+  writeHead(statusCode: number): ServerResponse;
+  writeHead(statusCode: number, headers: Record<string, string | number>): ServerResponse;
+  writeHead(statusCode: number, statusMessage: string, headers?: Record<string, string | number>): ServerResponse;
+  /** Append part of the response body before end(). */
+  write(chunk: string | Uint8Array): boolean;
+  /** Finalize and transmit the response (Content-Length is auto-set when absent). */
+  end(chunk?: string | Uint8Array, callback?: () => void): ServerResponse;
+  end(callback?: () => void): ServerResponse;
+}
+
+/** HTTP server created by `createServer()`; default bind host is "0.0.0.0" (Tailscale-visible). */
+declare class CzHttpServer {
+  /** Bind immediately: `listen(port)`, `listen(port, cb)` or `listen(port, host, cb)`; port 0 asks the OS for an ephemeral port. */
+  listen(port: number, callback?: () => void): this;
+  listen(port: number, host: string, callback?: () => void): this;
+  /** The real bound address, or null before listen() and after close(). */
+  address(): CzServerAddress | null;
+  /** Stop accepting new connections (live sockets finish their current request), emit "close". */
+  close(callback?: () => void): this;
+  on(event: "request", listener: (req: IncomingMessage, res: ServerResponse) => void): this;
+  on(event: "listening" | "close", listener: () => void): this;
+  on(event: "error", listener: (err: Error) => void): this;
+}
+
+declare module "node:http" {
+  /** Standard reason phrases keyed by numeric status code (e.g. STATUS_CODES[404]). */
+  export const STATUS_CODES: Record<string, string>;
+  /** Supported method tokens: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS. */
+  export const METHODS: string[];
+
+  /** Create a server; if `requestListener` is given it is registered as the "request" listener. */
+  export function createServer(requestListener?: (req: IncomingMessage, res: ServerResponse) => void): CzHttpServer;
+
+  /** The `Server` constructor function the runtime exports (same shape `createServer` builds). */
+  export const Server: {
+    new (requestListener?: (req: IncomingMessage, res: ServerResponse) => void): CzHttpServer;
+    prototype: CzHttpServer;
+  };
+
+  /** Constructor/type for the request object handed to `"request"` listeners. */
+  export const IncomingMessage: { prototype: IncomingMessage };
+  /** Constructor/type for the response object handed to `"request"` listeners. */
+  export const ServerResponse: { prototype: ServerResponse };
+
+  const http: {
+    STATUS_CODES: typeof STATUS_CODES;
+    METHODS: typeof METHODS;
+    createServer: typeof createServer;
+    Server: typeof Server;
+    IncomingMessage: typeof IncomingMessage;
+    ServerResponse: typeof ServerResponse;
+  };
+  export default http;
+}
+
+/** Node.js-style alias of the `node:http` module (named exports plus default object). */
+declare module "http" {
+  import httpMod from "node:http";
+  export * from "node:http";
+  export { httpMod as default };
+}
+
+/** Result shape of `statSync()`. */
+interface CzStats {
+  /** Size in bytes. */
+  size: number;
+  isFile(): boolean;
+  isDirectory(): boolean;
+}
+
+declare module "node:fs" {
+  /** Synchronous read: `string` for "utf8"/"utf-8" (also `{ encoding }` form), otherwise `Uint8Array`. Throws on missing files. */
+  export function readFileSync(path: string): Uint8Array;
+  export function readFileSync(path: string, encoding: "utf8" | "utf-8"): string;
+  export function readFileSync(path: string, options?: { encoding?: string | null }): string | Uint8Array;
+
+  /** Whether a path exists. */
+  export function existsSync(path: string): boolean;
+
+  /** Lightweight metadata (`size`, `isFile()`, `isDirectory()`); throws when the path is missing. */
+  export function statSync(path: string): CzStats;
+
+  const fs: {
+    readFileSync: typeof readFileSync;
+    existsSync: typeof existsSync;
+    statSync: typeof statSync;
+  };
+  export default fs;
+}
+
+/** Node.js-style alias of the `node:fs` module (named exports plus default object). */
+declare module "fs" {
+  import fsMod from "node:fs";
+  export * from "node:fs";
+  export { fsMod as default };
+}
+
+/** Node-compatible timers provided on `globalThis` by `cz-js`. */
+declare function setTimeout(callback: (...args: unknown[]) => void, delayMs?: number, ...args: unknown[]): number;
+declare function clearTimeout(id: number): void;
+declare function setInterval(callback: (...args: unknown[]) => void, delayMs?: number, ...args: unknown[]): number;
+declare function clearInterval(id: number): void;
