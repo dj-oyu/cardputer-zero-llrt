@@ -157,7 +157,7 @@ impl Framebuffer {
             let rc = unsafe {
                 libc::ioctl(
                     fd.as_raw_fd(),
-                    FBIOGET_VSCREENINFO,
+                    FBIOGET_VSCREENINFO as libc::Ioctl,
                     &mut vsi as *mut FbVarScreeninfo,
                 )
             };
@@ -168,7 +168,7 @@ impl Framebuffer {
             let rc = unsafe {
                 libc::ioctl(
                     fd.as_raw_fd(),
-                    FBIOGET_FSCREENINFO,
+                    FBIOGET_FSCREENINFO as libc::Ioctl,
                     &mut fsi as *mut FbFixScreeninfo,
                 )
             };
