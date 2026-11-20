@@ -864,6 +864,20 @@ fn walk_json<'js>(
             (rquickjs::qjs::JS_GPN_STRING_MASK | rquickjs::qjs::JS_GPN_ENUM_ONLY) as i32,
         ) == 0
         {
+            if len == 0 {
+                rquickjs::qjs::JS_FreePropertyEnum(q, tab, len);
+                // Nested cardputer:kv row handles are Proxies over an empty target (len == 0).
+                // Checking kv_row_tag only here keeps 0% overhead on plain non-empty objects.
+                if let Some((store, key)) = kv_row_tag(ctx, v)? {
+                    out.pop();
+                    write_kv_record(out, &store, &key);
+                    stack.pop();
+                    return Ok(());
+                }
+                out.push(b'}');
+                stack.pop();
+                return Ok(());
+            }
             let mut first = true;
             for i in 0..len {
                 let pe = &*tab.add(i as usize);

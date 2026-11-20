@@ -134,30 +134,54 @@ patch_module_builder() {
             AppModule, AudioModule, DisplayModule, HttpModule, ImuModule, InputModule, IoModule,
             IrModule, JsonModule, KvModule, PowerModule,
         };
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:display", DisplayModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:input", InputModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:app", AppModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:power", PowerModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:kv", KvModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:json", JsonModule));
-        // Phase 6A peripheral hardware modules (IIO IMU, PCM audio, NEC/LIRC IR, port + UART).
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:imu", ImuModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:audio", AudioModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:ir", IrModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("cardputer:io", IoModule));
-        builder = builder.with_module(llrt_utils::module::ModuleInfo::new("http", HttpModule));
+        builder = builder
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:display", module: DisplayModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:input", module: InputModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:app", module: AppModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:power", module: PowerModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:kv", module: KvModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:json", module: JsonModule })
+            // Phase 6A peripheral hardware modules (IIO IMU, PCM audio, NEC/LIRC IR, port + UART).
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:imu", module: ImuModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:audio", module: AudioModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:ir", module: IrModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "cardputer:io", module: IoModule })
+            .with_module(llrt_utils::module::ModuleInfo { name: "http", module: HttpModule });
     }
 CZBLOCK
     )
-    # Insert inside build(): after the first line mentioning fn build...{ ; fall back to a
-    # top-level block placement for unusual fork layouts.
+    # Insert right before the trailing `builder` return inside Default::default() / build(),
+    # falling back to after `fn build` or EOF for minimal mock layouts.
     local anchor
-    anchor="$(grep -n 'fn build' "$mb" | head -1 | cut -d: -f1 || true)"
-    if [ -z "$anchor" ]; then
-        printf '%s\n' "$block" >> "$mb"
-    else
-        awk -v ln="$anchor" -v add="$block" 'NR == ln { print; print add; next } { print }' \
+    anchor="$(grep -n '^[[:space:]]*builder[[:space:]]*$' "$mb" | tail -1 | cut -d: -f1 || true)"
+    if [ -n "$anchor" ]; then
+        awk -v ln="$anchor" -v add="$block" 'NR == ln { print add } { print }' \
             "$mb" > "$mb.cz-insert.tmp" && mv "$mb.cz-insert.tmp" "$mb"
+    else
+        anchor="$(grep -n 'fn build' "$mb" | head -1 | cut -d: -f1 || true)"
+        if [ -z "$anchor" ]; then
+            printf '%s\n' "$block" >> "$mb"
+        else
+            awk -v ln="$anchor" -v add="$block" 'NR == ln { print; print add; next } { print }' \
+                "$mb" > "$mb.cz-insert.tmp" && mv "$mb.cz-insert.tmp" "$mb"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 5) llrt_core (when present) — install cz-json AFTER LLRT's json::redefine_static_methods
+# ---------------------------------------------------------------------------
+patch_llrt_core() {
+    local cc="$TARGET_DIR/llrt_core/Cargo.toml"
+    local vm="$TARGET_DIR/llrt_core/src/vm.rs"
+    [ -f "$cc" ] && [ -f "$vm" ] || return 0
+    if ! grep -q '^cz-modules = ' "$cc"; then
+        insert_after "$cc" '^\[dependencies\]' "cz-modules = { path = \"$CZ_MODULES_DIR\" }"
+    fi
+    if ! grep -q 'cz_modules::install_json(ctx)?;' "$vm"; then
+        if grep -q 'json::redefine_static_methods(ctx)?;' "$vm"; then
+            insert_after "$vm" 'json::redefine_static_methods\(ctx\)\?;' '    cz_modules::install_json(ctx)?;'
+        fi
     fi
 }
 
@@ -190,11 +214,15 @@ verify_apply() {
     for spec in cardputer:display cardputer:input cardputer:app cardputer:power cardputer:kv \
                 cardputer:json cardputer:imu cardputer:audio cardputer:ir cardputer:io; do
         local spec_n
-        spec_n="$(grep -cF "ModuleInfo::new(\"$spec\"" "$mb" || true)"
+        spec_n="$(grep -cF "name: \"$spec\"" "$mb" || true)"
         [ "$spec_n" -eq 1 ] || { echo "FAIL: $spec registered $spec_n times (want exactly 1)" >&2; exit 1; }
     done
     grep -qF '// cardputer-zero: module registrations (cz-modules)' "$mb" || {
         echo "FAIL: module_builder.rs registration marker missing" >&2; exit 1; }
+    if [ -f "$TARGET_DIR/llrt_core/src/vm.rs" ]; then
+        grep -qF 'cz_modules::install_json(ctx)?;' "$TARGET_DIR/llrt_core/src/vm.rs" || {
+            echo "FAIL: llrt_core/src/vm.rs missing cz_modules::install_json(ctx)?;" >&2; exit 1; }
+    fi
     echo "[build-llrt-a53] patches verified OK in $TARGET_DIR (LSE removed, cortex-a53 active, cz-modules wired, all 10 Cardputer modules + http alias registered)"
 }
 
@@ -203,6 +231,7 @@ apply_patches() {
     patch_makefile
     patch_llrt_modules_cargo
     patch_module_builder
+    patch_llrt_core
     verify_apply
 }
 
@@ -237,8 +266,11 @@ RUSTFLAGS="-Ctarget-cpu=cortex-a53 -Ctarget-feature=-lse,+crt-static" \
 BIN="$TARGET_DIR/target/aarch64-unknown-linux-musl/release/llrt"
 [ -f "$BIN" ] || { echo "FAIL: release binary not produced at $BIN" >&2; exit 1; }
 
-LSE_COUNT="$(objdump -d "$BIN" | awk '{ if ($2 ~ /^(ldadd|ldclr|ldeor|ldcin|ldswp|casa|swpa|swpe)/) c++ } END { print c+0 }')"
-RCPC_COUNT="$(objdump -d "$BIN" | awk '{ if ($2 ~ /^(ldaexr|ldaexp|caspa|swprh|swplh|dmb)/) c++ } END { print c+0 }')"
+OBJDUMP="$(command -v aarch64-linux-gnu-objdump || command -v objdump)"
+"$OBJDUMP" -d --no-show-raw-insn "$BIN" > /tmp/cz-llrt-disasm.txt
+LSE_COUNT="$(grep -cE '\s(ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|cas)(a|l|al)?(b|h)?\s' /tmp/cz-llrt-disasm.txt || true)"
+RCPC_COUNT="$(grep -cE '\s(sdot|udot|ldapr|ldaprb|ldaprh)\s' /tmp/cz-llrt-disasm.txt || true)"
+rm -f /tmp/cz-llrt-disasm.txt
 echo "[build-llrt-a53] objdump LSE=$LSE_COUNT RCpc=$RCPC_COUNT (limits: LSE <= 200, RCpc == 0)"
 [ "$LSE_COUNT" -le 200 ] || { echo "FAIL: too many LSE instructions ($LSE_COUNT > 200)" >&2; exit 1; }
 [ "$RCPC_COUNT" -eq 0 ] || { echo "FAIL: RCpc atomics present (RCpc=$RCPC_COUNT, want 0)" >&2; exit 1; }

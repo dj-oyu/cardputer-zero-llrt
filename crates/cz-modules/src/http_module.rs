@@ -473,6 +473,12 @@ const HTTP_SHIM: &str = r#"
             }
             this._id = info.id;
             servers.set(info.id, this);
+            if (!globalThis.__czRunnerManagedPump && typeof process !== "undefined" && typeof setInterval === "function" && globalThis.__czHttpAutoPump == null) {
+                globalThis.__czHttpAutoPump = setInterval(function () {
+                    globalThis.__czHttpCheckCloses();
+                    globalThis.__czHttpDrainLoop();
+                }, 1);
+            }
             this._addr = { address: info.address, family: info.family, port: info.port };
             if (cb) { try { cb.call(this); } catch (e) { czReportError(e); } }
             this.emit("listening");
@@ -485,6 +491,10 @@ const HTTP_SHIM: &str = r#"
                 servers.delete(this._id);
                 __czClose(this._id);
                 this._id = null;
+                if (servers.size === 0 && globalThis.__czHttpAutoPump != null) {
+                    clearInterval(globalThis.__czHttpAutoPump);
+                    globalThis.__czHttpAutoPump = null;
+                }
             }
             this._addr = null;
             this.emit("close");
