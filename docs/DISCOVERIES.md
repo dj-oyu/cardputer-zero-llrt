@@ -33,6 +33,11 @@ Record every meaningful optimization attempt here — including **Dead Ends** (t
 
 _(Entries will be appended below during the Final Boss optimization campaign.)_
 
+### [Note] H30 audit: zero production polling sleeps remain — condvar idle wake covers every device pause (2026-11-20 02:48)
+- **Recall link**: `[Genius] condvar instant wake` asked whether other hidden 5 ms slices exist on device paths; `[Dead End] String borrow` kept the audit JS-boundary-free.
+- **Exhaustive scan result** (`rg thread::sleep` across cz-hal/cz-modules/cz-runner): EVERY remaining `sleep(...)` occurrence lives inside `#[cfg(test)]` modules (runner tests after line 408, http_module test mods after 839/1562, kv test helpers). Production has exactly ONE bounded pause: `idle_wait(IDLE_SLEEP=5ms)` guarded by the Condvar that wakes INSTANTLY on enqueue and on `mark_client_closed` (verified still wired post-H27/H24 edits: notify_all + idle_wait intact).
+- **Verdict**: nothing to implement — no churn shipped; device w6 keeps its already-shipped instant-wake win. Sleep-site map now recorded so future recalls can confirm closure without re-scanning.
+
 ### [Dead End] H29 ASCII pre-check before stringify-output UTF-8 validation — 2x SLOWER; std from_utf8 is already SIMD (2026-11-20 02:32)
 - **Recall link**: tried reusing the `[Useful] H13 is_ascii_fast` pattern on `ascii()` in do_stringify (called per stringify over up to 237 KB passthrough buffers), judged by µs A/B per `[Note] floor`; `[Note] raw-C-API revisit` reinforced measuring real shipped code paths, not proxies.
 - **Objective µs data (`/tmp/h29` vs live cz-json API, 3× repeats)**: 22 KB: old 266-270 ns vs "new" 517-519 ns; 237 KB: old ~2.8-2.9 µs vs new ~5.5 µs → **~2× slower at both sizes**. Root cause: `std::str::from_utf8` validates via SWAR/SIMD main loop itself (~0.9 B/cycle valid-ASCII); adding our NEON/SWAR pre-check does the SAME detection work twice.
