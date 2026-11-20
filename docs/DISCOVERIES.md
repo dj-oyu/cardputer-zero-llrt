@@ -100,6 +100,18 @@ _(Entries will be appended below during the Final Boss optimization campaign.)_
 - **Real A53**: expected small cross-crate inlining wins (esp. w7_js_core + cz-json hot loops); device cross-build link time grows modestly.
 - **Takeaway**: profile levers exhausted; `panic="abort"` remains forbidden (unwind required for error rendering), which the earlier entry already documented.
 
+### [Note] Reflection checkpoint: trap/handle boundary + FFI ownership table now the two governing rules (2026-11-20 23:10)
+- **Last 15 min landed**: shared-LAZY-handler attempt REVERTED (`[Dead End]` above, 24->26 ms) but its boundary rule is the real product: Epic's shared-handler pattern applies ONLY where handle creation dominates trap traffic (kv rows ✓, grandchildren ✓, root singletons ✗). Harness state re-verified 100/100 after revert, checksums byte-identical.
+- **Synergy check (requested entries)**:
+  - `[Dead End] raw C API`: ownership table (SetProperty frees val on ALL tails; GetOwnProperty desc.value owned; atom dup/leak rules) is now SETTLED and proven safe in H5 fast-enumeration — so tag-reading natives could safely use raw JS_GetPropertyStr later IF a GC soak gate is kept; verdict for object BUILDING stays "not worth it" (1.04×).
+  - `[Useful] one-slot registry memo`: same one-slot memo idiom has an unexploited target: `lazy_tag`/`kv_row_tag` build fresh `Symbol::new_global` objects on EVERY stringify hot call (w5 does 2,000/run, w3/w4 once each) — cache the global symbol per-context keyed by ctx pointer (cz-js = single context per process; wrapper-only, no raw value refs => honors the Dead End constraint). Attempt status below.
+- **Momentum**: next experiment = symbol-memo in tag helpers, judged via repeated w5 probes + phase5 e2e per `[Note]` floor.
+
+### [Dead End] Symbol::new_global memo for tag helpers — unsafe-by-construction staleness risk; abandoned pre-benefit (2026-11-20 23:22)
+- **Synergy attempt**: apply the `[Useful] one-slot registry memo` idiom to `lazy_tag`/`kv_row_tag`'s fresh `Symbol::new_global` per stringify call (w5 2,000/run).
+- **Why abandoned even before measuring benefit**: any memo holding a JS value must key on RUNTIME identity, but rquickjs gives no safely observable runtime token; storing wrapper bits via `transmute_copy` would leak/leave-dangling across sequential Runtimes in ONE process (our cz-modules unit tests create many Runtimes on the same thread!) — that's exactly the failure class the `[Dead End] raw-C-API` soak exposed. No safe lifetime exists → rule recorded: one-slot memo idiom is valid ONLY for Rust-side state (Arc handles like lazy docs), NEVER for JS values across runtimes.
+- **Measured side-note**: the draft never compiled into a shipped binary (signature typo), so no perf delta was ever observed; w5 stays at its H18 level 7-8 ms with checksum 176555, gc_soak stable, e2e phase3a 5/5 + phase5 4/4. Code fully reverted (json_module.rs byte-identical to HEAD); workspace -D warnings clean, 78 crate tests green.
+
 ### [Dead End] Shared LAZY_HANDLER for JSON root proxies — regressed w3; trap/handle ratio boundary found (2026-11-20 22:55)
 - **Recall link**: attempted the `[Epic]` shared-handler pattern on the Lazy JSON shim; reverted after repeated measurement per `[Note]` discipline.
 - **Hypothesis**: hoisting one Proxy handler (traps read {id,node} from the hidden tag) would cut per-handle allocations like it did for kv rows.
