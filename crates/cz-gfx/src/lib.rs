@@ -4,9 +4,11 @@
 
 mod font_data;
 
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Mutex;
 
 use swash::scale::{image::Content, image::Image, Render, Source, ScaleContext};
 use swash::{FontRef as SwashFontRef, GlyphId};
@@ -307,7 +309,32 @@ impl Canvas {
         }
     }
 
+    /// Zero-copy little-endian byte view of the pixel buffer (`WIDTH * HEIGHT * 2`
+    /// bytes). On little-endian targets the RGB565 words already have the exact on-wire
+    /// layout, so this just reborrows `pixels` with `slice::from_raw_parts` — no allocation,
+    /// no copy. Callers (flush/getBuffer/blit) can stream it straight to devices or JS arrays.
+    #[cfg(target_endian = "little")]
+    pub fn as_le_bytes(&self) -> &[u8] {
+        // SAFETY: every u16 pixel is 2 bytes and tightly packed; `pixels.len() * 2` stays
+        // within the allocation, alignment for u8 reads is trivially satisfied, and the
+        // returned slice borrows `self` for its whole lifetime.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.pixels.as_ptr() as *const u8,
+                self.pixels.len() * 2,
+            )
+        }
+    }
+
     /// Serialize the whole canvas as little-endian RGB565 (`WIDTH * HEIGHT * 2` bytes).
+    /// Kept for backward compatibility; on little-endian it copies the zero-copy view.
+    #[cfg(target_endian = "little")]
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        self.as_le_bytes().to_vec()
+    }
+
+    /// Serialize the whole canvas as little-endian RGB565 on big-endian targets.
+    #[cfg(target_endian = "big")]
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(WIDTH * HEIGHT * 2);
         for p in &self.pixels {
@@ -354,6 +381,31 @@ pub fn detect_format(bytes: &[u8]) -> Option<FontFormat> {
     }
 }
 
+/// Maximum number of rasterized glyphs kept per [`FontFace`] (FIFO eviction).
+pub const GLYPH_CACHE_MAX: usize = 256;
+
+/// One rasterized glyph (alpha coverage bitmap + metrics) stored in the face cache,
+/// keyed by `(glyph id, pixel-size bit pattern)`.
+#[derive(Clone, Debug)]
+struct CachedGlyph {
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    advance_px: f32,
+    alpha: Box<[u8]>,
+}
+
+/// Persistent swash `ScaleContext` plus a bounded glyph rasterization cache. Repeated
+/// `draw_text` calls reuse the scaler and hit the cache with zero heap allocations and
+/// zero re-rasterizations.
+struct FontCache {
+    scaler_ctx: ScaleContext,
+    glyphs: HashMap<(u16, u32), CachedGlyph>,
+    /// FIFO insertion order so eviction never scans the map.
+    order: VecDeque<(u16, u32)>,
+}
+
 /// A validated font loaded from disk (TTF/OTF/TTC, index 0).
 pub struct FontFace {
     data: Vec<u8>,
@@ -363,6 +415,7 @@ pub struct FontFace {
     units_per_em: u16,
     ascent: f32,
     descent: f32,
+    cache: Mutex<FontCache>,
 }
 
 impl std::fmt::Debug for FontFace {
@@ -378,33 +431,45 @@ impl std::fmt::Debug for FontFace {
 
 impl FontFace {
     /// Load and validate a font file. Returns `Err` on unreadable or unparseable files.
+    /// The file's `Vec<u8>` is moved straight into the face — no intermediate copy, which
+    /// avoids the temporary 2x RAM spike on multi-MB CJK `.ttc` collections.
     pub fn from_file(path: &Path, family: Option<&str>) -> io::Result<Self> {
         let mut data = Vec::new();
         fs::File::open(path)?.read_to_end(&mut data)?;
-        Self::from_bytes(&data, family)
+        Self::from_owned_bytes(data, family)
     }
 
     /// Validate raw font bytes (works for ttf/otf/ttc containers).
     pub fn from_bytes(data: &[u8], family: Option<&str>) -> io::Result<Self> {
-        let format = detect_format(data)
+        Self::from_owned_bytes(data.to_vec(), family)
+    }
+
+    /// Validate owned font bytes and move them into the face without re-copying.
+    pub fn from_owned_bytes(data: Vec<u8>, family: Option<&str>) -> io::Result<Self> {
+        let format = detect_format(&data)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a TTF/OTF/TTC font"))?;
         // Validate container parse at index 0.
-        let face = SwashFontRef::from_index(data, 0)
+        let face = SwashFontRef::from_index(&data, 0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "font table parse failed"))?;
         let metrics = face.metrics(&[]);
         let num_fonts = if matches!(format, FontFormat::Ttc) {
-            CollectionRef::new(data).map(|c| c.len() as usize).unwrap_or(1)
+            CollectionRef::new(&data).map(|c| c.len() as usize).unwrap_or(1)
         } else {
             1
         };
         Ok(Self {
-            data: data.to_vec(),
+            data,
             format,
             family: family.map(|s| s.to_string()),
             num_fonts,
             units_per_em: metrics.units_per_em,
             ascent: metrics.ascent,
             descent: metrics.descent,
+            cache: Mutex::new(FontCache {
+                scaler_ctx: ScaleContext::new(),
+                glyphs: HashMap::new(),
+                order: VecDeque::new(),
+            }),
         })
     }
 
@@ -478,13 +543,19 @@ impl FontFace {
         if !matches!(img.content, Content::Mask) || w == 0 || h == 0 {
             return;
         }
+        FontFace::blend_alpha(canvas, x, y, w, h, &img.data, color);
+    }
+
+    /// Shared coverage-blend core for tightly packed alpha masks (`w * h` bytes).
+    /// Out-of-range coverage samples are skipped exactly like the [`Image`] path.
+    fn blend_alpha(canvas: &mut Canvas, x: i32, y: i32, w: usize, h: usize, alpha: &[u8], color: u16) {
         for yy in 0..h {
             for xx in 0..w {
                 let off = yy * w + xx;
-                if off >= img.data.len() {
+                if off >= alpha.len() {
                     continue;
                 }
-                let cov = img.data[off];
+                let cov = alpha[off];
                 if cov == 0 {
                     continue;
                 }
@@ -514,8 +585,11 @@ impl FontFace {
     /// Returns the number of characters drawn. Glyph metrics advance through hmtx data and
     /// glyphs clip silently off-canvas (works for CJK codepoints when the font has them).
     pub fn draw_text(&self, canvas: &mut Canvas, x: i32, baseline_y: i32, text: &str, color: u16, pixel_size: f32) -> usize {
+        let size_bits = pixel_size.to_bits();
         let mut pen_x = x;
         let mut drawn = 0usize;
+        // One lock for the whole string; hit entries blit straight from cached alpha.
+        let mut guard = self.cache.lock().expect("glyph cache lock");
         for ch in text.chars() {
             if ch == '\n' {
                 continue; // single-line rasterizer call
@@ -527,13 +601,75 @@ impl FontFace {
                     continue;
                 }
             };
-            if let Some(img) = self.rasterize_glyph(gid, pixel_size) {
-                let gx = pen_x + img.placement.left;
-                let gy = baseline_y + img.placement.top;
-                FontFace::blend_coverage(canvas, gx, gy, &img, color);
+            let key = (gid, size_bits);
+            // Cache hit: zero heap allocations, zero swash rasterizations.
+            if let Some(cg) = guard.glyphs.get(&key) {
+                FontFace::blend_alpha(
+                    canvas,
+                    pen_x + cg.left,
+                    baseline_y + cg.top,
+                    cg.width as usize,
+                    cg.height as usize,
+                    &cg.alpha,
+                    color,
+                );
+                pen_x += cg.advance_px.round() as i32;
                 drawn += 1;
+                continue;
             }
-            pen_x += self.advance_px(gid, pixel_size).round() as i32;
+            // Cache miss: reuse the persistent ScaleContext (never ScaleContext::new here).
+            let advance = self.advance_px(gid, pixel_size);
+            let face = match SwashFontRef::from_index(&self.data, 0) {
+                Some(f) => f,
+                None => {
+                    pen_x += advance.round() as i32;
+                    continue;
+                }
+            };
+            {
+                // One deref of the guard, then disjoint field splits: the persistent
+                // scaler and the cache maps can be used side by side.
+                let cache = &mut *guard;
+                let scaler_ctx = &mut cache.scaler_ctx;
+                let glyphs = &mut cache.glyphs;
+                let order = &mut cache.order;
+                let mut scaler = scaler_ctx.builder(face).size(pixel_size).build();
+                if let Some(img) = Render::new(&[Source::Outline])
+                    .format(swash::zeno::Format::Alpha)
+                    .render(&mut scaler, gid)
+                {
+                    let gx = pen_x + img.placement.left;
+                    let gy = baseline_y + img.placement.top;
+                    FontFace::blend_alpha(
+                        canvas,
+                        gx,
+                        gy,
+                        img.placement.width as usize,
+                        img.placement.height as usize,
+                        &img.data,
+                        color,
+                    );
+                    drawn += 1;
+                    while glyphs.len() >= GLYPH_CACHE_MAX && !order.is_empty() {
+                        if let Some(old) = order.pop_front() {
+                            glyphs.remove(&old);
+                        }
+                    }
+                    glyphs.insert(
+                        key,
+                        CachedGlyph {
+                            left: img.placement.left,
+                            top: img.placement.top,
+                            width: img.placement.width,
+                            height: img.placement.height,
+                            advance_px: advance,
+                            alpha: img.data.into_boxed_slice(),
+                        },
+                    );
+                    order.push_back(key);
+                }
+            }
+            pen_x += advance.round() as i32;
         }
         drawn
     }
@@ -739,4 +875,296 @@ mod tests {
         assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
         fs::remove_file(&bad_path).ok();
     }
+
+    // ---- Phase 10B: zero-copy LE view + persistent scaler / bounded glyph cache ----
+
+    fn be16(out: &mut Vec<u8>, v: u16) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn be32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn align4(out: &mut Vec<u8>) {
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+
+    /// Hand-build a minimal but valid TrueType container (head/hhea/hmtx/maxp/cmap/
+    /// loca/glyf, 2 glyphs: gid0 empty notdef, gid1 triangle 'A') so the swash
+    /// rasterizer has real outlines to coverage-render without needing system fonts.
+    fn build_minimal_tt() -> Vec<u8> {
+        // glyf: one simple contour triangle with 3 on-curve points (long coords).
+        let mut glyf = Vec::new();
+        be16(&mut glyf, 1); // numberOfContours
+        be16(&mut glyf, 0); // xMin
+        be16(&mut glyf, 0); // yMin
+        be16(&mut glyf, 200); // xMax
+        be16(&mut glyf, 300); // yMax
+        be16(&mut glyf, 2); // endPtsOfContours[0]
+        be16(&mut glyf, 0); // instructionLength (read-fonts order: endPts BEFORE instrLen)
+        glyf.extend([1u8, 1, 1]); // flags: on-curve, long coords
+        for (x, y) in [(0i16, 0i16), (200, 300), (100, 300)] {
+            be16(&mut glyf, x as u16);
+            be16(&mut glyf, y as u16);
+        }
+        glyf.push(0); // pad glyph record to even length
+
+        let mut loca = Vec::new();
+        be32(&mut loca, 0);
+        be32(&mut loca, 0);
+        be32(&mut loca, glyf.len() as u32);
+
+        let mut head = Vec::new();
+        be32(&mut head, 0x0001_0000); // version
+        be32(&mut head, 0x0001_0000); // fontRevision
+        be32(&mut head, 0); // checkSumAdjustment
+        be32(&mut head, 0x5F0F_3A5F); // magicNumber
+        be16(&mut head, 0b1); // flags: indexToLocFormat long
+        be16(&mut head, 1000); // unitsPerEm
+        head.extend([0u8; 8]); // created
+        head.extend([0u8; 8]); // modified
+        be16(&mut head, 0);
+        be16(&mut head, 0);
+        be16(&mut head, 200);
+        be16(&mut head, 300); // global bounds
+        be16(&mut head, 0); // macStyle
+        be16(&mut head, 8); // lowestRecPPEM
+        be16(&mut head, 2); // fontDirectionHint
+        be16(&mut head, 1); // indexToLocFormat
+        be16(&mut head, 0); // glyphDataFormat
+        assert_eq!(head.len(), 54);
+
+        let mut hhea = Vec::new();
+        be32(&mut hhea, 0x0001_0000); // version
+        be16(&mut hhea, 800); // ascender
+        be16(&mut hhea, (-200i16) as u16); // descender
+        be16(&mut hhea, 0); // lineGap
+        be16(&mut hhea, 600); // advanceWidthMax
+        be16(&mut hhea, 0); // minLeftSideBearing
+        be16(&mut hhea, 0); // maxRightSideBearing
+        be16(&mut hhea, 200); // xMaxExtent
+        be16(&mut hhea, 1); // caretSlopeRise
+        be16(&mut hhea, 0); // caretSlopeRun
+        be16(&mut hhea, 0); // caretOffset
+        for _ in 0..4 {
+            be16(&mut hhea, 0);
+        } // reserved
+        be16(&mut hhea, 0); // metricDataFormat
+        be16(&mut hhea, 1); // numberOfHMetrics
+        assert_eq!(hhea.len(), 36);
+
+        let mut hmtx = Vec::new();
+        be16(&mut hmtx, 600); // gid0 long metric advance
+        be16(&mut hmtx, 0); // gid0 lsb
+        be16(&mut hmtx, 0); // gid1 short lsb (inherits last advance 600)
+
+        let mut maxp = Vec::new();
+        be32(&mut maxp, 0x0000_5000); // version 0.5
+        be16(&mut maxp, 2); // numGlyphs
+
+        // cmap format 4: space -> gid0 (notdef), 'A' -> gid1, sentinel 0xFFFF.
+        let mut sub = Vec::new();
+        be16(&mut sub, 4); // format
+        be16(&mut sub, 0); // length placeholder
+        be16(&mut sub, 0); // language
+        be16(&mut sub, 6); // segCountX2 (3 segments)
+        be16(&mut sub, 4); // searchRange
+        be16(&mut sub, 1); // entrySelector
+        be16(&mut sub, 2); // rangeShift
+        for end in [0x20u16, 0x41, 0xFFFF] {
+            be16(&mut sub, end);
+        }
+        be16(&mut sub, 0); // reservedPad
+        for start in [0x20u16, 0x41, 0xFFFF] {
+            be16(&mut sub, start);
+        }
+        for delta in [(-32i16), (1 - 0x41) as i16, 0] {
+            be16(&mut sub, delta as u16);
+        }
+        for _ in 0..3 {
+            be16(&mut sub, 0);
+        } // idRangeOffset all zero
+        let sub_len = sub.len();
+        sub[2..4].copy_from_slice(&(sub_len as u16).to_be_bytes());
+
+        let mut cmap = Vec::new();
+        be16(&mut cmap, 0); // cmap version
+        be16(&mut cmap, 1); // numTables
+        be16(&mut cmap, 3); // platformID (Windows)
+        be16(&mut cmap, 1); // encodingID (Unicode BMP)
+        be32(&mut cmap, 12); // subtable offset from cmap start
+        cmap.extend_from_slice(&sub);
+
+        let tables: [(&[u8; 4], Vec<u8>); 7] = [
+            (b"cmap", cmap),
+            (b"glyf", glyf),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"hmtx", hmtx),
+            (b"loca", loca),
+            (b"maxp", maxp),
+        ];
+
+        // Pre-compute 4-byte-aligned table offsets before emitting the directory.
+        let mut offsets = Vec::new();
+        let mut cursor = 12 + tables.len() * 16;
+        for (_, data) in &tables {
+            offsets.push(cursor);
+            cursor += data.len();
+            cursor = (cursor + 3) & !3;
+        }
+
+        let mut out = Vec::new();
+        be32(&mut out, 0x0001_0000); // sfntVersion TrueType
+        be16(&mut out, tables.len() as u16);
+        be16(&mut out, 64); // searchRange
+        be16(&mut out, 2); // entrySelector
+        be16(&mut out, 48); // rangeShift
+        for (i, (tag, data)) in tables.iter().enumerate() {
+            let rec_start = out.len();
+            out.extend_from_slice(&tag[..]);
+            be32(&mut out, 0); // checksum not validated by read-fonts
+            be32(&mut out, offsets[i] as u32);
+            be32(&mut out, data.len() as u32);
+            assert_eq!(out.len(), rec_start + 16);
+        }
+        for (i, (_, data)) in tables.iter().enumerate() {
+            assert_eq!(out.len(), offsets[i]);
+            out.extend_from_slice(data);
+            align4(&mut out);
+        }
+        out
+    }
+
+    fn load_mini_font() -> FontFace {
+        let tt = build_minimal_tt();
+        FontFace::from_owned_bytes(tt, Some("MiniTri")).expect("minimal TrueType must load")
+    }
+
+    fn lit_pixels(c: &Canvas) -> usize {
+        (0..WIDTH).flat_map(|x| (0..HEIGHT).map(move |y| (x, y)))
+            .filter(|(x, y)| c.get_pixel(*x as i32, *y as i32) != 0)
+            .count()
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn as_le_bytes_is_pointer_identical_zero_copy_view() {
+        let mut c = Canvas::new();
+        c.fill_rect(0, 0, 8, 4, 0x1F1F);
+        c.set_pixel(319, 169, 0xFFFF);
+        let view = c.as_le_bytes();
+        assert_eq!(view.len(), WIDTH * HEIGHT * 2);
+        // Same backing allocation: the view is a reborrow, not a copy.
+        assert_eq!(view.as_ptr(), c.pixels.as_ptr() as *const u8);
+        assert_eq!(&view[0..4], &[0x1F, 0x1F, 0x1F, 0x1F]);
+        let px_off = (169 * WIDTH + 319) * 2;
+        assert_eq!(&view[px_off..px_off + 2], &[0xFF, 0xFF]);
+        // Byte content matches the classic allocating serializer exactly.
+        assert_eq!(view, &c.to_le_bytes()[..]);
+        // Mutating a pixel via set_pixel is immediately visible through a fresh view.
+        c.set_pixel(0, 0, 0x001F);
+        let view2 = c.as_le_bytes();
+        assert_eq!(&view2[0..2], &[0x1F, 0x00]);
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn to_le_bytes_still_matches_manual_little_endian_encoding() {
+        let mut c = Canvas::new();
+        c.set_pixel(0, 0, 0xF800);
+        c.set_pixel(1, 0, 0x1234);
+        let b = c.to_le_bytes();
+        assert_eq!(&b[0..4], &[0x00, 0xF8, 0x34, 0x12]);
+        assert_eq!(b.len(), 108_800);
+    }
+
+    #[test]
+    fn from_owned_bytes_moves_font_data_and_reports_metrics() {
+        let tt = build_minimal_tt();
+        let len_before = tt.len();
+        let face = FontFace::from_owned_bytes(tt, Some("MiniTri")).expect("move-based load");
+        assert_eq!(face.format(), FontFormat::Ttf);
+        assert_eq!(face.family(), Some("MiniTri"));
+        assert_eq!(face.num_fonts(), 1);
+        assert_eq!(face.units_per_em(), 1000);
+        let (asc, desc) = face.vertical_metrics();
+        assert_eq!((asc, desc), (800.0, 200.0));
+        // from_file moves the read Vec too (no double copy of multi-MB files).
+        let path = std::env::temp_dir().join(format!("cz-gfx-mini-{}.ttf", std::process::id()));
+        fs::write(&path, &build_minimal_tt()).expect("write mini tt");
+        let from_disk = FontFace::from_file(&path, None).expect("from_file must load");
+        assert_eq!(from_disk.units_per_em(), 1000);
+        assert_eq!(fs::metadata(&path).expect("meta").len() as usize, len_before);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn glyph_id_and_advance_use_mini_font_tables() {
+        let face = load_mini_font();
+        assert_eq!(face.glyph_id('A'), Some(1));
+        assert_eq!(face.glyph_id(' '), None); // maps to notdef gid 0
+        // gid1 has no dedicated hmtx entry -> inherits the last advance (600/1000 em).
+        assert_eq!(face.advance_px(1, 40.0), 24.0);
+        assert_eq!(face.advance_px(0, 40.0), 24.0);
+    }
+
+    #[test]
+    fn glyph_cache_hit_is_pixel_identical_and_allocates_nothing_new() {
+        let face = load_mini_font();
+        let mut first = Canvas::new();
+        let n1 = face.draw_text(&mut first, 8, 90, "AAA", 0xFFFF, 40.0);
+        assert_eq!(n1, 3, "three mapped A glyphs should rasterize");
+        let lit = lit_pixels(&first);
+        assert!(lit >= 12, "triangle coverage should light pixels, got {lit}");
+        assert_eq!(face.cache.lock().expect("lock").glyphs.len(), 1);
+        // Repeat: same (gid, size) key hits the cache and must be pixel-identical.
+        let mut second = Canvas::new();
+        let n2 = face.draw_text(&mut second, 8, 90, "AAA", 0xFFFF, 40.0);
+        assert_eq!(n2, n1);
+        assert_eq!(second.pixels, first.pixels, "cached glyph must blend identically");
+        assert_eq!(face.cache.lock().expect("lock").glyphs.len(), 1, "hit must not grow cache");
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded_with_fifo_eviction() {
+        let face = load_mini_font();
+        let base_size = 40.0f32;
+        let mut snap_first = Canvas::new();
+        face.draw_text(&mut snap_first, 8, 90, "A", 0xFFFF, base_size);
+        // 300 distinct pixel sizes for one glyph id -> > 256 misses must evict FIFO.
+        for size in 5..=310u32 {
+            let mut c = Canvas::new();
+            assert_eq!(face.draw_text(&mut c, 4, 140, "A", 0xFFFF, size as f32), 1);
+        }
+        let g = face.cache.lock().expect("lock");
+        assert_eq!(g.glyphs.len(), GLYPH_CACHE_MAX, "cache capped at {GLYPH_CACHE_MAX}");
+        assert_eq!(g.order.len(), GLYPH_CACHE_MAX);
+        let oldest = (1u16, 5.0f32.to_bits());
+        let newest = (1u16, 310.0f32.to_bits());
+        assert!(!g.glyphs.contains_key(&oldest), "oldest entry should be evicted");
+        assert!(g.glyphs.contains_key(&newest), "newest entry must stay cached");
+        drop(g);
+        // After eviction, re-drawing the evicted size re-rasterizes pixel-identically.
+        let mut again = Canvas::new();
+        face.draw_text(&mut again, 8, 90, "A", 0xFFFF, base_size);
+        assert_eq!(again.pixels, snap_first.pixels);
+    }
+
+    #[test]
+    fn unmapped_and_newline_paths_match_legacy_pen_semantics() {
+        let face = load_mini_font();
+        let mut c = Canvas::new();
+        // ' ' (notdef) + '\n' draw nothing; 'A' rasterizes; drawn counts mapped glyphs only.
+        let drawn = face.draw_text(&mut c, 4, 120, "\n A", 0xF800, 50.0);
+        assert_eq!(drawn, 1);
+        assert!(lit_pixels(&c) >= 4);
+        let mut empty = Canvas::new();
+        assert_eq!(face.draw_text(&mut empty, 4, 120, " \n ", 0xFFFF, 20.0), 0);
+        assert_eq!(lit_pixels(&empty), 0);
+    }
 }
+

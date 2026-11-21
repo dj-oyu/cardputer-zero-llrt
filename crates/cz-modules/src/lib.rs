@@ -675,17 +675,20 @@ impl rquickjs::module::ModuleDef for InputModule {
 // Byte-buffer helpers for cardputer:display
 // ---------------------------------------------------------------------------
 
-/// Copy bytes out of a JS `Uint8Array`/`ArrayBuffer` into an owned Vec.
-pub(crate) fn bytes_from_value<'js>(value: &Value<'js>) -> Result<Vec<u8>> {
+/// Run `f` against a direct borrow of a JS `Uint8Array`/`ArrayBuffer` slice (zero copy).
+/// The closure may run Rust drawing code but must not execute JavaScript while held.
+pub(crate) fn with_borrowed_bytes<'js, R, F>(value: &Value<'js>, f: F) -> Result<R>
+where
+    F: FnOnce(&[u8]) -> R,
+{
     if let Ok(ta) = rquickjs::TypedArray::<u8>::from_value(value.clone()) {
         // SAFETY: no JavaScript execution happens while this slice is held.
-        let bytes = unsafe { ta.as_slice() }.to_vec();
-        return Ok(bytes);
+        return Ok(f(unsafe { ta.as_slice() }));
     }
     if let Some(ab) = rquickjs::ArrayBuffer::from_value(value.clone()) {
-        // SAFETY: no JavaScript execution happens while this slice is held.
+        // SAFETY: no JavaScript execution happens while this byte view is held.
         if let Some(b) = unsafe { ab.as_bytes() } {
-            return Ok(b.to_vec());
+            return Ok(f(b));
         }
     }
     Err(rquickjs::Error::FromJs {
@@ -693,6 +696,12 @@ pub(crate) fn bytes_from_value<'js>(value: &Value<'js>) -> Result<Vec<u8>> {
         to: "Uint8Array or ArrayBuffer",
         message: None,
     })
+}
+
+/// Copy bytes out of a JS `Uint8Array`/`ArrayBuffer` into an owned Vec (callers that need
+/// storage; hot display paths use [`with_borrowed_bytes`] instead).
+pub(crate) fn bytes_from_value<'js>(value: &Value<'js>) -> Result<Vec<u8>> {
+    with_borrowed_bytes(value, |b| b.to_vec())
 }
 
 /// Create a `Uint8Array` view over freshly copied LE canvas bytes.
@@ -714,14 +723,16 @@ fn ensure_backlight() -> Result<()> {
     Ok(())
 }
 
-/// Open the framebuffer lazily on first flush; writes the current canvas frame LE bytes.
+/// Open the framebuffer lazily on first flush; writes the canvas' zero-copy LE view
+/// directly (no per-frame 108,800-byte Vec allocation).
 fn js_flush() -> Result<()> {
-    let bytes = canvas().lock().expect("canvas lock").to_le_bytes();
+    let canvas_guard = canvas().lock().expect("canvas lock");
+    let bytes = canvas_guard.as_le_bytes();
     let mut guard = framebuffer().lock().expect("fb lock");
     if guard.is_none() {
         *guard = Some(Framebuffer::open_default()?);
     }
-    guard.as_mut().expect("fb").flush_frame(&bytes)?;
+    guard.as_mut().expect("fb").flush_frame(bytes)?;
     Ok(())
 }
 
@@ -806,8 +817,13 @@ impl rquickjs::module::ModuleDef for DisplayModule {
         })?;
         let draw_text_fn = Function::new(
             ctx.clone(),
-            |x: f64, y: f64, text: String, color: f64, scale: Option<f64>| {
-                let s = scale.unwrap_or(1.0);
+            |x: f64, y: f64, text: String, color: f64, scale: rquickjs::function::Opt<Value<'js>>| {
+                // Opt makes scale truly optional (omitted arg => None); legacy callers that
+                // pass an explicit undefined still land on the scale-1 default.
+                let s = match scale.0 {
+                    Some(v) => v.as_float().unwrap_or(1.0),
+                    None => 1.0,
+                };
                 let s = if s.is_finite() && s >= 0.0 { s as u32 } else { 1 };
                 canvas().lock().expect("canvas lock")
                     .draw_text_builtin(to_i32(x), to_i32(y), &text, to_u16_color(color), s);
@@ -816,16 +832,20 @@ impl rquickjs::module::ModuleDef for DisplayModule {
         let blit_fn = Function::new(
             ctx.clone(),
             |x: f64, y: f64, w: f64, h: f64, data: Value<'js>| -> Result<()> {
-                let bytes = bytes_from_value(&data)?;
-                canvas().lock().expect("canvas lock")
-                    .blit_rgb565(to_i32(x), to_i32(y), to_i32(w), to_i32(h), &bytes);
+                // Borrow the JS buffer slice directly and draw through it (no temp Vec).
+                with_borrowed_bytes(&data, |bytes| {
+                    canvas().lock().expect("canvas lock")
+                        .blit_rgb565(to_i32(x), to_i32(y), to_i32(w), to_i32(h), bytes);
+                })?;
                 Ok(())
             },
         )?;
         let flush_fn = Function::new(ctx.clone(), || -> Result<()> { js_flush() })?;
         let get_buffer_fn = Function::new(ctx.clone(), |ctx: Ctx<'js>| -> Result<Value<'js>> {
-            let bytes = canvas().lock().expect("canvas lock").to_le_bytes();
-            u8_array_from_vec(&ctx, bytes)
+            // Exactly one copy: straight from the zero-copy LE view into the JS array.
+            let guard = canvas().lock().expect("canvas lock");
+            let ta = rquickjs::TypedArray::<u8>::new_copy(ctx, guard.as_le_bytes())?;
+            Ok(ta.into_value())
         })?;
         let get_brightness_fn = Function::new(ctx.clone(), || -> Result<u32> {
             ensure_backlight()?;

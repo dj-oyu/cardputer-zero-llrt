@@ -148,7 +148,28 @@ impl Framebuffer {
     /// contents saved for restoration on [`Drop`]. Regular files are sized to `FB_BYTES` and
     /// never restored on Drop. Anything else yields an error.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => f,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Phase 10B mock semantics: `CARDPUTER_FB_PATH` may name a not-yet-existing
+                // regular file inside an EXISTING directory (harness tmp). Lazily create and
+                // size it as a regular-file mock. Paths whose parent directory is missing
+                // still fail with NotFound (device/early-open guard unchanged).
+                let parent_ok = path.parent().map(|p| p.is_dir()).unwrap_or(false);
+                if !parent_ok {
+                    return Err(err);
+                }
+                let created = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)?;
+                created.set_len(FB_BYTES as u64)?;
+                created
+            }
+            Err(err) => return Err(err),
+        };
         let file_type = file.metadata()?.file_type();
 
         if file_type.is_char_device() {
@@ -349,10 +370,27 @@ mod tests {
 
     #[test]
     fn missing_path_fails_cleanly() {
-        let path = temp_path("definitely-missing-fb");
-        fs::remove_file(&path).ok();
-        let err = Framebuffer::open(&path).expect_err("missing fb must not panic");
+        // A path whose parent DIRECTORY is absent must stay NotFound (never auto-created).
+        let dir = temp_path("definitely-missing-fb-dir");
+        fs::remove_dir_all(&dir).ok();
+        let nested = dir.join("fb0");
+        let err = Framebuffer::open(&nested).expect_err("missing parent dir must not panic");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(!nested.exists(), "nothing may be created when the parent dir is absent");
+    }
+
+    #[test]
+    fn env_mock_file_is_lazily_created_and_sized_on_open() {
+        // Phase 10B: an explicit mock path in an existing directory is created on first open.
+        let path = temp_path("fb0-lazy-create");
+        fs::remove_file(&path).ok();
+        let mut fb = Framebuffer::open(&path).expect("lazy create must succeed");
+        assert!(fb.is_mock_file());
+        assert_eq!(fs::metadata(&path).expect("meta").len(), FB_BYTES as u64);
+        // Seed canvas frame bytes and flush through the created mock end to end.
+        fb.flush_frame(&vec![0xABu8; FB_BYTES]).expect("flush fresh mock");
+        assert_eq!(fs::read(&path).expect("read mock").len(), FB_BYTES);
+        fs::remove_file(&path).ok();
     }
 
     #[test]
