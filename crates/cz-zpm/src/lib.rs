@@ -10,6 +10,15 @@
 //! native addon packages (`gypfile`, `node-gyp`/`prebuild` install scripts, `binding.gyp`,
 //! `*.node`) are rejected, dependency graphs over `20` packages are rejected, and staging dirs
 //! `<ZPM_TMPDIR>/zpm-*` (default `/tmp`, never `TMPDIR`) are ALWAYS cleaned via RAII `Drop`.
+//!
+//! Phase 7C lifecycle commands: `zpm update [pkg ...] [--latest] [--dry-run] [--no-minify]`
+//! (`up`/`upgrade` aliases) resolves the highest version satisfying the `package.json` semver
+//! range (or `dist-tags.latest` with `--latest`); up-to-date packages are skipped with ZERO
+//! downloads and ZERO writes, `--dry-run` prints plans without touching the filesystem, and
+//! commits run the full safe staging pipeline then ATOMICALLY replace `index.mjs` (temp file +
+//! rename), so a failed update leaves the installed bundle, manifest and `zpm-lock.json`
+//! completely intact. Also: `zpm outdated [--json]`, `zpm remove <pkg ...>`
+//! (`rm`/`uninstall`/`un`) and `zpm list` (`ls`).
 
 use std::collections::{HashSet, VecDeque};
 use std::env;
@@ -83,10 +92,16 @@ pub async fn run_cli_async(args: &[String]) -> u8 {
             0
         }
         Some("install") | Some("i") | Some("add") => cmd_install(&args[1..]).await,
+        Some("update") | Some("up") | Some("upgrade") => cmd_update(&args[1..]).await,
+        Some("outdated") => cmd_outdated(&args[1..]).await,
+        Some("remove") | Some("rm") | Some("uninstall") | Some("un") => cmd_remove(&args[1..]),
+        Some("list") | Some("ls") => cmd_list(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("bundle") => cmd_bundle(&args[1..]),
         _ => {
-            eprintln!("zpm: unknown or missing command. usage: zpm <install|i|add|run|bundle|--version> ...");
+            eprintln!(
+                "zpm: unknown or missing command. usage: zpm <install|update|outdated|remove|list|run|bundle|--version> ..."
+            );
             1
         }
     }
@@ -829,75 +844,559 @@ async fn cmd_install(args: &[String]) -> u8 {
 
     for spec in specs {
         let (name, range) = split_spec(&spec);
-        let stage = match TempDir::new("zpm") {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("zpm: staging failed: {e}");
-                return 1;
-            }
-        };
-        let root = match fetch_dep_tree(&client, &registry, stage.path(), vec![(name.clone(), range.clone())]).await {
-            Ok(r) => r,
+        // Fetch + bundle ENTIRELY in staging (all guards included) BEFORE any project write: a
+        // failure here leaves the previously installed package and lockfile completely intact,
+        // and the RAII TempDir keeps ZPM_TMPDIR clean.
+        let staged = match stage_package_bundle(&client, &registry, &esbuild, &name, &range, minify).await {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("zpm install {spec}: {e}");
                 return 1;
             }
         };
-        // Bundle from the staging tree: root entry lives at <stage>/package/<entry>, deps are
-        // resolved by esbuild via <stage>/node_modules (never written to the project dir).
-        let out_rel = PathBuf::from("node_modules").join(name.as_str()).join("index.mjs");
-        let entry_arg = format!("package/{}", root.entry_rel);
-        if let Err(e) = run_esbuild(&esbuild, stage.path(), &entry_arg, &out_rel, ESBUILD_BUNDLE_ARGS, minify, true) {
-            eprintln!("zpm install {spec}: {e}");
-            return 1;
-        }
-        let staged_out = stage.path().join(&out_rel);
-        // finalize into ./node_modules/<pkg>/ (index.mjs + package.json only)
-        let final_dir = cwd.join("node_modules").join(name.as_str());
-        if let Err(e) = fs::create_dir_all(&final_dir) {
-            eprintln!("zpm install {spec}: mkdir failed: {e}");
-            return 1;
-        }
-        match fs::copy(&staged_out, final_dir.join("index.mjs")) {
-            Ok(n) => {
-                let mut exports = serde_json::Map::new();
-                exports.insert(".".to_string(), Json::String("./index.mjs".to_string()));
-                let manifest = FinalManifest {
-                    name: root.name.clone(),
-                    version: root.version.clone(),
-                    pkg_type: "module".to_string(),
-                    main: "./index.mjs".to_string(),
-                    exports,
-                };
-                let text = match serde_json::to_string_pretty(&manifest) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("zpm: serialize manifest: {e}");
-                        return 1;
-                    }
-                };
-                if let Err(e) = fs::write(final_dir.join("package.json"), text + "\n") {
-                    eprintln!("zpm: write manifest: {e}");
-                    return 1;
-                }
-                if let Err(e) = update_root_package_json(&cwd, &name, &root.version) {
-                    eprintln!("zpm: {e}");
-                    return 1;
-                }
-                if let Err(e) = update_lockfile(&cwd, &name, &root.version, &root.integrity, n) {
-                    eprintln!("zpm: {e}");
-                    return 1;
-                }
-                println!(
-                    "zpm: installed {name}@{} -> node_modules/{name}/index.mjs ({n} bytes)",
-                    root.version
-                );
-            }
+        // Atomic commit into ./node_modules/<pkg>/ (index.mjs + package.json only): temp file ->
+        // rename, then refresh manifest, ./package.json range (^version) and zpm-lock.json.
+        let n = match finalize_installed_pkg(&cwd, &staged.root, &staged.staged_bundle, true) {
+            Ok(n) => n,
             Err(e) => {
-                eprintln!("zpm install {spec}: copy bundle failed: {e}");
+                eprintln!("zpm install {spec}: {e}");
+                return 1;
+            }
+        };
+        println!(
+            "zpm: installed {name}@{} -> node_modules/{name}/index.mjs ({n} bytes)",
+            staged.root.version
+        );
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------------------------
+// Staging + atomic commit pipeline (shared by install and update)
+// ---------------------------------------------------------------------------------------------
+
+/// A fully fetched+bundled but UNCOMMITTED package: everything lives inside the RAII `tmp`
+/// staging dir, so dropping this guard (on success or failure) always leaves ZPM_TMPDIR clean.
+struct StagedBundle {
+    root: RootInfo,
+    staged_bundle: PathBuf,
+    /// RAII guard: intentionally never read — held alive so `Drop` wipes the staging dir from
+    /// `ZPM_TMPDIR` once the atomic commit (or any failure path) finishes.
+    #[allow(dead_code)]
+    tmp: TempDir,
+}
+
+/// Run the full safe in-memory pipeline (5 MiB cap, SHA-512 SRI verified BEFORE extraction,
+/// zip-slip, native-addon and <=20-deps guards) into a fresh `<ZPM_TMPDIR>/zpm-*` staging dir,
+/// then esbuild-bundle it. NOTHING is written to the project dir; on any error the RAII guard
+/// wipes staging, so a failed install/update can never corrupt the current install.
+async fn stage_package_bundle(
+    client: &HttpsClient,
+    registry: &str,
+    esbuild: &str,
+    name: &str,
+    range: &str,
+    minify: bool,
+) -> Result<StagedBundle, String> {
+    let stage = TempDir::new("zpm")?;
+    let root = fetch_dep_tree(client, registry, stage.path(), vec![(name.to_string(), range.to_string())]).await?;
+    // Bundle from the staging tree: root entry lives at <stage>/package/<entry>, deps are
+    // resolved by esbuild via <stage>/node_modules (never written to the project dir).
+    let out_rel = PathBuf::from("node_modules").join(name).join("index.mjs");
+    let entry_arg = format!("package/{}", root.entry_rel);
+    run_esbuild(esbuild, stage.path(), &entry_arg, &out_rel, ESBUILD_BUNDLE_ARGS, minify, true)?;
+    let staged_bundle = stage.path().join(&out_rel);
+    if !staged_bundle.is_file() {
+        return Err("esbuild produced no bundle".to_string());
+    }
+    Ok(StagedBundle {
+        root,
+        staged_bundle,
+        tmp: stage,
+    })
+}
+
+/// Commit a fully-staged bundle into `./node_modules/<pkg>/`: ATOMIC `index.mjs` replace (copy
+/// to a temp file in the SAME directory -> rename; tmp removed on failure), then write the
+/// final package.json manifest, optionally rewrite the `./package.json` dependency range to
+/// `^<version>` (`record_range`) and refresh `zpm-lock.json`. Returns bundled byte size.
+fn finalize_installed_pkg(cwd: &Path, root: &RootInfo, staged_bundle: &Path, record_range: bool) -> Result<u64, String> {
+    let final_dir = cwd.join("node_modules").join(root.name.as_str());
+    fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let final_out = final_dir.join("index.mjs");
+    let tmp_out = final_dir.join(format!("index.mjs.tmp-{}", std::process::id()));
+    let n = fs::copy(staged_bundle, &tmp_out).map_err(|e| format!("copy bundle failed: {e}"))?;
+    if let Err(e) = fs::rename(&tmp_out, &final_out) {
+        let _ = fs::remove_file(&tmp_out);
+        return Err(format!("atomic replace of index.mjs failed: {e}"));
+    }
+    let mut exports = serde_json::Map::new();
+    exports.insert(".".to_string(), Json::String("./index.mjs".to_string()));
+    let manifest = FinalManifest {
+        name: root.name.clone(),
+        version: root.version.clone(),
+        pkg_type: "module".to_string(),
+        main: "./index.mjs".to_string(),
+        exports,
+    };
+    let text = serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
+    fs::write(final_dir.join("package.json"), text + "\n").map_err(|e| format!("write manifest: {e}"))?;
+    if record_range {
+        update_root_package_json(cwd, &root.name, &root.version)?;
+    }
+    update_lockfile(cwd, &root.name, &root.version, &root.integrity, n)?;
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------------------------
+// update / outdated / remove / list (Phase 7C)
+// ---------------------------------------------------------------------------------------------
+
+/// Fetch registry metadata for one package (`Accept: application/vnd.npm.install-v1+json`).
+async fn fetch_metadata(client: &HttpsClient, registry: &str, name: &str) -> Result<Json, String> {
+    let url = format!("{registry}/{}", encode_pkg_spec(name));
+    let bytes = fetch_bytes(client, &url, Some("application/vnd.npm.install-v1+json")).await?;
+    serde_json::from_slice::<Json>(&bytes).map_err(|e| format!("invalid registry metadata for {name}: {e}"))
+}
+
+/// Parse JSON bytes tolerantly into an object default (used for lockfiles/optional manifests).
+fn parse_json_default(bytes: &[u8]) -> Json {
+    serde_json::from_slice(bytes).unwrap_or_else(|_| Json::Object(serde_json::Map::new()))
+}
+
+/// Currently installed version of `name`: `zpm-lock.json` entry first, then
+/// `node_modules/<name>/package.json`, else `None` (not installed).
+fn installed_version(cwd: &Path, name: &str) -> Option<String> {
+    if let Ok(b) = fs::read(cwd.join("zpm-lock.json")) {
+        if let Some(s) = parse_json_default(&b)
+            .get("packages")
+            .and_then(|p| p.get(name))
+            .and_then(|e| e.get("version"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(s.to_string());
+        }
+    }
+    if let Ok(b) = fs::read(cwd.join("node_modules").join(name).join("package.json")) {
+        if let Some(s) = parse_json_default(&b).get("version").and_then(|v| v.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// Sorted keys of an optional JSON object (deterministic CLI output order).
+fn object_keys_sorted(obj_opt: Option<&Json>) -> Vec<String> {
+    let mut keys: Vec<String> = match obj_opt.and_then(|o| o.as_object()) {
+        Some(o) => o.keys().cloned().collect(),
+        None => Vec::new(),
+    };
+    keys.sort();
+    keys
+}
+
+fn object_has_key(obj_opt: Option<&Json>, key: &str) -> bool {
+    obj_opt.and_then(|o| o.as_object()).map(|o| o.contains_key(key)).unwrap_or(false)
+}
+
+/// Resolve an update target version from fetched metadata: with `--latest` take
+/// `dist-tags.latest`; otherwise the highest version satisfying the package.json range.
+fn resolve_update_target(meta: &Json, want: &str, want_latest: bool) -> Result<String, String> {
+    if want_latest {
+        return meta
+            .get("dist-tags")
+            .and_then(|d| d.get("latest"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or("registry metadata missing dist-tags.latest".to_string());
+    }
+    pick_from_meta(meta, want).map(|(v, _)| v)
+}
+
+/// A package is outdated iff `current != wanted || current != latest`.
+pub fn is_outdated(current: &str, wanted: &str, latest: &str) -> bool {
+    current != wanted || current != latest
+}
+
+/// `{ name, current, wanted, latest }` outdated record (all string fields).
+pub fn outdated_record(name: &str, current: &str, wanted: &str, latest: &str) -> Json {
+    serde_json::json!({ "name": name, "current": current, "wanted": wanted, "latest": latest })
+}
+
+/// Drop `key` from object `section` of a JSON file (pretty rewrite + trailing newline).
+/// `Ok(false)` when the file/section/key is absent; `Err` on an unreadable-corrupt file.
+fn drop_json_key(path: &Path, section: &str, key: &str) -> Result<bool, String> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+    let mut doc: Json = serde_json::from_slice(&bytes).map_err(|e| format!("invalid {}: {e}", path.display()))?;
+    let hit = match doc.get_mut(section).and_then(|s| s.as_object_mut()) {
+        Some(o) => o.remove(key).is_some(),
+        None => false,
+    };
+    if !hit {
+        return Ok(false);
+    }
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize {}: {e}", path.display()))?;
+    fs::write(path, text + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// Installed `(name, version, bundled_bytes)` entries: `zpm-lock.json` first; falls back to a
+/// `node_modules/*/package.json` scan (`index.mjs` byte size). Sorted by package name.
+fn list_entries(cwd: &Path) -> Vec<(String, String, u64)> {
+    let mut out: Vec<(String, String, u64)> = Vec::new();
+    if let Ok(b) = fs::read(cwd.join("zpm-lock.json")) {
+        let doc = parse_json_default(&b);
+        if let Some(pkgs) = doc.get("packages").and_then(|p| p.as_object()) {
+            for name in object_keys_sorted(doc.get("packages")) {
+                let e = pkgs.get(&name).cloned().unwrap_or(Json::Null);
+                let version = e.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let bytes = e
+                    .get("bundledBytes")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| fs::metadata(cwd.join("node_modules").join(&name).join("index.mjs")).map(|m| m.len()).ok())
+                    .unwrap_or(0);
+                out.push((name, version, bytes));
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Fallback scan when the lockfile is missing/empty.
+    let nm = cwd.join("node_modules");
+    let rd = match fs::read_dir(&nm) {
+        Ok(rd) => rd,
+        Err(_) => return out,
+    };
+    for ent in rd.flatten() {
+        let dir = ent.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest = match fs::read(dir.join("package.json")) {
+            Ok(b) => parse_json_default(&b),
+            Err(_) => continue,
+        };
+        let name = match manifest.get("name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let version = match manifest.get("version").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let bytes = fs::metadata(dir.join("index.mjs")).map(|m| m.len()).unwrap_or(0);
+        out.push((name, version, bytes));
+    }
+    out.sort();
+    out
+}
+
+/// `zpm update [pkg ...] [--latest] [--dry-run] [--no-minify]` (aliases `up`, `upgrade`).
+/// Default: highest version satisfying the `package.json` semver range (`^`, `~`, exact,
+/// `*`/`latest`). `--latest`: `dist-tags.latest` + rewrite `dependencies[pkg]` to
+/// `^<newVersion>`. Up-to-date packages are skipped with ZERO tarball downloads and ZERO
+/// writes; `--dry-run` prints plans with ZERO filesystem writes (metadata GETs only).
+/// Commits run the full safe staging pipeline and ATOMIC rename replacement, so a failed
+/// update keeps the previous `index.mjs`, manifest, `zpm-lock.json` and ZPM_TMPDIR intact.
+async fn cmd_update(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut minify = true;
+    let mut want_latest = false;
+    let mut dry_run = false;
+    let mut names: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--no-minify" => minify = false,
+            "--latest" => want_latest = true,
+            "--dry-run" => dry_run = true,
+            s if s.starts_with("--") => eprintln!("zpm update: ignoring unknown flag {s}"),
+            s => names.push(s.to_string()),
+        }
+    }
+    let pkg_json = cwd.join("package.json");
+    let doc: Json = match fs::read(&pkg_json) {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zpm: invalid ./package.json: {e}");
+                return 1;
+            }
+        },
+        Err(_) => Json::Object(serde_json::Map::new()),
+    };
+    let lock = parse_json_default(&fs::read(cwd.join("zpm-lock.json")).unwrap_or_default());
+    let targets: Vec<String> = if names.is_empty() {
+        let t = object_keys_sorted(doc.get("dependencies"));
+        if t.is_empty() {
+            println!("zpm: nothing to update (no dependencies in ./package.json)");
+            return 0;
+        }
+        t
+    } else {
+        // Requested packages MUST be listed in package.json dependencies OR zpm-lock.json.
+        for n in &names {
+            if !object_has_key(doc.get("dependencies"), n) && !object_has_key(lock.get("packages"), n) {
+                eprintln!("zpm update: {n} is not listed in ./package.json or zpm-lock.json");
+                eprintln!("usage: zpm update [pkg ...] [--latest] [--dry-run] [--no-minify]");
                 return 1;
             }
         }
+        names
+    };
+
+    let registry = registry_base();
+    let esbuild = esbuild_bin();
+    let client = build_client();
+    let mut code = 0u8;
+    for name in targets {
+        let want = match doc
+            .get("dependencies")
+            .and_then(|d| d.as_object())
+            .and_then(|o| o.get(&name))
+            .and_then(|v| v.as_str())
+        {
+            Some(r) => r.to_string(),
+            None => "*".to_string(),
+        };
+        // Metadata-only resolution first (no tarball yet) enables the zero-download no-op.
+        let meta = match fetch_metadata(&client, &registry, &name).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("zpm update {name}: {e}");
+                code = 1;
+                continue;
+            }
+        };
+        let target = match resolve_update_target(&meta, &want, want_latest) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("zpm update {name}: {e}");
+                code = 1;
+                continue;
+            }
+        };
+        let current = installed_version(&cwd, &name);
+        if current.as_deref() == Some(target.as_str()) {
+            println!("zpm: {name}@{target} is already up to date");
+            continue; // ZERO downloads, ZERO writes
+        }
+        if dry_run {
+            let old = current.unwrap_or_else(|| "not installed".to_string());
+            println!("zpm: would update {name} {old} -> {target}");
+            continue; // no staging dir, no tarball, no filesystem writes
+        }
+        let old = current.unwrap_or_else(|| "not installed".to_string());
+        // Fetch the EXACT resolved version through the safe pipeline; failure keeps everything.
+        let staged = match stage_package_bundle(&client, &registry, &esbuild, &name, &target, minify).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zpm update {name}: {e}");
+                code = 1;
+                continue;
+            }
+        };
+        // --latest also rewrites package.json dependencies[pkg] to ^<newVersion>; a plain
+        // semver update keeps the user's existing range untouched.
+        match finalize_installed_pkg(&cwd, &staged.root, &staged.staged_bundle, want_latest) {
+            Ok(n) => println!("zpm: updated {name} {old} -> {target} -> node_modules/{name}/index.mjs ({n} bytes)"),
+            Err(e) => {
+                eprintln!("zpm update {name}: {e}");
+                code = 1;
+            }
+        }
+    }
+    code
+}
+
+/// `zpm outdated [--json]`: inspect every `package.json` dependency against the registry and
+/// report `{ name, current, wanted, latest }` for packages where `current != wanted ||
+/// current != latest`. With `--json` stdout is PURE valid JSON (diagnostics go to stderr);
+/// otherwise a clean aligned human table. Always exit 0 unless a registry fetch failed.
+async fn cmd_outdated(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut json_mode = false;
+    for a in args {
+        if a == "--json" {
+            json_mode = true;
+        } else if a.starts_with("--") {
+            eprintln!("zpm outdated: ignoring unknown flag {a}");
+        } else {
+            eprintln!("zpm outdated: ignoring unexpected argument {a}");
+        }
+    }
+    let doc: Json = match fs::read(cwd.join("package.json")) {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zpm: invalid ./package.json: {e}");
+                return 1;
+            }
+        },
+        Err(_) => Json::Object(serde_json::Map::new()),
+    };
+    let names = object_keys_sorted(doc.get("dependencies"));
+    let registry = registry_base();
+    let client = build_client();
+    let mut records: Vec<Json> = Vec::new();
+    let mut code = 0u8;
+    for name in names {
+        let want = match doc
+            .get("dependencies")
+            .and_then(|d| d.as_object())
+            .and_then(|o| o.get(&name))
+            .and_then(|v| v.as_str())
+        {
+            Some(r) => r.to_string(),
+            None => "*".to_string(),
+        };
+        let meta = match fetch_metadata(&client, &registry, &name).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("zpm outdated {name}: {e}");
+                code = 1;
+                continue;
+            }
+        };
+        let latest = meta
+            .get("dist-tags")
+            .and_then(|d| d.get("latest"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let wanted = resolve_update_target(&meta, &want, false).unwrap_or_default();
+        let current = installed_version(&cwd, &name).unwrap_or_default();
+        if is_outdated(&current, &wanted, &latest) {
+            records.push(outdated_record(&name, &current, &wanted, &latest));
+        }
+    }
+    if json_mode {
+        match serde_json::to_string_pretty(&records) {
+            Ok(t) => println!("{t}"),
+            Err(e) => {
+                eprintln!("zpm outdated: serialize: {e}");
+                code = 1;
+            }
+        }
+    } else if records.is_empty() {
+        println!("zpm: all packages up to date");
+    } else {
+        let head = ["name", "current", "wanted", "latest"];
+        let rows: Vec<[String; 4]> = records
+            .iter()
+            .map(|r| {
+                [
+                    r["name"].as_str().unwrap_or("").to_string(),
+                    r["current"].as_str().unwrap_or("").to_string(),
+                    r["wanted"].as_str().unwrap_or("").to_string(),
+                    r["latest"].as_str().unwrap_or("").to_string(),
+                ]
+            })
+            .collect();
+        let widths: Vec<usize> = (0..4)
+            .map(|i| head[i].len().max(rows.iter().map(|r| r[i].len()).max().unwrap_or(0)))
+            .collect();
+        println!("{}", head.iter().enumerate().map(|(i, h)| pad(h, widths[i])).collect::<Vec<_>>().join("  "));
+        for r in &rows {
+            println!(
+                "{}",
+                r.iter().enumerate().map(|(i, c)| pad(c, widths[i])).collect::<Vec<_>>().join("  ")
+            );
+        }
+    }
+    code
+}
+
+/// Left-align `s` into width `w` (clean table output without unstable `pad_end`).
+fn pad(s: &str, w: usize) -> String {
+    format!("{s}{}", " ".repeat(w.saturating_sub(s.len())))
+}
+
+/// `zpm remove <pkg ...>` (aliases `rm`, `uninstall`, `un`): recursively delete
+/// `node_modules/<pkg>` and drop the package from `./package.json` `dependencies` and
+/// `zpm-lock.json` `packages`. Non-zero when no package args are given or a named package is
+/// not installed/listed.
+fn cmd_remove(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut names: Vec<String> = Vec::new();
+    for a in args {
+        if a.starts_with("--") {
+            eprintln!("zpm remove: ignoring unknown flag {a}");
+        } else {
+            names.push(a.clone());
+        }
+    }
+    if names.is_empty() {
+        eprintln!("usage: zpm remove <pkg> ...");
+        return 1;
+    }
+    let pkg_json = cwd.join("package.json");
+    let doc: Json = match fs::read(&pkg_json) {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zpm: invalid ./package.json: {e}");
+                return 1;
+            }
+        },
+        Err(_) => Json::Object(serde_json::Map::new()),
+    };
+    let lock_path = cwd.join("zpm-lock.json");
+    let lock = parse_json_default(&fs::read(&lock_path).unwrap_or_default());
+    let mut code = 0u8;
+    for name in &names {
+        let dir = cwd.join("node_modules").join(name.as_str());
+        let listed = dir.is_dir() || object_has_key(doc.get("dependencies"), name) || object_has_key(lock.get("packages"), name);
+        if !listed {
+            eprintln!("zpm remove: {name} is not installed or listed");
+            code = 1;
+            continue;
+        }
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("zpm remove {name}: delete failed: {e}");
+                code = 1;
+                continue;
+            }
+        }
+        if let Err(e) = drop_json_key(&pkg_json, "dependencies", name) {
+            eprintln!("zpm remove {name}: {e}");
+            code = 1;
+        }
+        if let Err(e) = drop_json_key(&lock_path, "packages", name) {
+            eprintln!("zpm remove {name}: {e}");
+            code = 1;
+        }
+        println!("zpm: removed {name}");
+    }
+    code
+}
+
+/// `zpm list` (alias `ls`): print installed packages from `zpm-lock.json` (falling back to a
+/// `node_modules/*/package.json` scan) as `name@version` plus bundled byte size. Always exit 0.
+fn cmd_list(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for a in args {
+        if a.starts_with("--") {
+            eprintln!("zpm list: ignoring unknown flag {a}");
+        } else {
+            eprintln!("zpm list: ignoring unexpected argument {a}");
+        }
+    }
+    let entries = list_entries(&cwd);
+    if entries.is_empty() {
+        println!("zpm: no packages installed");
+        return 0;
+    }
+    let labels: Vec<String> = entries.iter().map(|(n, v, _)| format!("{n}@{v}")).collect();
+    let w = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+    for (label, (_, _, bytes)) in labels.iter().zip(&entries) {
+        println!("{}   {} bytes", pad(label, w), bytes);
     }
     0
 }
@@ -1275,5 +1774,159 @@ mod tests {
             None => std::env::remove_var("ZPM_REGISTRY"),
         }
         assert_ne!(code, 0);
+    }
+
+    // ---------------------------------------------------------------- Phase 7C helpers ---
+
+    fn demo_meta() -> Json {
+        serde_json::json!({
+            "name": "demo-lib",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": { "name": "demo-lib", "version": "1.0.0" },
+                "1.2.0": { "name": "demo-lib", "version": "1.2.0" },
+                "2.0.0": { "name": "demo-lib", "version": "2.0.0" }
+            }
+        })
+    }
+
+    #[test]
+    fn update_target_resolution_semver_vs_latest() {
+        let meta = demo_meta();
+        assert_eq!(resolve_update_target(&meta, "^1.0.0", false).unwrap(), "1.2.0");
+        assert_eq!(resolve_update_target(&meta, "~1.2.0", false).unwrap(), "1.2.0");
+        assert_eq!(resolve_update_target(&meta, "1.0.0", false).unwrap(), "1.0.0");
+        assert_eq!(resolve_update_target(&meta, "*", false).unwrap(), "2.0.0");
+        // --latest ignores the range and takes dist-tags.latest
+        assert_eq!(resolve_update_target(&meta, "^1.0.0", true).unwrap(), "2.0.0");
+        let bare: Json = serde_json::json!({ "versions": {} });
+        assert!(resolve_update_target(&bare, "^1.0.0", true).is_err());
+        assert!(resolve_update_target(&bare, "^9.0.0", false).is_err());
+    }
+
+    #[test]
+    fn outdated_predicates_and_record_shape() {
+        assert!(is_outdated("1.0.0", "1.2.0", "2.0.0"));
+        assert!(is_outdated("1.2.0", "1.2.0", "2.0.0"));
+        assert!(!is_outdated("2.0.0", "2.0.0", "2.0.0"));
+        let rec = outdated_record("demo-lib", "1.0.0", "1.2.0", "2.0.0");
+        for k in ["name", "current", "wanted", "latest"] {
+            assert!(rec.get(k).and_then(|v| v.as_str()).is_some(), "record missing {k}");
+        }
+        assert_eq!(rec["wanted"].as_str().unwrap(), "1.2.0");
+    }
+
+    #[test]
+    fn installed_version_prefers_lockfile_then_manifest() {
+        let dir = TempDir::new("zpm-lv").unwrap();
+        let nm = dir.path().join("node_modules").join("pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("package.json"), "{\"name\":\"pkg\",\"version\":\"1.1.0\"}").unwrap();
+        assert_eq!(installed_version(dir.path(), "pkg").unwrap(), "1.1.0");
+        fs::write(dir.path().join("zpm-lock.json"), "{\"packages\":{\"pkg\":{\"version\":\"1.2.0\"}}}").unwrap();
+        assert_eq!(installed_version(dir.path(), "pkg").unwrap(), "1.2.0");
+        assert!(installed_version(dir.path(), "missing").is_none());
+    }
+
+    #[test]
+    fn finalize_replaces_atomically_and_refreshes_lock_and_manifest() {
+        let cwd = TempDir::new("zpm-fin").unwrap();
+        let src_dir = TempDir::new("zpm-src").unwrap();
+        let src = src_dir.path().join("index.mjs");
+        fs::write(&src, "export const VER = \"1.0.0\";\n").unwrap();
+        let root = RootInfo {
+            name: "demo-lib".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            entry_rel: "index.js".to_string(),
+        };
+        let n = finalize_installed_pkg(cwd.path(), &root, &src, false).unwrap();
+        assert!(n > 0);
+        let pkg_dir = cwd.path().join("node_modules").join("demo-lib");
+        let files: Vec<String> = fs::read_dir(&pkg_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 2, "only index.mjs + package.json, got {files:?}");
+        assert_eq!(fs::read(pkg_dir.join("index.mjs")).unwrap(), b"export const VER = \"1.0.0\";\n".to_vec());
+        // No tmp leftovers anywhere (ZPM_TMPDIR semantics):
+        assert!(!pkg_dir.join(format!("index.mjs.tmp-{}", std::process::id())).exists());
+        // Second commit ATOMICALLY replaces the bundle and bumps version/lock/range.
+        fs::write(&src, "export const VER = \"1.2.0\";\n").unwrap();
+        let root2 = RootInfo {
+            name: "demo-lib".to_string(),
+            version: "1.2.0".to_string(),
+            integrity: root.integrity.clone(),
+            entry_rel: "index.js".to_string(),
+        };
+        let n2 = finalize_installed_pkg(cwd.path(), &root2, &src, true).unwrap();
+        assert!(n2 > 0);
+        assert_eq!(fs::read(pkg_dir.join("index.mjs")).unwrap(), b"export const VER = \"1.2.0\";\n".to_vec());
+        let lock: Json = serde_json::from_slice(&fs::read(cwd.path().join("zpm-lock.json")).unwrap()).unwrap();
+        assert_eq!(lock["packages"]["demo-lib"]["version"].as_str().unwrap(), "1.2.0");
+        assert_eq!(lock["packages"]["demo-lib"]["bundledBytes"].as_u64().unwrap(), n2);
+        let pj: Json = serde_json::from_slice(&fs::read(cwd.path().join("package.json")).unwrap()).unwrap();
+        assert_eq!(pj["dependencies"]["demo-lib"].as_str().unwrap(), "^1.2.0");
+        let man: Json = serde_json::from_slice(&fs::read(pkg_dir.join("package.json")).unwrap()).unwrap();
+        assert_eq!(man["version"].as_str().unwrap(), "1.2.0");
+        assert_eq!(man["exports"]["."].as_str().unwrap(), "./index.mjs");
+    }
+
+    #[test]
+    fn drop_json_key_removes_and_reports_missing() {
+        let dir = TempDir::new("zpm-rm").unwrap();
+        let pj = dir.path().join("package.json");
+        fs::write(&pj, "{\"dependencies\":{\"a\":\"^1.0.0\",\"b\":\"^2.0.0\"}}").unwrap();
+        let lock = dir.path().join("zpm-lock.json");
+        fs::write(&lock, "{\"packages\":{\"a\":{\"version\":\"1.0.0\"}}}").unwrap();
+        assert!(drop_json_key(&pj, "dependencies", "a").unwrap());
+        assert!(!drop_json_key(&pj, "dependencies", "a").unwrap()); // second time: absent
+        let doc: Json = serde_json::from_slice(&fs::read(&pj).unwrap()).unwrap();
+        assert!(doc["dependencies"].get("a").is_none());
+        assert!(doc["dependencies"].get("b").is_some()); // untouched sibling kept
+        assert!(drop_json_key(&lock, "packages", "a").unwrap());
+        assert!(!drop_json_key(&dir.path().join("nope.json"), "packages", "x").unwrap());
+        // corrupt file must error, not silently pass
+        fs::write(&pj, "not json").unwrap();
+        assert!(drop_json_key(&pj, "dependencies", "b").is_err());
+    }
+
+    #[test]
+    fn list_entries_lock_then_fallback_scan() {
+        let dir = TempDir::new("zpm-ls").unwrap();
+        let nm = dir.path().join("node_modules").join("demo-lib");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("index.mjs"), "export const VER = \"1.2.0\";\n").unwrap();
+        fs::write(nm.join("package.json"), "{\"name\":\"demo-lib\",\"version\":\"1.2.0\"}").unwrap();
+        // lock path: version + bundledBytes win
+        fs::write(dir.path().join("zpm-lock.json"), "{\"packages\":{\"demo-lib\":{\"version\":\"1.2.0\",\"bundledBytes\":42}}}").unwrap();
+        let e = list_entries(dir.path());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].0, "demo-lib");
+        assert_eq!(e[0].1, "1.2.0");
+        assert_eq!(e[0].2, 42);
+        // fallback scan after lock removal reports manifest version + index.mjs size
+        fs::remove_file(dir.path().join("zpm-lock.json")).unwrap();
+        let e2 = list_entries(dir.path());
+        assert_eq!(e2.len(), 1);
+        assert_eq!(e2[0].1, "1.2.0");
+        assert_eq!(e2[0].2, fs::metadata(nm.join("index.mjs")).unwrap().len());
+        // empty project -> empty list
+        let empty = TempDir::new("zpm-ls0").unwrap();
+        assert!(list_entries(empty.path()).is_empty());
+    }
+
+    #[test]
+    fn pad_aligns_table_columns() {
+        assert_eq!(pad("abc", 5), "abc  ");
+        assert_eq!(pad("abcdef", 3), "abcdef");
+    }
+
+    #[tokio::test]
+    async fn remove_needs_pkg_and_list_exits_zero() {
+        // `remove` without package args must exit non-zero; `list` always exits 0.
+        assert_ne!(run_cli_async(&s(&["remove"])).await, 0);
+        assert_eq!(run_cli_async(&s(&["ls"])).await, 0);
     }
 }
