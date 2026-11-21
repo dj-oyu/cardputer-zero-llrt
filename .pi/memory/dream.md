@@ -72,3 +72,6 @@ Measured truth: relative `""`/`"#y"` KEEP base query (base fragment dropped); `%
 
 ### [Note] Cross-check — D13 realm gap OBSOLETE after Phase 11; D15 still sound
 cz-js now exposes URL/URLSearchParams/TextDecoder/WebSocket globally (probe rc=0), so pure-JS splitUrl()/utf8Decode() fallbacks remain only for cross-realm shared ESM (Node side); absolute-spec/temp-dir + kv semantics parts of D13/D17 unchanged; D15 tape scalar-passthrough conclusion unaffected (workspace tests green post-Phase-11).
+
+### [Note] D33 — Banned-dep names survive ONLY because asserts read manifests, not .rs
+Phase 11 purity gates regex cz-hal/Cargo.toml (word-boundary) + cz-net/Cargo.toml (`^\s*name\s*=`), so ws.rs comments ("no `tungstenite`", "openssl ground truth") PASS today — 4 such mentions exist at ws.rs:2/1513/1518/1519. A stricter future gate scanning raw source would trip D28 on exactly these lines; prefer rewording without the literal (e.g. "no third-party WebSocket crate", "reference SHA-1 vector") when next phase adds structural asserts. D13's realm-gap half is OBSOLETE (global URL/TextDecoder/WebSocket probed rc=0); its temp-dir/kv halves stand.
