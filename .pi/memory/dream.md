@@ -88,3 +88,11 @@ URLhash`"#"`terminatedURL_SHIMearly->crypticparseerrinRUSTnotJS.Rule:shimswith`#
 ### [Insight] D42 — Body-derived Content-Type lost if header pairs serialize BEFORE normalizeBody
 WireCTundefinedwhilebodybytesOK->nodeechoLOGreq.headersisolatesheader-vs-body;FIXnormalizeBodyFIRSTthenpairs;appliesANYclientpre-snapshotsheadersbeforebodycoercionaddsmeta..
 
+### [Principle] D43 — Handshake reader MUST hand COALESCED leftovers to the frame loop
+Head readersPASTterminator MUSThandover leftover ownership:cz-net WSupgrade(512chunk→CRLFCRLF)swallowed SAME-segment TEXT+PING behindhead→auto-Ponglost+workerblocked inblockingread forever(Control drains dead;loopback test hung36s→.2safterFIX);MOVE(resp,head_end=i+4)intorun_frames,draincursor FIRSTvia read_prefetched_or_socket w/EXACT-sizeddst (never over-read next header),cursor persists acrossInFrame resets;probebranch ENTRYw/eprintln BEFOREguessing (silence=upstream swallow not handlerbug);familyD30/D38,verbose detail Phase-13archive..
+
+### [Insight] D44 — rquickjs 0.14 typed-array FFI: mutation routes + double-Result unwrapping
+rquickjs.14:TAsubclass WORKS(class extendsUint8Array,no customctor;setPrototypeOf onrealU8 KEEPSinternal slots⇒wrap native-decodedviews into Buffer-subclass,species slice/subarray already yield subclass);mutate callerbuf ONLY via ArrayBuffer::as_raw()+std::slice::from_raw_parts_mut(NO-JSwhilealias)ORdelegate ENGINE-side:shim target.set(subarrayView,off)=Cmemcpy,overlap-safe,noJSloop(Buffer.copy returnscount);nested with_borrowed_bytes(outer returns inner Result)=>Result<Result<_>> needs ??  ;declared-builtins AUTO-LINK imports inModule::evaluate WITHOUTrt.set_loader(assert globalThis.__FLAG,module eval yields no value)..
+
+### [Note] D45 — Native codec asserts need Node/HTML GROUND-TRUTH vectors, never guessed alphabets
+Guess alphabets WRONG AGAIN(measured):base64url single byte0xfb=="-w" NOT-_!(std"+w==" maps same sextets),[fb,ff,fe]=="-__-" unpadded;Nodehexdecode skips ASCIIws,FIRST invalid char TERMINATES,dangling odd nibble dropped(b"1"→[]);REUSEcrypto_module base64_decode(url_safe flag)+std PADDED encode for"base64",own B64URL_TABLE unpadded=legit NEW(alphabet+padding semantics differ⇒no §duplication violation);hex_encode_fast nibble-table beats crypto per-byte format!;byteLength("日本語","utf8")==9 natively asserted..
