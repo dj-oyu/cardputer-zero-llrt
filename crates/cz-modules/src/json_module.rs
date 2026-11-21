@@ -45,10 +45,10 @@ const JSON_SHIM: &str = r#"
     // KV shim): instead of allocating 6 fresh JS closures per handle, traps read (id, node)
     // straight from the handle's own hidden target tag. The empty/array extensible target keeps
     // all Proxy invariants and `Array.isArray` stays true for array documents.
-    globalThis.__czLazyMake = function (id, node) {
+    globalThis.__czLazyMake = function (id, node, guard) {
         const isArray = __czLazyIsArray(id, node);
         const t = isArray ? [] : {};                 // Proxy over [] keeps Array.isArray true
-        Reflect.set(t, LAZY, { id: id, node: node });
+        Reflect.set(t, LAZY, { id: id, node: node, guard: guard });
         return new Proxy(t, LAZY_HANDLER);
     };
 
@@ -286,8 +286,8 @@ fn do_parse<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>> {
     } else {
         match LazyDoc::build(bytes) {
             Ok(doc) => {
-                let id = cz_json::lazy::register(doc);
-                make_lazy_handle(ctx, id, 0)
+                cz_json::lazy::register(&doc);
+                make_lazy_handle(ctx, doc, 0)
             }
             Err(e) => Err(Exception::throw_syntax(ctx, &e.to_string())),
         }
@@ -298,8 +298,8 @@ fn do_parse<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>> {
 fn parse_lazy<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>> {
     match LazyDoc::build(text.as_bytes()) {
         Ok(doc) => {
-            let id = cz_json::lazy::register(doc);
-            make_lazy_handle(ctx, id, 0)
+            cz_json::lazy::register(&doc);
+            make_lazy_handle(ctx, doc, 0)
         }
         Err(e) => Err(Exception::throw_syntax(ctx, &e.to_string())),
     }
@@ -308,8 +308,8 @@ fn parse_lazy<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>> {
 /// Outcome of a direct byte parse: `>= LAZY_THRESHOLD_BYTES` documents land as a registered
 /// immutable Tape document, smaller ones as an owned DOM tree.
 pub(crate) enum ByteParse {
-    /// Registered [`LazyDoc`] id (root node 0); the raw bytes stay untouched inside it.
-    Lazy(u32),
+    /// Registered [`LazyDoc`] handle (root node 0); the raw bytes stay untouched inside it.
+    Lazy(std::sync::Arc<LazyDoc>),
     /// Small-document DOM (`Val<'static>` so it outlives the borrowed JS buffer slice).
     Dom(Val<'static>),
 }
@@ -325,7 +325,10 @@ pub(crate) fn parse_bytes_direct(bytes: &[u8]) -> std::result::Result<ByteParse,
         }
     } else {
         match LazyDoc::build(bytes) {
-            Ok(doc) => Ok(ByteParse::Lazy(cz_json::lazy::register(doc))),
+            Ok(doc) => {
+                cz_json::lazy::register(&doc);
+                Ok(ByteParse::Lazy(doc))
+            }
             Err(e) => Err(e.to_string()),
         }
     }
@@ -346,7 +349,7 @@ pub(crate) fn json_parse_bytes_native<'js>(ctx: &Ctx<'js>, input: &Value<'js>) -
     })?;
     match outcome {
         Err(msg) => Err(Exception::throw_syntax(ctx, &msg)),
-        Ok(ByteParse::Lazy(id)) => make_lazy_handle(ctx, id, 0),
+        Ok(ByteParse::Lazy(doc)) => make_lazy_handle(ctx, doc, 0),
         Ok(ByteParse::Dom(dom)) => dom_to_js(ctx, &dom),
     }
 }
@@ -421,9 +424,13 @@ fn kv_row_tag<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Option<(String,
     }
 }
 
-fn make_lazy_handle<'js>(ctx: &Ctx<'js>, id: u32, node: u32) -> Result<Value<'js>> {
+fn make_lazy_handle<'js>(ctx: &Ctx<'js>, doc: std::sync::Arc<LazyDoc>, node: u32) -> Result<Value<'js>> {
+    let id = doc.id.load(std::sync::atomic::Ordering::SeqCst);
+    let guard = Function::new(ctx.clone(), move || {
+        let _keep = &doc;
+    })?;
     let make: Function<'js> = ctx.globals().get("__czLazyMake")?;
-    make.call((id as f64, node as f64))
+    make.call((id as f64, node as f64, guard))
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +508,12 @@ fn js_to_val<'js>(ctx: &Ctx<'js>, v: &Value<'js>, depth: usize) -> Result<Val<'s
     Ok(Val::Obj(fields))
 }
 
-fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>, parent: u32) -> Result<Value<'js>> {
+fn got_to_js<'js>(
+    ctx: &Ctx<'js>,
+    doc: &std::sync::Arc<LazyDoc>,
+    got: Got<'_>,
+    parent: u32,
+) -> Result<Value<'js>> {
     match got {
         Got::Missing => ctx.globals().get::<_, Value>("__czMiss"),
         Got::Scalar(s) => match s {
@@ -519,15 +531,11 @@ fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>, parent: u32) -> R
         // transparent handle so deeper writes reach Rust edits instead of a detached JS copy.
         Got::Subtree(child) => {
             if parent == 0 || !doc.is_clean() || !doc.subtree_is_clean(child) {
-                return make_lazy_handle(
-                    ctx,
-                    doc.id.load(std::sync::atomic::Ordering::SeqCst),
-                    child,
-                );
+                return make_lazy_handle(ctx, std::sync::Arc::clone(doc), child);
             }
             match materialize_native(ctx, doc, child) {
                 Ok(v) => Ok(v),
-                Err(_) => make_lazy_handle(ctx, doc.id.load(std::sync::atomic::Ordering::SeqCst), child),
+                Err(_) => make_lazy_handle(ctx, std::sync::Arc::clone(doc), child),
             }
         }
         Got::Owned(v) => dom_to_js(ctx, &v),

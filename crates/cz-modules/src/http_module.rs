@@ -243,6 +243,8 @@ pub fn drain_disconnects() -> Vec<u64> {
 
 const HTTP_SHIM: &str = r#"
 (function () {
+    if (globalThis.__czHttpShimInstalled) return;
+    globalThis.__czHttpShimInstalled = true;
     const servers = new Map();
     globalThis.__czHttpServers = servers;
 

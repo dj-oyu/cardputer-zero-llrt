@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::parse::ParseErr;
 use crate::tape::{KIND_ARRAY, KIND_OBJECT, Scalar, TapeDoc};
@@ -494,50 +494,87 @@ pub fn parse_index(key: &str) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Process-wide handle registry (ids are indices into this vector)
+// Process-wide handle registry (weak slots + free list; GC-reclaimed on Drop)
 // ---------------------------------------------------------------------------
 
-fn registry() -> &'static Mutex<Vec<Arc<LazyDoc>>> {
-    static REG: OnceLock<Mutex<Vec<Arc<LazyDoc>>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(Vec::new()))
+struct LazyRegistry {
+    slots: Vec<Option<Weak<LazyDoc>>>,
+    free: Vec<u32>,
 }
 
-/// Register a document and return its handle id (never drops: ids stay valid for JS handles).
-pub fn register(doc: Arc<LazyDoc>) -> u32 {
+fn registry() -> &'static Mutex<LazyRegistry> {
+    static REG: OnceLock<Mutex<LazyRegistry>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(LazyRegistry {
+            slots: Vec::new(),
+            free: Vec::new(),
+        })
+    })
+}
+
+impl Drop for LazyDoc {
+    fn drop(&mut self) {
+        let id = self.id.load(Ordering::Relaxed);
+        if id == u32::MAX {
+            return;
+        }
+        if let Ok(mut reg) = registry().lock() {
+            if let Some(slot) = reg.slots.get_mut(id as usize) {
+                *slot = None;
+                reg.free.push(id);
+            }
+        }
+    }
+}
+
+/// Register a document by weak reference and return its handle id.
+/// The caller MUST retain an `Arc<LazyDoc>` (e.g. via a QuickJS class guard); when the last
+/// strong `Arc` drops, `LazyDoc::drop` frees the backing tape/bytes and recycles the slot id.
+pub fn register(doc: &Arc<LazyDoc>) -> u32 {
     let mut reg = registry().lock().expect("lazy registry lock");
-    let id = (reg.len()) as u32;
+    let weak = Arc::downgrade(doc);
+    let id = if let Some(reused) = reg.free.pop() {
+        reg.slots[reused as usize] = Some(weak);
+        reused
+    } else {
+        let id = reg.slots.len() as u32;
+        reg.slots.push(Some(weak));
+        id
+    };
     doc.id.store(id, Ordering::SeqCst);
-    reg.push(doc);
     id
 }
 
-/// Look up a registered document by id. A one-slot thread-local memo skips the global registry
-/// mutex + vector scan when the same document is accessed repeatedly (hot JSON.parse loops).
+/// Look up a registered document by id. A one-slot thread-local weak memo skips the global
+/// registry mutex when the same live document is accessed repeatedly without pinning dead docs.
 pub fn doc(id: u32) -> Option<Arc<LazyDoc>> {
     thread_local! {
-        static MEMO: std::cell::RefCell<Option<(u32, Arc<LazyDoc>)>> = const { std::cell::RefCell::new(None) };
+        static MEMO: std::cell::RefCell<Option<(u32, Weak<LazyDoc>)>> = const { std::cell::RefCell::new(None) };
     }
     if let Some(hit) = MEMO.with(|m| {
         let g = m.borrow();
         match &*g {
-            Some((mid, arc)) if *mid == id => Some(arc.clone()),
+            Some((mid, weak)) if *mid == id => weak.upgrade(),
             _ => None,
         }
     }) {
         return Some(hit);
     }
     let reg = registry().lock().expect("lazy registry lock");
-    let found = reg.get(id as usize).cloned();
+    let found = reg.slots.get(id as usize).and_then(|s| s.as_ref()).and_then(|w| w.upgrade());
     if let Some(arc) = &found {
-        MEMO.with(|m| *m.borrow_mut() = Some((id, arc.clone())));
+        MEMO.with(|m| *m.borrow_mut() = Some((id, Arc::downgrade(arc))));
     }
     found
 }
 
-/// How many Lazy documents are currently registered (diagnostics/tests).
+/// How many live Lazy documents are currently registered (diagnostics/tests).
 pub fn registered_count() -> usize {
     let reg = registry().lock().expect("lazy registry lock");
-    reg.len()
+    reg.slots
+        .iter()
+        .filter(|s| s.as_ref().is_some_and(|w| w.strong_count() > 0))
+        .count()
 }
 
 #[cfg(test)]
@@ -730,13 +767,17 @@ mod lazy_tests {
     fn registry_roundtrips_ids_and_keeps_documents_shared() {
         let before = registered_count();
         let d1 = LazyDoc::build(SMALL.as_bytes()).expect("registry build");
-        let id = register(d1.clone());
+        let id = register(&d1);
         let got = crate::lazy::doc(id).expect("registered doc lookup");
         assert!(Arc::ptr_eq(&d1, &got));
         assert_eq!(registered_count(), before + 1);
         assert!(crate::lazy::doc(id + 9_999).is_none());
         assert!(got.raw_bytes() == SMALL.len());
         assert!(got.node_count() > 0);
+        drop(got);
+        drop(d1);
+        assert!(crate::lazy::doc(id).is_none());
+        assert_eq!(registered_count(), before);
     }
 }
 
