@@ -7,19 +7,19 @@
       "weight": 10
     },
     {
-      "name": "phase10b-lightweight-harness",
-      "command": "node /refs/phase10/verify_phase10.mjs --phase=10b",
+      "name": "phase10c-lightweight-harness",
+      "command": "node /refs/phase10/verify_phase10.mjs --phase=10c",
       "weight": 45
     },
     {
       "name": "rust-workspace-tests-no-regression",
       "command": "RUSTFLAGS=\"-D warnings\" cargo test --workspace -- --test-threads=1",
-      "weight": 25
+      "weight": 20
     },
     {
-      "name": "phase1-display-e2e-regression",
-      "command": "bash /refs/verify/check_e2e.sh",
-      "weight": 20
+      "name": "phase8a-8c-net-regression",
+      "command": "node /refs/phase8a/verify_phase8a.mjs && node /refs/phase8c/verify_phase8c.mjs",
+      "weight": 25
     }
   ]
 }
