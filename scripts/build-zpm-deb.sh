@@ -17,10 +17,11 @@ DIST_DIR="$ROOT_DIR/dist"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zpm-deb.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-echo "=== [1/5] Building cz-zpm for aarch64-unknown-linux-gnu (Cortex-A53, no LSE) ==="
+echo "=== [1/5] Building cz-zpm for aarch64-unknown-linux-gnu (Cortex-A53, no LSE/AES/SHA2) ==="
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-aarch64-linux-gnu-gcc}"
 export CC_aarch64_unknown_linux_gnu="${CC_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-gcc}"
-export RUSTFLAGS="-Ctarget-cpu=cortex-a53 -Ctarget-feature=-lse ${RUSTFLAGS:-}"
+# BCM2710 (Raspberry Pi CM0 / CardputerZero) Cortex-A53 lacks LSE and ARMv8 Crypto Extensions (aes/pmull/sha2).
+export RUSTFLAGS="-Ctarget-cpu=cortex-a53 -Ctarget-feature=-lse,-aes,-sha2 ${RUSTFLAGS:-}"
 
 cd "$ROOT_DIR"
 cargo build --release -p cz-zpm --target aarch64-unknown-linux-gnu
@@ -39,9 +40,10 @@ OBJDUMP="$(command -v aarch64-linux-gnu-objdump || command -v objdump)"
 "$OBJDUMP" -d --no-show-raw-insn "$STAGE_DIR/cz-zpm" > "$STAGE_DIR/disasm.txt"
 LSE_COUNT="$(grep -cE '\s(ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|cas)(a|l|al)?(b|h)?\s' "$STAGE_DIR/disasm.txt" || true)"
 RCPC_COUNT="$(grep -cE '\s(sdot|udot|ldapr|ldaprb|ldaprh)\s' "$STAGE_DIR/disasm.txt" || true)"
-echo "CZ_ZPM_LSE=$LSE_COUNT CZ_ZPM_RCPC=$RCPC_COUNT"
-if [ "$LSE_COUNT" -gt 200 ] || [ "$RCPC_COUNT" -gt 0 ]; then
-  echo "FAIL: incompatible Cortex-A53 instructions (LSE=$LSE_COUNT RCPC=$RCPC_COUNT)" >&2
+CRYPTO_COUNT="$(grep -cE '\s(pmull|pmull2|aese|aesd|aesmc|aesimc|sha1|sha256|sha512)\b' "$STAGE_DIR/disasm.txt" || true)"
+echo "CZ_ZPM_LSE=$LSE_COUNT CZ_ZPM_RCPC=$RCPC_COUNT CZ_ZPM_CRYPTO=$CRYPTO_COUNT"
+if [ "$LSE_COUNT" -gt 200 ] || [ "$RCPC_COUNT" -gt 0 ] || [ "$CRYPTO_COUNT" -gt 0 ]; then
+  echo "FAIL: incompatible Cortex-A53 instructions (LSE=$LSE_COUNT RCPC=$RCPC_COUNT CRYPTO=$CRYPTO_COUNT)" >&2
   exit 1
 fi
 

@@ -279,7 +279,7 @@ export AR_aarch64_unknown_linux_musl="zig ar"
 if grep -q '^libs-arm64:' Makefile; then
     make libs-arm64
 fi
-RUSTFLAGS="-Ctarget-cpu=cortex-a53 -Ctarget-feature=-lse,+crt-static" \
+RUSTFLAGS="-Ctarget-cpu=cortex-a53 -Ctarget-feature=-lse,-aes,-sha2,+crt-static" \
     cargo +nightly build --release --target aarch64-unknown-linux-musl --features cardputer
 
 BIN="$TARGET_DIR/target/aarch64-unknown-linux-musl/release/llrt"
