@@ -87,3 +87,12 @@ sha256 LIVE pin vs seed BEFORE cp(seeds unapplied till host swap;mismatch=instan
 
 ### [Insight] D56 bound registry I/O FAST(shipped)+tar facade trap
 timeouts read vendored ORACLE(Resolve5s/connect10/read10 default;ZPM_TIMEOUT_MS 1..60000 loud-reject,guarded);never-answer exits ~10s/2.6s tuned vs old SIGKILL-null,FAIL tail informative | TRAP tgz facade re-export !=bundle=>hand-picked tar members FALSE mismatch,real pipeline only.
+
+### [Dead End] D60 rustls ALERT-on-half-closed=>WSL2 dying ghosts poison loopback
+P15 hostile hang: RST-storm then plaintext conns get ZERO close/error FOREVER;server-side rows st=06 ino=0 tm=03 accumulate(120+ never purge),client pairs VANISH /proc/net/tcp despite node holding fds.NODE + write-free synthetic probes survive SAME storm=>app-causal NOT kernel;real-cz-net-acceptor /tmp cargo replica pinned = decisive isolation(D5-class).FIX shipped https.rs make_tls_acceptor:libc::recv MSG_PEEK 1B BEFORE rustls touches socket,non-0x16=>Err static-str NO alloc NO outgoing write,0x16 mTLS path untouched,P8B/P8C+ALL 360 tests green,set_read_timeout(HANDSHAKE_TIMEOUT) FIRST also caps peek.
+
+### [Insight] D61 repro observability traps—pipe-buffer+silent-exit+orphan-daemons
+process.exit() DROPS buffered stdout-to-pipe tail=>fs.writeSync(2,...) for causal logs;bare async-IIFE w/ unsettled await exits code-0 SILENTLY(no warning—only top-level-await warns),misread as pass.kill %N NEVER reaches daemons across bash calls—enumerate /proc/*/exe(readlink match)+kill;orphan cz-js/node servers from old runs cross-contaminate ephemeral-port forensics(ghost soup inflates CLOSE_WAIT baselines).
+
+### [Dead End] D62 backgrounded-chain cwd trap
+`cd dir && daemon &` backgrounds WHOLE chain=>foreground shell stays ORIGINAL cwd,relative redirects/scalars land in repo root(exact.mjs,m_cli.txt leaked);ALWAYS absolute paths for daemon logs+repro artifacts,scrub git-status BEFORE git add -A(gates commit tree verbatim).
