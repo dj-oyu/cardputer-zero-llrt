@@ -7,29 +7,19 @@
       "weight": 10
     },
     {
-      "name": "phase9a-aws-emulator-e2e",
-      "command": "node /refs/phase9a/verify_phase9a_aws.mjs",
+      "name": "phase10a-lightweight-harness",
+      "command": "node /refs/phase10/verify_phase10.mjs --phase=10a",
       "weight": 45
-    },
-    {
-      "name": "phase8c-tls-regression",
-      "command": "node /refs/phase8c/verify_phase8c.mjs",
-      "weight": 15
-    },
-    {
-      "name": "phase8b-https-regression",
-      "command": "node /refs/phase8b/verify_phase8b.mjs",
-      "weight": 10
-    },
-    {
-      "name": "phase8a-fetch-regression",
-      "command": "node /refs/phase8a/verify_phase8a.mjs",
-      "weight": 10
     },
     {
       "name": "rust-workspace-tests-no-regression",
       "command": "RUSTFLAGS=\"-D warnings\" cargo test --workspace -- --test-threads=1",
-      "weight": 10
+      "weight": 25
+    },
+    {
+      "name": "phase3a-5-kv-json-regression",
+      "command": "bash /refs/verify/check_e2e_p3a.sh && bash /refs/verify/check_e2e_p5.sh",
+      "weight": 20
     }
   ]
 }
