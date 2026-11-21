@@ -51,3 +51,12 @@ One ctx.with per pass may chain fetch->tls->httpCloses->http->timers ONLY if job
 
 ### [Principle] D18 — Font glyph cache: hits and misses blend identically
 swash ScaleContext + bounded cache (glyph_id,f32 size bits) FIFO cap 256 = zero-alloc repeat draw_text ONLY if cached AND fresh share ONE blend_alpha routine; separate compositing drifts pixels -> pixel-exact E2E fails; assert hit-vs-fresh BYTE equality. &mut *guard deref once per string; re-lock same Mutex panics; one guard per STRING not glyph..
+
+### [Insight] D27 — Span-backed head: retract the fold separator first
+Extending a previous header value span in-place for obs-fold MUST truncate the just-emitted `\r\n` field separator before appending `" " + trim`, else the grown span swallows CRLF and borrowed values drift byte-for-byte (`"one\r\n folded"` vs legacy `"one folded"`); ends_with guard keeps repeated folds idempotent, restore the missing separator when the NEXT field begins. Legacy join fixtures are the exact oracle — they caught this immediately.
+
+### [Dead End] D28 — Structural greps scan raw text; comments trip banned-literal asserts
+Explaining an API removal in a comment with the banned literal (e.g. `HashMap<String, Vec<String>>`) makes the /refs structural FAIL even though code is clean; reword comments without the literal pattern (no name->values map / no value vectors phrasing). grep -n on the file pinpoints the offending line fast.
+
+### [Principle] D29 — Linear-cursor + vectored-TX test/wire rules
+Assert parser cursor state ONLY from literal fixture lengths: Vec growth capacity is unspecified (use explicit with_capacity(32) in compaction-rule tests), and mid-request full consumption resets read_pos+buf to (0,0) — stale NeedMore asserts lie. Zero-body-copy TX: never pass a leading zero-length IoSlice element, retry via a global offset mapped onto (head,body) slices, ONE flush at end = wire bytes identical to combined encode()+write_all_eof_free (TCP writev coalesces; TLS falls back through std default write_vectored).
