@@ -30,9 +30,12 @@ pub mod io_module;
 pub mod ir_module;
 pub mod json_module;
 pub mod kv_module;
+pub mod path_module;
 pub mod process_module;
 pub mod tls_module;
 pub mod url_module;
+pub mod web_crypto;
+pub mod web_module;
 pub mod ws_module;
 
 // ---------------------------------------------------------------------------
@@ -44,7 +47,7 @@ pub mod ws_module;
 // reaching into submodules.
 pub use audio_module::AudioModule;
 pub use crypto_module::CryptoModule;
-pub use fs_module::FsModule;
+pub use fs_module::{FsModule, FsPromisesModule};
 pub use http_module::HttpModule;
 pub use https_module::HttpsModule;
 pub use imu_module::ImuModule;
@@ -53,9 +56,12 @@ pub use ir_module::IrModule;
 pub use json_module::{install_json, JsonModule};
 pub use fetch_module::{fetch_active_count, fetch_has_pending, install_fetch};
 pub use kv_module::KvModule;
+pub use path_module::PathModule;
 pub use process_module::{install_process, ProcessModule};
 pub use tls_module::TlsModule;
 pub use url_module::{install_url, UrlModule};
+pub use web_crypto::install_web_crypto;
+pub use web_module::install_web;
 pub use ws_module::{install_ws, ws_active_count, ws_has_pending, WsModule};
 
 /// Live raw TLS sockets + listening TLS servers (`node:tls` liveness for `cz-runner`).
@@ -144,6 +150,8 @@ pub const MODULE_NAMES: &[&str] = &[
     "tls",
     "node:fs",
     "fs",
+    "node:fs/promises",
+    "fs/promises",
     "node:process",
     "process",
     "node:crypto",
@@ -152,6 +160,8 @@ pub const MODULE_NAMES: &[&str] = &[
     "url",
     "node:ws",
     "ws",
+    "node:path",
+    "path",
 ];
 
 /// Which builtin implementation answers a resolved specifier.
@@ -165,6 +175,7 @@ pub enum ModuleKind {
     Https,
     Tls,
     Fs,
+    FsPromises,
     Kv,
     Json,
     Imu,
@@ -175,6 +186,7 @@ pub enum ModuleKind {
     Crypto,
     Url,
     Ws,
+    Path,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -189,6 +201,7 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "node:https" | "https" => Some(ModuleKind::Https),
         "node:tls" | "tls" => Some(ModuleKind::Tls),
         "node:fs" | "fs" => Some(ModuleKind::Fs),
+        "node:fs/promises" | "fs/promises" => Some(ModuleKind::FsPromises),
         "cardputer:kv" => Some(ModuleKind::Kv),
         "cardputer:json" => Some(ModuleKind::Json),
         "cardputer:imu" => Some(ModuleKind::Imu),
@@ -199,6 +212,7 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "node:crypto" | "crypto" => Some(ModuleKind::Crypto),
         "node:url" | "url" => Some(ModuleKind::Url),
         "node:ws" | "ws" => Some(ModuleKind::Ws),
+        "node:path" | "path" => Some(ModuleKind::Path),
         _ => None,
     }
 }
@@ -218,6 +232,7 @@ pub fn declare_builtin<'js>(
         ModuleKind::Https => rquickjs::Module::declare_def::<https_module::HttpsModule, _>(ctx.clone(), name),
         ModuleKind::Tls => rquickjs::Module::declare_def::<tls_module::TlsModule, _>(ctx.clone(), name),
         ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
+        ModuleKind::FsPromises => rquickjs::Module::declare_def::<fs_module::FsPromisesModule, _>(ctx.clone(), name),
         ModuleKind::Kv => rquickjs::Module::declare_def::<kv_module::KvModule, _>(ctx.clone(), name),
         ModuleKind::Json => rquickjs::Module::declare_def::<json_module::JsonModule, _>(ctx.clone(), name),
         ModuleKind::Imu => rquickjs::Module::declare_def::<imu_module::ImuModule, _>(ctx.clone(), name),
@@ -228,6 +243,7 @@ pub fn declare_builtin<'js>(
         ModuleKind::Crypto => rquickjs::Module::declare_def::<crypto_module::CryptoModule, _>(ctx.clone(), name),
         ModuleKind::Url => rquickjs::Module::declare_def::<url_module::UrlModule, _>(ctx.clone(), name),
         ModuleKind::Ws => rquickjs::Module::declare_def::<ws_module::WsModule, _>(ctx.clone(), name),
+        ModuleKind::Path => rquickjs::Module::declare_def::<path_module::PathModule, _>(ctx.clone(), name),
     }
 }
 

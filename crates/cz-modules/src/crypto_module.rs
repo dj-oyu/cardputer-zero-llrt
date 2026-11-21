@@ -22,22 +22,23 @@ use std::sync::{Mutex, OnceLock};
 use rquickjs::function::Opt;
 use rquickjs::{Ctx, Exception, Function, Object, Result, Value};
 
-/// Digest algorithm selector (SHA-256 / SHA-512 only, per spec).
+/// Digest algorithm selector (SHA-256 / SHA-512 only, per spec). Shared with the Phase 12
+/// `globalThis.crypto` (`crypto.subtle`) layer so both surfaces normalize identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Alg {
+pub(crate) enum Alg {
     Sha256,
     Sha512,
 }
 
 impl Alg {
-    fn digest_alg(self) -> &'static ring::digest::Algorithm {
+    pub(crate) fn digest_alg(self) -> &'static ring::digest::Algorithm {
         match self {
             Alg::Sha256 => &ring::digest::SHA256,
             Alg::Sha512 => &ring::digest::SHA512,
         }
     }
 
-    fn hmac_alg(self) -> ring::hmac::Algorithm {
+    pub(crate) fn hmac_alg(self) -> ring::hmac::Algorithm {
         match self {
             // ring 0.17 `hmac::Key::new` takes Algorithm by value.
             Alg::Sha256 => ring::hmac::HMAC_SHA256,
@@ -47,7 +48,7 @@ impl Alg {
 }
 
 /// Normalize a JS algorithm name: case-insensitive, tolerating `sha-256`/`sha_256` spacing.
-fn alg_of(name: &str) -> Option<Alg> {
+pub(crate) fn alg_of(name: &str) -> Option<Alg> {
     let norm: String = name
         .to_ascii_lowercase()
         .chars()
@@ -82,7 +83,7 @@ fn js_bytes<'js>(v: &Value<'js>) -> Result<Vec<u8>> {
     crate::bytes_from_value(v)
 }
 
-fn hex_encode(data: &[u8]) -> String {
+pub(crate) fn hex_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len() * 2);
     for b in data {
         out.push_str(&format!("{b:02x}"));
@@ -91,7 +92,7 @@ fn hex_encode(data: &[u8]) -> String {
 }
 
 /// Minimal standard-alphabet base64 (no new crates; ring keeps its Base64 Ring-internal only).
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -181,6 +182,53 @@ fn final_impl<'js>(ctx: &Ctx<'js>, id: i64, encoding: Opt<String>) -> Result<Val
 
 static RNG: OnceLock<ring::rand::SystemRandom> = OnceLock::new();
 
+/// Process-wide CSPRNG shared by `node:crypto`, Web Crypto fill/UUID paths.
+pub(crate) fn system_rng() -> &'static ring::rand::SystemRandom {
+    RNG.get_or_init(|| ring::rand::SystemRandom::new())
+}
+
+/// Decode standard (`+`/`/`) or URL-safe (`-`/`_`) Base64 in ONE native pass. HTML-style
+/// semantics: whitespace is skipped and everything from the first `=` onward terminates the
+/// stream, so unpadded JWK (`k`) values decode cleanly; a lone dangling sextet yields no byte.
+/// `None` marks an invalid character (HTML `InvalidCharacterError` / JWK parse failure).
+pub(crate) fn base64_decode(text: &str, url_safe: bool) -> Option<Vec<u8>> {
+    let sextet = |b: u8| -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((b - b'0') as u32 + 52),
+            b'+' if !url_safe => Some(62),
+            b'/' if !url_safe => Some(63),
+            b'-' if url_safe => Some(62),
+            b'_' if url_safe => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in text.as_bytes() {
+        if *b == b'=' {
+            break; // padding terminates the stream (trailing junk is ignored, per HTML)
+        }
+        if matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
+            continue; // WHATWG/HTML whitespace filtering
+        }
+        let v = sextet(*b)?;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    // A single leftover sextet (len % 4 == 1) cannot produce a byte: invalid input.
+    if bits == 6 {
+        return None;
+    }
+    Some(out)
+}
+
 fn random_bytes_impl<'js>(ctx: &Ctx<'js>, size: f64) -> Result<Value<'js>> {
     // Defensive double-check (the shim raises the spec RangeErrors first):
     if !size.is_finite() || size < 0.0 || size > 65536.0 || size != size.round() {
@@ -198,7 +246,8 @@ fn random_bytes_impl<'js>(ctx: &Ctx<'js>, size: f64) -> Result<Value<'js>> {
     crate::u8_array_from_vec(ctx, buf)
 }
 
-fn random_uuid_impl() -> rquickjs::Result<String> {
+/// RFC 4122 v4 lowercase UUID from `ring::rand` (reused by `globalThis.crypto.randomUUID`).
+pub(crate) fn random_uuid_impl() -> rquickjs::Result<String> {
     let mut b = [0u8; 16];
     let rng = RNG.get_or_init(|| ring::rand::SystemRandom::new());
     use ring::rand::SecureRandom;

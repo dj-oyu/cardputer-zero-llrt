@@ -560,6 +560,12 @@ fn main() {
         // Phase 8A: global fetch()/Headers/Request/Response/AbortController/AbortSignal/
         // ReadableStream (+ URLSearchParams when absent) built on cz-net's sync worker engine.
         cz_modules::install_fetch(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 12: globalThis.crypto + crypto.subtle (ring-only SHA/HMAC/AES-GCM, in-place
+        // getRandomValues fill, RFC 4122 randomUUID).
+        cz_modules::install_web_crypto(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 12: native atob/btoa + Blob/File/FormData (+ Response.blob()/formData()).
+        // Runs after install_fetch so the Response prototype patch finds the class.
+        cz_modules::install_web(&ctx).map_err(|e| format!("{e}"))?;
         // Phase 11: global WHATWG URL (Rust-parsed record + live searchParams) and the RFC 6455
         // WebSocket client (`ws://` + `wss://`) driven by cz-net's worker engine.
         cz_modules::install_url(&ctx).map_err(|e| format!("{e}"))?;

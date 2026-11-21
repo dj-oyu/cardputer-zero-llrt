@@ -772,10 +772,33 @@ declare module "node:fs" {
   /** Lightweight metadata (`size`, `isFile()`, `isDirectory()`); throws when the path is missing. */
   export function statSync(path: string): CzStats;
 
+  /** Phase 12 sync write: creates/truncates; borrows buffer payloads natively (no copy). */
+  export function writeFileSync(path: string, data: string | Uint8Array | ArrayBuffer): void;
+  /** Phase 12 sync append (creates when missing). */
+  export function appendFileSync(path: string, data: string | Uint8Array | ArrayBuffer): void;
+  /** `mkdirSync(path[, { recursive }])`; throws `EEXIST` without `recursive`. */
+  export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
+  /** Sorted directory entries (Rust-side sort). */
+  export function readdirSync(path: string): string[];
+  export function unlinkSync(path: string): void;
+  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
+  export function renameSync(oldPath: string, newPath: string): void;
+
+  /** Promise mirror of the sync surface (`readFile`, `writeFile`, ..., `access`). */
+  export const promises: CzFsPromises;
+
   const fs: {
     readFileSync: typeof readFileSync;
     existsSync: typeof existsSync;
     statSync: typeof statSync;
+    writeFileSync: typeof writeFileSync;
+    appendFileSync: typeof appendFileSync;
+    mkdirSync: typeof mkdirSync;
+    readdirSync: typeof readdirSync;
+    unlinkSync: typeof unlinkSync;
+    rmSync: typeof rmSync;
+    renameSync: typeof renameSync;
+    promises: CzFsPromises;
   };
   export default fs;
 }
@@ -847,7 +870,7 @@ declare class Request {
 }
 
 type HeadersInit = Headers | Record<string, string> | Array<[string, string]> | string;
-type BodyInit = string | Uint8Array | ArrayBuffer | URLSearchParams | ReadableStream | null;
+type BodyInit = string | Uint8Array | ArrayBuffer | URLSearchParams | Blob | FormData | ReadableStream | null;
 
 /** WHATWG-style response carrying the fetched body (buffered or streamed consumption). */
 declare class Response {
@@ -866,6 +889,10 @@ declare class Response {
   json(): Promise<unknown>;
   bytes(): Promise<Uint8Array>;
   arrayBuffer(): Promise<ArrayBuffer>;
+  /** Phase 12: wraps the buffered body in a `Blob` typed by the response Content-Type. */
+  blob(): Promise<Blob>;
+  /** Phase 12: parses `multipart/form-data` and urlencoded bodies natively. */
+  formData(): Promise<FormData>;
   clone(): Response;
 }
 
@@ -1133,4 +1160,193 @@ declare module "ws" {
   import wsMod from "node:ws";
   export * from "node:ws";
   export { wsMod as default };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 12: Modern Web & WinterCG APIs (Web Crypto, Blob/File/FormData, atob/btoa,
+// node:path, node:fs/promises)
+// ---------------------------------------------------------------------------
+
+/** Symmetric key handle returned by `crypto.subtle.importKey` (`type: "secret"`). */
+interface CryptoKey {
+  readonly type: "secret";
+  readonly algorithm: { name: "HMAC" | "AES-GCM"; hash?: string };
+  readonly extractable: boolean;
+  readonly usages: string[];
+}
+
+/** ring-backed SubtleCrypto subset: SHA-256/512 digests, HMAC sign/verify, AES-128/256-GCM. */
+interface SubtleCrypto {
+  digest(algorithm: string | { name: string }, data: ArrayBuffer | Uint8Array): Promise<ArrayBuffer>;
+  importKey(
+    format: "raw" | "jwk",
+    keyData: ArrayBuffer | Uint8Array | string | { kty: "oct"; k: string },
+    algorithm: string | { name: "HMAC" | "AES-GCM"; hash?: string | { name: string } },
+    extractable: boolean,
+    keyUsages: string[]
+  ): Promise<CryptoKey>;
+  exportKey(format: "raw", key: CryptoKey): Promise<ArrayBuffer>;
+  sign(algorithm: string | { name: "HMAC" }, key: CryptoKey, data: ArrayBuffer | Uint8Array): Promise<ArrayBuffer>;
+  verify(
+    algorithm: string | { name: "HMAC" },
+    key: CryptoKey,
+    signature: ArrayBuffer | Uint8Array,
+    data: ArrayBuffer | Uint8Array
+  ): Promise<boolean>;
+  encrypt(
+    algorithm: { name: "AES-GCM"; iv: ArrayBuffer | Uint8Array; additionalData?: ArrayBuffer | Uint8Array; tagLength?: 128 },
+    key: CryptoKey,
+    data: ArrayBuffer | Uint8Array
+  ): Promise<ArrayBuffer>;
+  decrypt(
+    algorithm: { name: "AES-GCM"; iv: ArrayBuffer | Uint8Array; additionalData?: ArrayBuffer | Uint8Array; tagLength?: 128 },
+    key: CryptoKey,
+    data: ArrayBuffer | Uint8Array
+  ): Promise<ArrayBuffer>;
+}
+
+/** WinterCG/Web `Crypto` surface installed by `cz-js` (`globalThis.crypto`). */
+interface Crypto {
+  getRandomValues<T extends ArrayBufferView>(array: T): T;
+  randomUUID(): string;
+  readonly subtle: SubtleCrypto;
+  getCrypto(): Crypto;
+}
+
+declare global {
+  const crypto: Crypto;
+}
+
+/** HTML-standard Base64 decode (latin1 binary-string semantics, native single pass). */
+declare function atob(data: string): string;
+
+/** HTML-standard Base64 encode; throws for code points above U+00FF. */
+declare function btoa(data: string): string;
+
+/** Immutable byte blob: parts concatenate once; `slice()` returns a zero-copy view Blob. */
+declare class Blob {
+  constructor(parts?: Array<string | Uint8Array | ArrayBuffer | Blob>, options?: { type?: string });
+  readonly size: number;
+  readonly type: string;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  bytes(): Promise<Uint8Array>;
+  text(): Promise<string>;
+  slice(start?: number, end?: number, contentType?: string): Blob;
+}
+
+/** `File extends Blob` with `name` and `lastModified`. */
+declare class File extends Blob {
+  constructor(bits: Array<string | Uint8Array | ArrayBuffer | Blob>, name: string, options?: { type?: string; lastModified?: number });
+  readonly name: string;
+  readonly lastModified: number;
+}
+
+/** WHATWG field bag: strings and `File`s, multipart-serializable via `fetch(body)`. */
+declare class FormData {
+  append(name: string, value: string | Blob, filename?: string): void;
+  set(name: string, value: string | Blob, filename?: string): void;
+  get(name: string): string | File | null;
+  getAll(name: string): Array<string | File>;
+  has(name: string): boolean;
+  delete(name: string): void;
+  forEach(callback: (value: string | File, name: string, self: FormData) => void, thisArg?: unknown): void;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string | File>;
+  entries(): IterableIterator<[string, string | File]>;
+  [Symbol.iterator](): IterableIterator<[string, string | File]>;
+}
+
+/** Promise-returning filesystem mirror shared by `fs.promises` and `node:fs/promises`. */
+interface CzFsPromises {
+  readFile(path: string): Promise<Uint8Array>;
+  readFile(path: string, encoding: "utf8" | "utf-8"): Promise<string>;
+  readFile(path: string, options?: { encoding?: string | null }): Promise<string | Uint8Array>;
+  writeFile(path: string, data: string | Uint8Array | ArrayBuffer): Promise<void>;
+  appendFile(path: string, data: string | Uint8Array | ArrayBuffer): Promise<void>;
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
+  readdir(path: string): Promise<string[]>;
+  stat(path: string): Promise<CzStats>;
+  unlink(path: string): Promise<void>;
+  rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  access(path: string): Promise<void>;
+}
+
+declare const FsPromisesImpl: CzFsPromises;
+
+declare module "node:fs/promises" {
+  export const readFile: CzFsPromises["readFile"];
+  export const writeFile: CzFsPromises["writeFile"];
+  export const appendFile: CzFsPromises["appendFile"];
+  export const mkdir: CzFsPromises["mkdir"];
+  export const readdir: CzFsPromises["readdir"];
+  export const stat: CzFsPromises["stat"];
+  export const unlink: CzFsPromises["unlink"];
+  export const rm: CzFsPromises["rm"];
+  export const rename: CzFsPromises["rename"];
+  export const access: CzFsPromises["access"];
+  const promisesMod: CzFsPromises;
+  export default promisesMod;
+}
+
+declare module "fs/promises" {
+  import promisesMod from "node:fs/promises";
+  export * from "node:fs/promises";
+  export { promisesMod as default };
+}
+
+/** Node POSIX path result object (`parse`). */
+interface ParsedPath {
+  root: string;
+  dir: string;
+  base: string;
+  ext: string;
+  name: string;
+}
+
+/** Input accepted by `format` (either `base` or `name` + `ext`). */
+interface FormatInput {
+  root?: string;
+  dir?: string;
+  base?: string;
+  ext?: string;
+  name?: string;
+}
+
+interface CzPathPosix {
+  readonly sep: "/";
+  readonly delimiter: ":";
+  join(...paths: string[]): string;
+  resolve(...paths: string[]): string;
+  normalize(p: string): string;
+  isAbsolute(p: string): boolean;
+  dirname(p: string): string;
+  basename(p: string, ext?: string): string;
+  extname(p: string): string;
+  parse(p: string): ParsedPath;
+  format(p: FormatInput): string;
+}
+
+declare const PathImpl: CzPathPosix;
+
+declare module "node:path" {
+  export const sep: "/";
+  export const delimiter: ":";
+  export function join(...paths: string[]): string;
+  export function resolve(...paths: string[]): string;
+  export function normalize(p: string): string;
+  export function isAbsolute(p: string): boolean;
+  export function dirname(p: string): string;
+  export function basename(p: string, ext?: string): string;
+  export function extname(p: string): string;
+  export function parse(p: string): ParsedPath;
+  export function format(p: FormatInput): string;
+  const pathMod: CzPathPosix;
+  export default pathMod;
+}
+
+declare module "path" {
+  import pathMod from "node:path";
+  export * from "node:path";
+  export { pathMod as default };
 }

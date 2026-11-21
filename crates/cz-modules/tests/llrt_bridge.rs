@@ -9,9 +9,9 @@ fn llrt_public_defs_register_all_twelve_modules_end_to_end() {
     // Every struct is importable at the crate ROOT (not just through submodules) and can be
     // declared + evaluated like any LLRT ModuleDef inside a fresh runtime.
     use cz_modules::{
-        AppModule, AudioModule, CARDPUTER_MODULE_NAMES, DisplayModule, FsModule, HttpModule,
-        ImuModule, InputModule, IoModule, IrModule, JsonModule, KvModule, ModuleKind, PowerModule,
-        resolve_builtin,
+        AppModule, AudioModule, CARDPUTER_MODULE_NAMES, DisplayModule, FsModule, FsPromisesModule,
+        HttpModule, ImuModule, InputModule, IoModule, IrModule, JsonModule, KvModule, ModuleKind,
+        PathModule, PowerModule, resolve_builtin,
     };
 
     assert_eq!(CARDPUTER_MODULE_NAMES.len(), 10);
@@ -33,6 +33,11 @@ fn llrt_public_defs_register_all_twelve_modules_end_to_end() {
     assert_eq!(resolve_builtin("cardputer:audio"), Some(ModuleKind::Audio));
     assert_eq!(resolve_builtin("cardputer:ir"), Some(ModuleKind::Ir));
     assert_eq!(resolve_builtin("cardputer:io"), Some(ModuleKind::Io));
+    // Phase 12: Node-style path + fs/promises specifiers resolve to builtin kinds.
+    assert_eq!(resolve_builtin("node:path"), Some(ModuleKind::Path));
+    assert_eq!(resolve_builtin("path"), Some(ModuleKind::Path));
+    assert_eq!(resolve_builtin("node:fs/promises"), Some(ModuleKind::FsPromises));
+    assert_eq!(resolve_builtin("fs/promises"), Some(ModuleKind::FsPromises));
 
     let rt = Runtime::new().expect("runtime");
     let ctx = Context::full(&rt).expect("context");
@@ -49,6 +54,10 @@ fn llrt_public_defs_register_all_twelve_modules_end_to_end() {
         Module::declare_def::<IoModule, _>(c.clone(), "cardputer:io").expect("io");
         Module::declare_def::<HttpModule, _>(c.clone(), "node:http").expect("http");
         Module::declare_def::<FsModule, _>(c.clone(), "node:fs").expect("fs");
+        Module::declare_def::<PathModule, _>(c.clone(), "node:path").expect("node:path");
+        Module::declare_def::<PathModule, _>(c.clone(), "path").expect("path alias");
+        Module::declare_def::<FsPromisesModule, _>(c.clone(), "node:fs/promises").expect("node:fs/promises");
+        Module::declare_def::<FsPromisesModule, _>(c.clone(), "fs/promises").expect("fs/promises alias");
         let p = Module::evaluate(
             c.clone(),
             "llrt-bridge.mjs",
@@ -61,6 +70,8 @@ fn llrt_public_defs_register_all_twelve_modules_end_to_end() {
             import * as czJson from "cardputer:json";
             import * as http from "node:http";
             import * as fs from "node:fs";
+            import pathP12 from "node:path";
+            import fspP12 from "node:fs/promises";
             import * as imu from "cardputer:imu";
             import imuDef from "cardputer:imu";
             import * as audioMod from "cardputer:audio";
@@ -78,6 +89,9 @@ fn llrt_public_defs_register_all_twelve_modules_end_to_end() {
             if (s.get("k") !== 7) throw new Error("kv roundtrip");
             if (typeof http.createServer !== "function" || !Array.isArray(http.METHODS)) throw new Error("http shape");
             if (typeof fs.readFileSync !== "function" || typeof fs.existsSync !== "function") throw new Error("fs shape");
+            if (typeof fs.writeFileSync !== "function" || typeof fs.rmSync !== "function" || !fs.promises) throw new Error("fs phase12 shape");
+            if (pathP12.sep !== "/" || pathP12.join("/a", "b") !== "/a/b") throw new Error("path phase12");
+            if (typeof fspP12.readFile !== "function" || typeof fspP12.access !== "function") throw new Error("fs/promises phase12");
             if (typeof czJson.parseLazy !== "function" || typeof czJson.isLazy !== "function" || typeof czJson.lazyStats !== "function") throw new Error("json shape");
             const lazy = czJson.parseLazy('{"a":1}');
             if (!czJson.isLazy(lazy) || lazy.a !== 1) throw new Error("json lazy handle");

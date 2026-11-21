@@ -861,6 +861,16 @@ pub(crate) const FETCH_SHIM: &str = r#"
         if (typeof Uint8Array !== "undefined" && body instanceof Uint8Array) return body;
         if (body instanceof ArrayBuffer) return new Uint8Array(body);
         if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+        // Phase 12: Blob bodies hand out their owned bytes; FormData serializes multipart/form-data.
+        if (typeof globalThis.FormData === "function" && body instanceof globalThis.FormData) {
+            const boundary = globalThis.__czMultipartBoundary();
+            if (!headers.has("content-type")) headers.set("Content-Type", "multipart/form-data; boundary=" + boundary);
+            return body._serialize(boundary);
+        }
+        if (typeof globalThis.Blob === "function" && body instanceof globalThis.Blob) {
+            if (!headers.has("content-type") && body.type) headers.set("Content-Type", body.type);
+            return body._bytes;
+        }
         if (typeof body === "object" && typeof body.toString === "function" && !headers.has("content-type")) {
             headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
             return new TextEncoder().encode(body.toString());
@@ -886,9 +896,11 @@ pub(crate) const FETCH_SHIM: &str = r#"
         const signal = req.signal;
         if (signal && signal.aborted) throw signal.reason === undefined ? makeAbortError(undefined) : signal.reason;
 
+        // Phase 12: normalizeBody FIRST so Content-Type derived from Blob/FormData/urlencoded
+        // bodies is present when the header pairs are serialized onto the wire.
+        const bodyBytes = normalizeBody(req.body, req.headers);
         const pairs = [];
         req.headers.forEach(function (value, name) { pairs.push([name, value]); });
-        const bodyBytes = normalizeBody(req.body, req.headers);
         const id = __czFetchStart(req.url, req.method, String(req.redirect || "follow"), pairs,
                                   bodyBytes === null ? null : bodyBytes,
                                   req.tls ? req.tls : {});
