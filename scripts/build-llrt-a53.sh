@@ -180,7 +180,7 @@ patch_llrt_core() {
     fi
     if ! grep -q 'cz_modules::install_json(ctx)?;' "$vm"; then
         if grep -q 'json::redefine_static_methods(ctx)?;' "$vm"; then
-            insert_after "$vm" 'json::redefine_static_methods\(ctx\)\?;' '    cz_modules::install_json(ctx)?;'
+            insert_after "$vm" 'json::redefine_static_methods' '    cz_modules::install_json(ctx)?;'
         fi
     fi
 }
