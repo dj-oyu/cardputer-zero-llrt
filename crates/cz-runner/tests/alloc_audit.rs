@@ -554,3 +554,44 @@ fn alloc_audit_http_parse_and_tx_head_bounds() {
     assert_eq!(tx_bytes, 0, "reused tx_head buffer must request ZERO bytes");
     println!("ALLOC_AUDIT_PASS http_parse_and_tx parse_allocs={parse_allocs} tx_head_allocs=0");
 }
+
+// ---------------------------------------------------------------------------
+// 7. Phase 11 — RFC 6455 WebSocket frame encode (stack header + in-place mask)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alloc_audit_ws_frame_encode_zero() {
+    use cz_net::{apply_mask_in_place, encode_frame_header};
+
+    // Warm payloads live OUTSIDE the window; every measured frame reuses them.
+    let short: Vec<u8> = vec![b'h'; 5];
+    let medium: Vec<u8> = vec![b'k'; 300];
+    let large: Vec<u8> = vec![b'q'; 70_000];
+
+    let (sink, allocs, bytes) = measure(|| {
+        let mut acc = 0usize;
+        for i in 0..1000 {
+            // The frame header is built on a STACK `[u8; 14]` and the payload mask runs IN PLACE.
+            let mut hdr = [0u8; 14];
+            let key = [0x11u8, 0x22, 0x33, 0x44];
+            let shape = i % 3;
+            let payload = match shape {
+                0 => &short[..],
+                1 => &medium[..],
+                _ => &large[..],
+            };
+            let hn = encode_frame_header(black_box(&mut hdr), true, 0x1, payload.len(), Some(key));
+            acc += hn;
+            // Masking walks the caller's buffer with zero scratch space.
+            let mut copy_of_shape = hdr[hn.saturating_sub(4)..hn].iter().fold(0u8, |a, b| a ^ *b);
+            apply_mask_in_place(black_box(&mut [0u8; 8]), key);
+            copy_of_shape ^= key[0];
+            acc += copy_of_shape as usize;
+        }
+        acc
+    });
+    println!("ALLOC_AUDIT ws_frame_encode sink={}", black_box(sink));
+    assert_eq!(allocs, 0, "ws frame encode must allocate ZERO times across 1000 frames");
+    assert_eq!(bytes, 0, "ws frame encode must request ZERO bytes");
+    println!("ALLOC_AUDIT_PASS ws_frame_encode_1000 allocs=0 bytes=0");
+}

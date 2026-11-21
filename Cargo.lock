@@ -172,6 +172,7 @@ dependencies = [
  "cz-hal",
  "http",
  "libc",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -186,6 +187,7 @@ dependencies = [
  "cz-hal",
  "cz-json",
  "cz-modules",
+ "cz-net",
  "rquickjs",
 ]
 

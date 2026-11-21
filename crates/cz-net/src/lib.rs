@@ -6,13 +6,20 @@
 //! streams immediately). Phases 8B (`node:https` server TLS) and 8C (`node:tls` raw sockets) reuse
 //! [`tls`] without pulling any TLS C library into `cz-hal`, which stays strictly `libc`-only.
 //!
-//! Forbidden-by-spec dependencies are absent: no `tokio`, `openssl`/`native-tls`, `aws-lc-rs`, or
-//! `webpki-roots`.
+//! Phase 11 adds [`url`] (zero-allocation WHATWG-style URL parsing into ONE owned buffer plus
+//! `Copy` byte spans) and [`ws`] (an RFC 6455 WebSocket client for `ws://` and `wss://` written
+//! directly on top of [`tls`] + `ring`, with stack frame headers, mandatory client masking and
+//! automatic `Pong` replies) — no external WebSocket crate anywhere.
+//!
+//! Forbidden-by-spec dependencies are absent: no `tokio`, `openssl`/`native-tls`, `aws-lc-rs`,
+//! `webpki-roots`, `tungstenite`, or any other WebSocket crate.
 
 pub mod fetch;
 pub mod https;
 pub mod tls;
 pub mod tls_socket;
+pub mod url;
+pub mod ws;
 
 pub use fetch::{
     active_fetch_count, cancel_fetch, fetch_has_pending, is_redirect_status, live_ids, next_event,
@@ -30,6 +37,15 @@ pub use tls_socket::{
     close_tls_server, connect_tls, create_tls_server, next_tls_event, tls_active_count,
     tls_destroy, tls_end, tls_has_pending, tls_write, TlsEngineEvent, SERVER_HANDSHAKE_TIMEOUT,
     TLS_WORKER_STACK_BYTES,
+};
+pub use url::{
+    default_port, is_special, parse_url, parse_url_into, trim_url_chars, OwnedUrl, Parsed, Span,
+    Url, FLAG_AUTHORITY, FLAG_OPAQUE, FLAG_SPECIAL,
+};
+pub use ws::{
+    apply_mask_in_place, close_ws, encode_frame_header, next_ws_event, send_ws, terminate_ws,
+    ws_active_count, ws_buffered_amount, ws_connect, ws_has_pending, WsEngineEvent, WS_GUID,
+    WS_MAX_FRAME, WS_WORKER_STACK_BYTES,
 };
 
 #[cfg(test)]

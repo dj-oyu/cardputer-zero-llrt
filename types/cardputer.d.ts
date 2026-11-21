@@ -826,7 +826,7 @@ interface Headers {
 
 /** WHATWG-style request object (`fetch(Request)` passes url/method/headers/body/redirect/signal/tls). */
 declare class Request {
-  constructor(input: string | Request, init?: {
+  constructor(input: string | URL | Request, init?: {
     method?: string;
     headers?: HeadersInit;
     body?: BodyInit | null;
@@ -907,7 +907,7 @@ interface ReadableStream {
 }
 
 /** Global fetch entry point installed by the runner (`crates/cz-net` rustls/ring engine). */
-declare function fetch(input: string | Request, init?: {
+declare function fetch(input: string | URL | Request, init?: {
   method?: string;
   headers?: HeadersInit;
   body?: BodyInit | null;
@@ -1007,4 +1007,130 @@ declare module "crypto" {
   import cryptoMod from "node:crypto";
   export * from "node:crypto";
   export { cryptoMod as default };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11: WHATWG URL + RFC 6455 WebSocket client (crates/cz-net)
+// ---------------------------------------------------------------------------
+
+/** WHATWG `URLSearchParams` pair view (also exported by `node:url`). */
+interface URLSearchParams {
+  append(name: string, value: string): void;
+  set(name: string, value: string): void;
+  get(name: string): string | null;
+  getAll(name: string): string[];
+  has(name: string): boolean;
+  delete(name: string): void;
+  sort(): void;
+  toString(): string;
+  forEach(callback: (value: string, name: string, self: URLSearchParams) => void, thisArg?: unknown): void;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string>;
+  entries(): IterableIterator<[string, string]>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+}
+
+declare class URLSearchParamsCtor {
+  constructor(init?: string | URLSearchParams | Iterable<[string, string]>);
+}
+
+/** Global WHATWG `URL`: Rust-parsed (`cz_net::url`, one href buffer, span accessors). */
+declare class URL {
+  constructor(input: string | URL, base?: string | URL);
+  href: string;
+  readonly origin: string;
+  protocol: string;
+  username: string;
+  password: string;
+  host: string;
+  hostname: string;
+  port: string;
+  pathname: string;
+  search: string;
+  hash: string;
+  /** LIVE query view both ways: mutating it rewrites `.search`/`.href`; assigning `.search`
+   *  refreshes the SAME params object in place. */
+  readonly searchParams: URLSearchParams;
+  toString(): string;
+  toJSON(): string;
+  static canParse(input: string | URL, base?: string | URL): boolean;
+  static parse(input: string | URL, base?: string | URL): URL | null;
+}
+
+declare module "node:url" {
+  export const URL: typeof URLClassAlias;
+  export const URLSearchParams: typeof URLSearchParamsCtor;
+  const urlMod: { URL: typeof URLClassAlias; URLSearchParams: typeof URLSearchParamsCtor };
+  export default urlMod;
+}
+
+// Module-side alias so `node:url` exports the SAME classes the runner installed globally.
+declare const URLClassAlias: typeof URL;
+
+declare module "url" {
+  import urlMod from "node:url";
+  export * from "node:url";
+  export { urlMod as default };
+}
+
+/** `fetch()` message payload event shape (`MessageEvent`-compatible). */
+interface WebSocketMessageEvent {
+  type: "message";
+  data: string | Uint8Array | ArrayBuffer;
+}
+
+/** RFC 6455 close handshake result (`CloseEvent`-compatible). */
+interface WebSocketCloseEvent {
+  type: "close";
+  code: number;
+  reason: string;
+  wasClean: boolean;
+}
+
+interface WebSocketErrorEvent {
+  type: "error";
+  message: string;
+  error?: unknown;
+}
+
+/** Global RFC 6455 client over `ws://` and `wss://` (rustls + ring, masked frames, auto-Pong). */
+declare class WebSocket {
+  static readonly CONNECTING: 0;
+  static readonly OPEN: 1;
+  static readonly CLOSING: 2;
+  static readonly CLOSED: 3;
+  constructor(url: string | URL, protocols?: string | string[] | { protocols?: string | string[]; tls?: CzFetchTlsOptions });
+  readonly url: string;
+  readyState: 0 | 1 | 2 | 3;
+  readonly protocol: string;
+  readonly extensions: string;
+  /** Inbound binary shape: `"arraybuffer"` (default) or `"uint8array"` (zero-copy native view). */
+  binaryType: "arraybuffer" | "uint8array" | "blob";
+  readonly bufferedAmount: number;
+  onopen: ((ev: WebSocketMessageEvent & { type: "open" }) => void) | null;
+  onmessage: ((ev: WebSocketMessageEvent) => void) | null;
+  onerror: ((ev: WebSocketErrorEvent) => void) | null;
+  onclose: ((ev: WebSocketCloseEvent) => void) | null;
+  send(data: string | Uint8Array | ArrayBuffer): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(type: "open" | "close" | "error", listener: (ev: WebSocketCloseEvent | WebSocketErrorEvent | { type: string }) => void): void;
+  addEventListener(type: "message", listener: (ev: WebSocketMessageEvent) => void): void;
+  removeEventListener(type: string, listener: (ev: { type: string }) => void): void;
+}
+
+/** Per-socket WebSocket options mirror fetch's `tls` bag (`ca`, `cert`, `key`, `rejectUnauthorized`). */
+type WebSocketTlsOptions = CzFetchTlsOptions;
+
+declare const WsClassAlias: typeof WebSocket;
+
+declare module "node:ws" {
+  export const WebSocket: typeof WsClassAlias;
+  const wsMod: { WebSocket: typeof globalThis.WebSocket };
+  export default wsMod;
+}
+
+declare module "ws" {
+  import wsMod from "node:ws";
+  export * from "node:ws";
+  export { wsMod as default };
 }

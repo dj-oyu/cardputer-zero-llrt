@@ -97,7 +97,7 @@ fn tls_server_opts_from_js<'js>(ctx: &Ctx<'js>, opts: &Object<'js>) -> Result<Tl
 }
 
 /// Convert the JS connect descriptor into `TlsClientOptions`.
-fn tls_client_opts_from_js<'js>(ctx: &Ctx<'js>, desc: &Object<'js>) -> Result<TlsClientOptions> {
+pub(crate) fn tls_client_opts_from_js<'js>(ctx: &Ctx<'js>, desc: &Object<'js>) -> Result<TlsClientOptions> {
     let ca = opt_tls_bytes(ctx, desc.get::<_, Value>("ca")?)?;
     let cert = opt_tls_bytes(ctx, desc.get::<_, Value>("cert")?)?;
     let key = opt_tls_bytes(ctx, desc.get::<_, Value>("key")?)?;

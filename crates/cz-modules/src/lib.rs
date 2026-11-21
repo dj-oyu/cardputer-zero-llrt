@@ -32,6 +32,8 @@ pub mod json_module;
 pub mod kv_module;
 pub mod process_module;
 pub mod tls_module;
+pub mod url_module;
+pub mod ws_module;
 
 // ---------------------------------------------------------------------------
 // Clean `awslabs/llrt` v0.10.0-beta integration surface
@@ -53,6 +55,8 @@ pub use fetch_module::{fetch_active_count, fetch_has_pending, install_fetch};
 pub use kv_module::KvModule;
 pub use process_module::{install_process, ProcessModule};
 pub use tls_module::TlsModule;
+pub use url_module::{install_url, UrlModule};
+pub use ws_module::{install_ws, ws_active_count, ws_has_pending, WsModule};
 
 /// Live raw TLS sockets + listening TLS servers (`node:tls` liveness for `cz-runner`).
 pub fn tls_active_count() -> usize {
@@ -144,6 +148,10 @@ pub const MODULE_NAMES: &[&str] = &[
     "process",
     "node:crypto",
     "crypto",
+    "node:url",
+    "url",
+    "node:ws",
+    "ws",
 ];
 
 /// Which builtin implementation answers a resolved specifier.
@@ -165,6 +173,8 @@ pub enum ModuleKind {
     Io,
     Process,
     Crypto,
+    Url,
+    Ws,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -187,6 +197,8 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "cardputer:io" => Some(ModuleKind::Io),
         "node:process" | "process" => Some(ModuleKind::Process),
         "node:crypto" | "crypto" => Some(ModuleKind::Crypto),
+        "node:url" | "url" => Some(ModuleKind::Url),
+        "node:ws" | "ws" => Some(ModuleKind::Ws),
         _ => None,
     }
 }
@@ -214,6 +226,8 @@ pub fn declare_builtin<'js>(
         ModuleKind::Io => rquickjs::Module::declare_def::<io_module::IoModule, _>(ctx.clone(), name),
         ModuleKind::Process => rquickjs::Module::declare_def::<process_module::ProcessModule, _>(ctx.clone(), name),
         ModuleKind::Crypto => rquickjs::Module::declare_def::<crypto_module::CryptoModule, _>(ctx.clone(), name),
+        ModuleKind::Url => rquickjs::Module::declare_def::<url_module::UrlModule, _>(ctx.clone(), name),
+        ModuleKind::Ws => rquickjs::Module::declare_def::<ws_module::WsModule, _>(ctx.clone(), name),
     }
 }
 

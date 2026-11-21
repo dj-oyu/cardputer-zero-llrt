@@ -14,5 +14,6 @@ rquickjs.workspace = true
 
 [dev-dependencies]
 cz-gfx = { path = "../cz-gfx" }
+cz-net = { path = "../cz-net" }
 cz-hal = { path = "../cz-hal" }
 cz-json = { path = "../cz-json" }

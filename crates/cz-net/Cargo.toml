@@ -12,5 +12,8 @@ rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 http = "1"
 libc.workspace = true
+# Phase 11: RFC 6455 handshake/accept hashing and mask keys use `ring` only (already resolved in
+# Cargo.lock through rustls); NO OpenSSL/native-tls/async-runtime/WebSocket crates are added.
+ring = "0.17"
 
 [dev-dependencies]

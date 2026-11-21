@@ -272,8 +272,8 @@ fn settle_module(rt: &Runtime, ctx: &Context) -> Result<bool, String> {
         if module_settled(ctx) {
             return Ok(true);
         }
-        let (_, timers, extra_work, fetch_active, tls_active) = loop_liveness(rt, ctx);
-        if !extra_work && timers <= 0 && fetch_active == 0 && tls_active == 0
+        let (_, timers, extra_work, fetch_active, tls_active, ws_active) = loop_liveness(rt, ctx);
+        if !extra_work && timers <= 0 && fetch_active == 0 && tls_active == 0 && ws_active == 0
             && cz_modules::http_listening_count() == 0
         {
             idle_passes += 1;
@@ -368,6 +368,7 @@ const LOOP_DRAIN_GLUE: &str = r#"
         globalThis.__czLoopDrain = function () {
             var n = 0;
             if (typeof __czFetchDrainLoop === "function") n += __czFetchDrainLoop();
+            if (typeof __czWsDrainLoop === "function") n += __czWsDrainLoop();
             if (typeof __czTlsDrainLoop === "function") n += __czTlsDrainLoop();
             if (typeof __czHttpCheckCloses === "function") n += __czHttpCheckCloses();
             if (typeof __czHttpDrainLoop === "function") n += __czHttpDrainLoop();
@@ -381,6 +382,7 @@ const LOOP_DRAIN_GLUE: &str = r#"
             if (typeof __czHttpCheckCloses === "function") n += __czHttpCheckCloses();
             if (typeof __czHttpDrainLoop === "function") n += __czHttpDrainLoop();
             if (typeof __czFetchDrainLoop === "function") n += __czFetchDrainLoop();
+            if (typeof __czWsDrainLoop === "function") n += __czWsDrainLoop();
             if (typeof __czTlsDrainLoop === "function") n += __czTlsDrainLoop();
             return n;
         };
@@ -429,7 +431,7 @@ fn loop_pass(rt: &Runtime, ctx: &Context) {
     // 3. Give work CREATED by the pass above one more dispatch round (still a single scope, and it
     //    skips timers so an interval can never fire twice inside one iteration).
     if rt.is_job_pending() || cz_modules::http_has_pending() || cz_modules::fetch_has_pending()
-        || cz_modules::tls_has_pending()
+        || cz_modules::tls_has_pending() || cz_modules::ws_has_pending()
     {
         ctx.with(|c| call_js_i64(&c, "__czRescanDrain", 0));
         drain_jobs(rt);
@@ -439,18 +441,21 @@ fn loop_pass(rt: &Runtime, ctx: &Context) {
 /// Liveness snapshot: listening servers, pending JS timers, plus queued engine requests, pending
 /// QuickJS jobs, queued TLS events and live TLS sockets/servers. Runtime queries run outside any
 /// context scope (rquickjs RefCell rule).
-fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool, usize, usize) {
+fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool, usize, usize, usize) {
     let listening = cz_modules::http_listening_count();
     let queued = cz_modules::http_has_pending()
         || cz_modules::fetch_has_pending()
-        || cz_modules::tls_has_pending();
+        || cz_modules::tls_has_pending()
+        || cz_modules::ws_has_pending();
     let job_pending = rt.is_job_pending();
     let timers = ctx.with(|c| call_js_i64(&c, "__czTimerCount", 0));
     // Live fetch slots keep the process alive even when no node:http server exists.
     let fetch_active = cz_modules::fetch_active_count();
     // Phase 8C: open raw TLS sockets + listening TLS servers keep the loop alive too.
     let tls_active = cz_modules::tls_active_count();
-    (listening, timers, queued || job_pending, fetch_active, tls_active)
+    // Phase 11: open WebSocket connections must hold the loop until their close handshake lands.
+    let ws_active = cz_modules::ws_active_count();
+    (listening, timers, queued || job_pending, fetch_active, tls_active, ws_active)
 }
 
 /// Keep the process alive while any HTTP server listens or any timer is pending. The idle pause
@@ -470,11 +475,11 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
             break;
         }
         loop_pass(rt, ctx);
-        let (listening, timers, extra_work, fetch_active, tls_active) = loop_liveness(rt, ctx);
-        if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 && tls_active == 0 {
+        let (listening, timers, extra_work, fetch_active, tls_active, ws_active) = loop_liveness(rt, ctx);
+        if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 && tls_active == 0 && ws_active == 0 {
             break;
         }
-        if !has_http && listening == 0 && timers <= 0 && fetch_active == 0 && tls_active == 0 {
+        if !has_http && listening == 0 && timers <= 0 && fetch_active == 0 && tls_active == 0 && ws_active == 0 {
             break;
         }
         if started.elapsed().as_secs() > 3600 {
@@ -555,6 +560,10 @@ fn main() {
         // Phase 8A: global fetch()/Headers/Request/Response/AbortController/AbortSignal/
         // ReadableStream (+ URLSearchParams when absent) built on cz-net's sync worker engine.
         cz_modules::install_fetch(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 11: global WHATWG URL (Rust-parsed record + live searchParams) and the RFC 6455
+        // WebSocket client (`ws://` + `wss://`) driven by cz-net's worker engine.
+        cz_modules::install_url(&ctx).map_err(|e| format!("{e}"))?;
+        cz_modules::install_ws(&ctx).map_err(|e| format!("{e}"))?;
         // Phase 9A: globalThis.process (env/argv/cwd/exit/platform/arch) so cloud REST clients
         // can read AWS_ENDPOINT_URL & friends; full std::env::args() keeps script CLI args live.
         cz_modules::install_process(&ctx, &args).map_err(|e| format!("{e}"))?;
