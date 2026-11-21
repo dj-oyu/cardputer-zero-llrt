@@ -17,9 +17,10 @@ pub const LAZY_THRESHOLD_BYTES: usize = 4096;
 /// A Copy-on-Write member edit: `Some(val)` = set/add, `None` = delete (tombstone).
 type Edit = Vec<(String, Option<Val<'static>>)>;
 
-/// A live Lazy document: shared raw bytes + tape arena + sparse CoW edits.
+/// A live Lazy document: shared immutable `Arc<TapeDoc>` (raw bytes + tape arena) + independent
+/// sparse CoW edit overlay. Forking shares `Arc<TapeDoc>` in O(1) with isolated versioned edits.
 pub struct LazyDoc {
-    pub tape: TapeDoc,
+    pub tape: Arc<TapeDoc>,
     /// Registry id assigned by [`register`] (`u32::MAX` before registration); child handles need
     /// it so nested Lazy proxies can address the same document.
     pub id: AtomicU32,
@@ -32,13 +33,30 @@ pub struct LazyDoc {
 impl LazyDoc {
     /// Parse strictly and build the Lazy document (no JS objects touched).
     pub fn build(input: &[u8]) -> Result<Arc<Self>, ParseErr> {
-        let tape = TapeDoc::build(input)?;
+        let tape = Arc::new(TapeDoc::build(input)?);
         Ok(Arc::new(Self {
             tape,
             id: AtomicU32::new(u32::MAX),
             dirty: AtomicBool::new(false),
             edits: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    /// O(1) persistent-tree / rope-style CoW fork: shares the immutable `Arc<TapeDoc>` (0 bytes
+    /// copied of raw JSON or TapeNode arena) while isolating all future CoW edits on each version.
+    pub fn fork(&self) -> Arc<Self> {
+        let is_dirty = self.dirty.load(Ordering::SeqCst);
+        let edits = if is_dirty {
+            self.edits.lock().expect("lazy edits lock").clone()
+        } else {
+            BTreeMap::new()
+        };
+        Arc::new(Self {
+            tape: Arc::clone(&self.tape),
+            id: AtomicU32::new(u32::MAX),
+            dirty: AtomicBool::new(is_dirty),
+            edits: Mutex::new(edits),
+        })
     }
 
     #[inline]
@@ -778,6 +796,36 @@ mod lazy_tests {
         drop(d1);
         assert!(crate::lazy::doc(id).is_none());
         assert_eq!(registered_count(), before);
+    }
+
+    #[test]
+    fn fork_shares_tape_in_o1_and_isolates_cow_edits_across_versions() {
+        let d1 = LazyDoc::build(SMALL.as_bytes()).expect("build");
+        let d2 = d1.fork();
+        // Structural sharing: both versions point at the exact same immutable TapeDoc.
+        assert!(Arc::ptr_eq(&d1.tape, &d2.tape));
+        assert!(d1.is_clean() && d2.is_clean());
+
+        // Mutating d1 does not affect d2.
+        d1.set(0, "a", Val::Int(999));
+        assert!(!d1.is_clean() && d2.is_clean());
+        let mut s1 = Vec::new();
+        let mut s2 = Vec::new();
+        d1.serialize(0, &mut s1);
+        d2.serialize(0, &mut s2);
+        assert!(std::str::from_utf8(&s1).unwrap().contains("999"));
+        assert_eq!(std::str::from_utf8(&s2).unwrap(), SMALL);
+
+        // Chained fork from dirty d1 snapshots d1's edits into d3, then diverges cleanly.
+        let d3 = d1.fork();
+        assert!(Arc::ptr_eq(&d1.tape, &d3.tape));
+        d3.set(0, "a", Val::Int(777));
+        let mut s1_after = Vec::new();
+        let mut s3 = Vec::new();
+        d1.serialize(0, &mut s1_after);
+        d3.serialize(0, &mut s3);
+        assert!(std::str::from_utf8(&s1_after).unwrap().contains("999"));
+        assert!(std::str::from_utf8(&s3).unwrap().contains("777"));
     }
 }
 

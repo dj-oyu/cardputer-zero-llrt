@@ -433,6 +433,23 @@ fn make_lazy_handle<'js>(ctx: &Ctx<'js>, doc: std::sync::Arc<LazyDoc>, node: u32
     make.call((id as f64, node as f64, guard))
 }
 
+/// O(1) CoW fork for `structuredClone(lazyProxy)`: if `v` is a `LazyJSON` handle, fork its
+/// `LazyDoc` (sharing the immutable `Arc<TapeDoc>` with an isolated CoW edit overlay) and return
+/// a fresh handle rooted at the same `node`. Returns `Ok(None)` for non-Lazy values.
+pub(crate) fn try_clone_lazy<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Option<Value<'js>>> {
+    let (id, node) = match lazy_tag(ctx, v)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let doc = match cz_json::lazy::doc(id) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let forked = doc.fork();
+    cz_json::lazy::register(&forked);
+    Ok(Some(make_lazy_handle(ctx, forked, node)?))
+}
+
 // ---------------------------------------------------------------------------
 // Value conversion
 // ---------------------------------------------------------------------------

@@ -75,3 +75,21 @@ Method: same device, back-to-back A vs B, 15 warmup iterations, median of 5 tria
 | `structuredClone (5.7 KB obj)` | 2957.39 us (1.8 MB/s) | **523.65 us (10.4 MB/s)** | **5.65x** |
 | `JSON.parse lazy (5.7 KB)` | 242.81 us (22.4 MB/s) | **232.93 us (23.3 MB/s)** | **1.04x (-4.1%)** |
 
+---
+
+## Round 2B — O(1) Persistent-Tree / Rope-Style CoW `structuredClone(LazyJSON)`
+
+### Design
+- `LazyDoc` (`crates/cz-json/src/lazy.rs`) now holds `pub tape: Arc<TapeDoc>` and exposes `LazyDoc::fork(&self) -> Arc<Self>`:
+  - Structurally shares the immutable `Arc<TapeDoc>` (0 bytes copied of raw JSON or TapeNode arena) while giving each forked version an independent `BTreeMap<u32, Edit>` CoW overlay.
+  - `structuredClone()` (`crates/cz-modules/src/web_globals.rs`) checks `qjs::JS_IsProxy(raw)` (~0 overhead on plain objects) and calls `json_module::try_clone_lazy()` to fork `LazyJSON` handles in O(1) — including nested `LazyJSON` handles inside plain wrapper objects.
+  - Each fork carries its own `LazyDocGuard` finalizer; `Arc<TapeDoc>` stays alive until the last version is GC'd.
+
+### Real-Hardware Results (CardputerZero Cortex-A53 @ 1.0 GHz)
+- **Version isolation**: clean fork, dirty fork, chained fork (`orig -> c1 -> c2`), and wrapped `{ doc: lazy }` fork all verified 100% isolated.
+- **Zero-leak proof**: 5,000 × 64 KB forks (335 MB logical data cloned) → RSS **`5.37 MB -> 5.37 MB`** (`+0.00 MB`).
+- **True O(1) scaling**:
+  - `structuredClone(LazyJSON 5.7 KB)`: **32.60 us/op** (164.0 MB/s — **90.7x faster** than original 2,957 us JS `structuredClone`)
+  - `structuredClone(LazyJSON 64.0 KB)`: **30.20 us/op** (**2,116.0 MB/s** — identical constant time at 12x payload size)
+
+

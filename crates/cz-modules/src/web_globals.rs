@@ -97,6 +97,14 @@ fn clone_fast_rec<'js>(
     }
 
     unsafe {
+        // O(1) persistent-tree / rope-style CoW fork for LazyJSON Proxy handles.
+        // Guarded by `JS_IsProxy` so plain non-Proxy objects pay ~0 overhead.
+        if qjs::JS_IsProxy(raw) {
+            if let Some(forked) = crate::json_module::try_clone_lazy(ctx, val)? {
+                seen.insert(ptr_key, forked.clone());
+                return Ok(FastClone::Done(forked));
+            }
+        }
         let is_arr = qjs::JS_IsArray(raw);
         let proto_raw = qjs::JS_GetPrototype(q, raw);
         if qjs::JS_IsException(proto_raw) {
