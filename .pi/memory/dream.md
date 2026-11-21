@@ -2,10 +2,10 @@
 D-detail lives in dream-archive.md (same labels; Phase 11 evidence there).
 
 ### [Principle] D1 — QuickJS TLA settlement: pump jobs BETWEEN scopes
-NeverPromise::finish()(jobspindeadlocksworkerI/O;Context::withRefCellpanic);evaluateWITHOUTfinish,JSsettleflags,pumpI/O+jobsONLYbetweenscopes;promise.into_value()toglue,NEVERRust.then..
+NeverPromise::finish()(jobspindeadlocksworkerI/O+Context::withRefCellpanic);evaluateWITHOUTfinish,JSsettleFLAG,pumpI/O+jobsONLYbetweenScopes;bareawaitinplainctx.eval=SyntaxErr->asyncIIFE.then->__Rflag,drainOUTSIDE..
 
 ### [Dead End] D2 = D20 = D34 — File-edit & sandbox hygiene
-safe.directory needed ONLY when .git owner uid != id -u (stat -c %u .git; earlier runs were owner-matched) | ReadverbatimbeforeeditoldText;sedre-emissionrepair;git-csafe.directory=/workspacepercall;python3absent->node-esplit-countanchors;heredocterminatorALONEonownline;provenon-writeviagitstatusafteranomalies..
+safe.directoryONLYwhen.gitowneruid!=id-u | readverbatimBEFOREoldText;gitstatus-provenon-writeafteranomaly;node-eanchors(py3absent);heredoctermALONEownline | STATEFULjs-fstests:rm(force,recursive)FIRSTpre-clean(append/readdir/EEXISTdrift)..
 
 ### [Principle] D3 — Stage-then-commit beats in-place mutation
 RAIIstagingBEFOREwrites;commitsame-dirtemp+fs::rename;corrupthasheskeepmanifestsbyte-intact;verify-before-extract+sizecaps;ONEstagingpipelinereused..
@@ -17,16 +17,16 @@ CountsdecrementatEVERYterminalpoint;countsINCLUDElisteners->closeserversFIRSTthe
 ..
 
 ### [Insight] D6 = D19 — rquickjs API + zero-copy buffer idioms
-ValuenoDisplay->Coerced::<String>::from_js;globals().setneedsOUTER?;throwException::throw_message/Error::Io(io::Error::other);Canvasas_le_bytescfg(LE)-gatedw/BEfallback;fbmock:parentdirEXISTSelseNotFound..
+ValuenoDisplay->Coerced::<String>::from_js;globals().setneedsOUTER?;throwException::throw_message/Error::Io(io::Error::other);Canvasas_le_bytescfg(LE)-gatedw/BEfallback;fbmock:parentdirEXISTSelseNotFound;Rest<Value>=VARIADICnotRest<Vec>;with(nonResultT)->BARETnounwrap..
 
 ### [Principle] D7 = D8 = D9 — TLS/rustls ground truth
-ProverejectionbyEFFECTS(mTLSalertmayfollowcomplete_ioOk;rejectedhandshakeemitsNODataevent);webpkileaf-as-caCaUsedAsEndEntityPartialEqalwaysfalse->matchDebug;OnceLockroots->CA-envneedsseparatesubprocessesoruncachedserial;end()=Shutdown::Write+keepreading;destroy():latchbeforeshutdown(Both),try_clonewake-slotms..
+ProverejectionbyEFFECTS(mTLSalertmayfollowcomplete_ioOk;rejectedhandshakeemitsNODataevent);webpkileaf-as-caCaUsedAsEndEntity,PartialEqalwaysfalse->matchDebug;end()=Shutdown::Write+keepreading;destroy():latchbeforeshutdown;CA-env/OnceLockarchive..
 
 ### [Insight] D10 — ureq/hyper/dyn-dispatch drift facts
 Box<dynTrait>rebindneedsdelegatingimpl(E0277);handRead/WriteonBoxhitsE0119blanketconflict;manualredirects=max_redirects(0).hyper1Empty<Bytes>/frame();tarrejects'..';semverstrip'^'..;inherentmethodsshadowtraits:callTrait::method(&x)..
 
 ### [Insight] D12 — aws-emulator protocol + SigV4 ground truth
-SQSJSONprotoALWAYSPOSTROOT'/':path-style->QueueDoesNotExist;ConditionalCheckFailed400neverretried.S3path-stylebinaryUint8ArrayOK;errorsJSON__type;BucketNotEmpty409XML;canonicalheadersLOWERCASEkeyselsesilentmessagelessSerializationException..
+SQSJSONprotoALWAYSPOSTROOT'/':pathstyle->QueueDoesNotExist;ConditionalCheckFailed400NEVERretried;S3pathstylebinaryUint8ArrayOK;SigV4canonicalheadersLOWERCASEkeyselseSILENTmessagelessSerializationException(envelopesarchive)..
 
 ### [Dead End] D13 = D17 — cz-js realm gaps + KvStore semantics
 ..
@@ -47,7 +47,7 @@ swashScaleContext+cache(glyph_id,f32bits)FIFOcap256=zero-allocrepeatsONLYwhencac
 ArrayBuffer::new(ctx,Vec<u8>)+TypedArray::from_arraybuffer=ZEROmemcpy;EMPTYVecnullptr->separatenew_copy(&[]);proveJS-owns-buffermutate-viewthenwith_borrowed_bytesre-read;to_cstringborrow->bytesto_vecTHENmove..
 
 ### [Insight] D25 — Native codec inside a borrowed slice + QuickJS view gotc
-JSstringbuiltINSIDEwith_borrowed_byteslegal(alloc!=JSexec;argrootedonstack)->validUTF-8zeroRustStringcopy;newUint8Array(DataView)ARRAY-LIKE->empty,resolveinput.buffer(+byteOffset/byteLength);multibytetotalsneednodeBuffer.byteLengthoracle,neverguess..
+JSstringbuiltINSIDEwith_borrowed_byteslegal(alloc!=JSexec;argrootedonJSstack)->validUTF-8zeroRustStringcopy;views/DataView->resolve.buffer+byteOffset/LINEORnodeBuffer.byteLengthoracleformultibyteTOTALSneverchar-guess..
 
 ### [Principle] D26 — Combined loop-drain scope + rustls config memoization
 ..
@@ -74,7 +74,7 @@ obs-foldin-placevalue-spangrowthMUSTtruncatethejust-emitted`\r\n`BEFORE""+trimel
 ..
 
 ### [Dead End] D37 — `"#` inside an embedded JS shim kills r#"…"# raw strings
-TheURLhashsetter(`s!=="#"`/`"#"+s`)terminatedURL_SHIMearly->cryptic`prefixcustomisunknown`+cascadingparseerrorsinRust,notJS.Rule:anyshimcontaining`#`stringliteralsMUSTuser##"…"##delimiters;greptheshimfor`"#`beforetrustingr#"…"#(fetch/tlsshimspassonlybecausetheynevercontain`#`)...
+URLhash`"#"`terminatedURL_SHIMearly->crypticparseerrinRUSTnotJS.Rule:shimswith`#`stringliteralsMUSTuse##".."##delims;grepshimfor`"#`BEFOREtrustr#".."#..
 
 ### [Principle] D38 — Local protocol test servers MUST drain the peer's Close 
 ..
@@ -84,4 +84,7 @@ TheURLhashsetter(`s!=="#"`/`"#"+s`)terminatedURL_SHIMearly->cryptic`prefixcustom
 
 ### [Principle] D40 = D41 — Shared JS classes: reuse by existence-check + export BY 
 ..
+
+### [Insight] D42 — Body-derived Content-Type lost if header pairs serialize BEFORE normalizeBody
+WireCTundefinedwhilebodybytesOK->nodeechoLOGreq.headersisolatesheader-vs-body;FIXnormalizeBodyFIRSTthenpairs;appliesANYclientpre-snapshotsheadersbeforebodycoercionaddsmeta..
 
