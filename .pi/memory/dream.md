@@ -60,3 +60,9 @@ Anchoring an `edit` insert on D17's BODY line while prepending new sections land
 
 ### [Note] D21 — Convergence hygiene once TARGET MET is locked
 After final commit reaches verifier target with porcelain=0, repeated autonomous/dream nudges get idempotent cheap confirmations (`git status --porcelain | wc -l`, HEAD hash); re-run the full ~20 s suite only when state changed or a fresh observation is demanded. Memory-file commits ride as separate `chore(memory):` commits so perf/docs DONE hashes stay untouched and integrity SHA checks remain green.
+
+### [Insight] D22 — Minimal TrueType fixture field order + cmap delta gotchas
+`glyf` simple-glyph layout requires `endPtsOfContours` BEFORE instruction length/bytecodes — emitting instructions first yields blank rasters (zero coverage); cmap format4 `idDelta` pairs must map each test char to the INTENDED glyf index or rasterization silently lands on the wrong glyph/size. Prove non-blank ink with a standalone alpha-sum probe per glyph BEFORE wiring cache-hit pixel-identity tests (external-oracle discipline, cf. D14/D5). Evidence: exactly these two bugs made hand-rolled cz-gfx fixtures rasterize empty masks until the Phase 10B glyph-cache unit tests were fixed by byte-layout correction.
+
+### [Note] D23 — Dream-checkpoint honesty: never fabricate lessons on no-delta turns
+Between locked-DONE rounds, checkpoint turns carry only maintenance (adjacency scan, cross-checks vs recalled notes); append ONLY evidence-backed entries (D22 came from real fixture debugging), otherwise leave dream.md byte-intact — invented "lessons" poison future vec-recall and cost credibility.
