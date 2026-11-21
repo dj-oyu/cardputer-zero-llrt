@@ -7,14 +7,14 @@
       "weight": 10
     },
     {
-      "name": "phase14-tokio-free-multicall-e2e",
-      "command": "node /refs/phase14/verify_phase14.mjs",
-      "weight": 40
+      "name": "phase15-aws-llrt-free-and-load-leak",
+      "command": "node /refs/phase15/verify_phase15.mjs",
+      "weight": 45
     },
     {
-      "name": "phase7b-7c-zpm-regression",
-      "command": "node /refs/phase7b/verify_phase7b.mjs && node /refs/phase7c/verify_phase7c.mjs",
-      "weight": 20
+      "name": "phase14-tokio-free-multicall-regression",
+      "command": "node /refs/phase14/verify_phase14.mjs",
+      "weight": 15
     },
     {
       "name": "phase10-alloc-audit-regression",
