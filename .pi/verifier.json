@@ -7,19 +7,19 @@
       "weight": 10
     },
     {
-      "name": "phase15-aws-llrt-free-and-load-leak",
-      "command": "node /refs/phase15/verify_phase15.mjs",
+      "name": "phase15b-review-polish-e2e",
+      "command": "node /refs/phase15b/verify_phase15b.mjs",
       "weight": 45
-    },
-    {
-      "name": "phase14-tokio-free-multicall-regression",
-      "command": "node /refs/phase14/verify_phase14.mjs",
-      "weight": 15
     },
     {
       "name": "phase10-alloc-audit-regression",
       "command": "node /refs/phase10/verify_phase10_final.mjs",
       "weight": 20
+    },
+    {
+      "name": "phase15-load-leak-regression",
+      "command": "node /refs/phase15/verify_phase15.mjs",
+      "weight": 15
     },
     {
       "name": "rust-workspace-tests-all",
