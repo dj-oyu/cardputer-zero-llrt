@@ -1,141 +1,89 @@
 ### [Note] Archive
-D-detail lives in dream-archive.md (same labels; Phase 11 evidence there).
+D-detail in dream-archive.md(same labels);P14 detail SPEC_PHASE14 §5-§6+DISCOVERIES H83.
 
-### [Principle] D1 — QuickJS TLA settlement: pump jobs BETWEEN scopes
-NeverPromise::finish()(jobspindeadlocksworkerI/O+Context::withRefCellpanic);evaluateWITHOUTfinish,JSsettleFLAG,pumpI/O+jobsONLYbetweenScopes;bareawaitinplainctx.eval=SyntaxErr->asyncIIFE.then->__Rflag,drainOUTSIDE..
+### [Principle] D1 QuickJS TLA:pump jobs BETWEEN scopes
+No Promise::finish()(jobspin deadlock,withRefCell panic);eval WITHOUT finish,settle FLAG,pump ONLY between Scopes;bare await eval=SyntaxErr->async IIFE.then __Rflag drain OUTSIDE.
 
-### [Dead End] D2 = D20 = D34 — File-edit & sandbox hygiene
-safe.directoryONLYwhen.gitowneruid!=id-u | readverbatimBEFOREoldText;gitstatus-provenon-writeafteranomaly;node-eanchors(py3absent);heredoctermALONEownline | STATEFULjs-fstests:rm(force,recursive)FIRSTpre-clean(append/readdir/EEXISTdrift) | BATCHEDedits:ONEbadliteralROLLSBACKALL->verifyexactglyphs(grep/od)pre-batch..
+### [Dead End] D2=D20=D34 file-edit/sandbox hygiene
+safe.directory EVERY new shell;patch verifier-COPY at FINAL assignment post-listen NOT init+print effective base BEFORE trust(D59).
 
-### [Principle] D3 — Stage-then-commit beats in-place mutation
-RAIIstagingBEFOREwrites;commitsame-dirtemp+fs::rename;verify+sizecapsBEFOREextract;manifestbyte-intactundercorruption..
+### [Principle] D3 stage-then-commit
+RAII staging BEFORE writes;same-dir temp+rename;verify+caps BEFORE extract;manifest byte-intact under corruption.
 
-### [Principle] D4 — Liveness registries: release ALL terminal paths; close s
-CountsdecrementatEVERYterminalpoint;countsINCLUDElisteners->closeserversFIRSTthenpollzero;stop-flagbeforejoin;hang->inspectlive-id/listenerregistry..
+### [Principle] D4 liveness registries
+Release at EVERY terminal point
 
-### [Principle] D5 = D11 = D21 = D23 — Harness discipline: standalone reproduce, verifier trust
-ReproSTANDALONEBEFOREfix;lockedverifier=groundtruthNEVERweakenchecks;re-ground AFTER final edit even docs-only | memoryconsolidationmath:draftADDSfirst,awkLINEBYTES(charcount!=bytes),iterateto<=cap | recall snapshots can lag LIVE dream.md-diffagainstlivebefore"fixing"phantomdrift..
+### [Principle] D5=D11=D21=D23 harness discipline
+Repro STANDALONE before fix;closed D54=D55=D57 duplicate recalls pointer-only).
 
-### [Insight] D6 = D19 — rquickjs API + zero-copy buffer idioms
-ValuenoDisplay->Coerced::<String>::from_js;globals().setneedsOUTER?;throwException::throw_message/Error::Io(io::Error::other);Canvasas_le_bytescfg(LE)-gatedw/BEfallback;fbmock:parentdirEXISTSelseNotFound;Rest<Value>=VARIADICnotRest<Vec>;with(nonResultT)->BARETnounwrap..
+### [Insight] D6=D19 rquickjs API
+Value no Display->Coerced::from_js
 
-### [Principle] D7 = D8 = D9 — TLS/rustls ground truth
-ProverejectionbyEFFECTS(mTLSalertmayfollowcomplete_ioOk;rejectedhandshakeemitsNODataevent);webpkileaf-as-caCaUsedAsEndEntity,PartialEqalwaysfalse->matchDebug;end()=Shutdown::Write+keepreading;destroy():latchbeforeshutdown..
+### [Principle] D7=D8=D9 TLS/rustls ground truth
+rejection by EFFECTS(alert may follow complete_io Ok;destroy latch first..archive.
 
-### [Insight] D10 — ureq/hyper/dyn-dispatch drift facts
-Box<dynTrait>rebind=delegatingimpl(E0277);implRead/WriteonBox=E0119blanketconflict;inherentmethodsSHADOWtraits->callTrait::method(&x)..
+### [Insight] D10 dyn-dispatch drift
+Box<dyn Trait> rebind=delegating impl(E0277);impl Read/Write on Box E0119 blanket;inherent SHADOWS trait methods->call Trait::method(&x) explicitly.
 
-### [Insight] D12 — aws-emulator protocol + SigV4 ground truth
-SQSJSONprotoALWAYSPOSTROOT'/':pathstyle->QueueDoesNotExist;ConditionalCheckFailed400NEVERretried;S3pathstylebinaryUint8ArrayOK;SigV4canonicalheadersLOWERCASEkeyselseSILENTmessagelessSerializationException..
+### [Insight] D12 aws-emulator SigV4
+SQS POST ROOT /;SigV4 headers LOWERCASE else SILENT msgless SerializationException.
 
-### [Dead End] D13 = D17 — cz-js realm gaps + KvStore semantics
-..
+### [Dead End] D13=D17 realm gaps+Kv semantics
+era URL/TextDecoder gap MOOT(P10C/P11);purge INSIDE get/has/keys/stats,count post-read only..archive:30.
 
-### [Insight] D14 = D22 — Oracle discipline + ring/TTF fixture facts
-NodeoraclesBEFOREembeddingvectors/rasters(hand-writtenwerewrong).ringhmac::sign(&Key,data)NOTtag(),digest()->Digest.as_ref().Opt<Value>explicitundefinedseesSome(undefined-value)->is_undefined()..
+### [Insight] D14=D22=D32=D45=D48 oracles BEFORE embedding REAL Node vectors/fixtures
+guesses WRONG repeatedly:base64url fb=="-w",fbfffe=="-__-" unpadded;hex ws skipped,first invalid TERMINATES,odd dangling dropped;utf8 日本語==9 | registries TWO shapes(npm dist-tags vs compact name/version/tarball/integrity):probe REAL fixtures,compact fallback SAME semver+canonical /pkg/-/file,err msg kept,guards both|ring hmac sign(&Key) NOT tag..archive.
 
-### [Dead End] D15 = D35 — cz-json tape zero-span scalars break passthrough
-KIND_BOOL/KIND_NULLspan(0,0)->EMPTYrawslice->passthroughemitsNOTHING->invalidJSON;renderscalarsviataggedtape.scalar();A/BHEAD-vs-PATCHSAMEscriptisolatespre-existingbugs;tempprobeDELETEafter..
+### [Dead End] D15=D35 cz-json zero-span scalars
+zero-span scalars->EMPTY raw slice->emits NOTHING=invalid JSON
 
-### [Principle] D16 — Lazy CoW transparency + non-reentrant edits-mutex recurs
-MaterializeONLYwhileWHOLEdocis_clean()elseProxydetachesnestedwrites;is_cleanfastpathBEFORElocking;under-guardrefsNOTVecclones;DROPMutexGuardBEFORErecursion(samemutexre-lock=DEADLOCK)..
+### [Principle] D16 Lazy CoW+mutex recursion
+materialize only whole-doc clean;DROP guard BEFORE recursion(re-lock=DEADLOCK).
 
-### [Principle] D18 — Font glyph cache: hits and misses blend identically
-swashScaleContext+cache(glyph_id,f32bits)FIFOcap256=zero-allocrepeatsONLYwhencachedANDfreshshareONEblend_alpharoutine;asserthit-vs-freshBYTEequality;derefguardonceperSTRINGnotglyph,re-locksameMutexpanics..
+### [Principle] D18 glyph cache identity blends
+ScaleContext+cache(glyph_id,f32)FIFO256 zero-alloc;hit AND fresh share ONE alpha routine,assert bytes;deref once/STRING not glyph.
 
-### [Principle] D24 — rquickjs Vec->Uint8Array ownership move beats new_copy
-ArrayBuffer::new(ctx,Vec<u8>)+TypedArray::from_arraybuffer=ZEROmemcpy;EMPTYVecnullptr->separatenew_copy(&[]);proveJSownsbuffer:mutateview,re-readviawith_borrowed_bytes..
+### [Principle] D24=D44 typed-array ownership/mutation
+ArrayBuffer::new(ctx,Vec)=ZERO memcpy(empty nullptr->separate new_copy,JS-owns proof=mutate view re-read);double Result ??.archive:96.
 
-### [Insight] D25 — Native codec inside a borrowed slice + QuickJS view gotc
-JSstringbuiltINSIDEwith_borrowed_byteslegal(alloc!=JSexec;argrootedonJSstack)->validUTF-8zeroRustStringcopy;views/DataView->resolve.buffer+byteOffset/LINEORnodeBuffer.byteLengthoracleformultibyteTOTALSneverchar-guess..
+### [Insight] D25 codec in borrowed slice+views
+JS string in borrowed slice legal(rooted,alloc!=exec);views resolve buffer+byteOffset;Node byteLength totals oracle.
 
-### [Principle] D26 — Combined loop-drain scope + rustls config memoization
-..
+### [Principle] D26=D29=D30=D31=D36=D38=D39=D40=D41 engine-wiring family (archive)
+loop-drain scope+rustls memo;accum FLOOR+terminal latch;shared classes existence-check,export BY ref.
 
-### [Insight] D27 — Span-backed head: retract the fold separator first
-obs-foldin-placevalue-spangrowthMUSTretractthejust-emitted`\r\n`BEFOREappendingtrimmedcontinuationelsespanswallowsCRLF;restoresparatoratnextfieldbegin;fixtures=exactbyteoracle..
+### [Insight] D27 obs-fold retract separator first
+retract emitted \r\n BEFORE fold continuation else span eats CRLF;restore next field;byte fixtures.
 
-### [Dead End] D28 = D33 — Structural greps scan raw text; comments trip banned-lit
-/refsstructuralassertsregexRAWfiletext->bannedliteraleveninsideanexplanatorycommentFAILScleancode;rewordw/opattern("noname->valuesmap/novaluevectors");grep-npinpointsfast..
+### [Dead End] D28=D33 structural greps RAW text
+banned literal trips even in COMMENT->reword sans pattern;grep-n fast.
 
-### [Principle] D29 — Linear-cursor + vectored-TX test/wire rules
-..
+### [Dead End] D37 `"#` kills r#"…"# embedded shims
+literal terminates raw string early(cryptic RUST err):##".."## delims;grep first.
 
-### [Principle] D30 — Frame header accumulation: ask EXACTLY what's missing, n
-..
+### [Principle] D43 handshake leftovers to frame loop
+handover coalesced leftovers past terminator(WS upgrade swallowed TEXT+PING->Pong lost,36s->.2s):move resp+head_end,drain cursor first EXACT size,no over-read,persist resets;probe ENTRY eprintln before guess.archive:96.
 
-### [Principle] D31 — Shared-buffer accumulators need a FLOOR + terminal latch
-..
+### [Insight] D42 normalizeBody BEFORE header pairs
+CT undefined w/ body OK;echo-headers isolates;pre-snapshot clients need meta.archive:87.
 
-### [Insight] D32 — Node WHATWG URL oracles repeatedly killed guessed behavi
-..
+### [Insight] D50 multicall dispatch BEFORE init
+dispatch FIRST(no Runtime for zpm/npm paths),node passthrough runtime(argv0 zpm|npm or argv1 zpm);keep standalone cz-zpm bin for release-build verifiers;guard all 4 shapes+None.
 
-### [Principle] D36 — New-engine loop wiring: extend liveness in EVERY consume
-..
+### [Principle] D47 Web-class shims DUAL-SHAPE ctors(engine record vs user init)
+ctor hitting engine-state on user init=>native slot undefined f64 err EVERY route;manual=BUFFERED slot-less id:-1 released:true+resolved;sweep both-shape classes(D47-class).
 
-### [Dead End] D37 — `"#` inside an embedded JS shim kills r#"…"# raw strings
-URLhash`"#"`terminatedURL_SHIMearly->crypticparseerrinRUSTnotJS.Rule:shimswith`#`stringliteralsMUSTuse##".."##delims;grepshimfor`"#`BEFOREtrustr#".."#..
+### [Dead End] D46=D52=D58 spawnSync x in-process server=frozen pump,HOST-only fix
+ALL JS starves:blocked parent shows server Recv-Q CONSTANT full-GET-unread>=5s w/ ESTABLISHED st=01 (TCP-level only,accept never)=>socket existence NEVER proves pump;reopen HOST-only via §5.2 snippet(helper-before-block|async spawn),replica-at-HEAD canonical(ALL PASS byte-exact).NEVER sync-child+same-process server.
 
-### [Principle] D38 — Local protocol test servers MUST drain the peer's Close 
-..
+### [Dead End] D49 ureq feature rustls RE-ADDS webpki-roots even default-features=false
+feature rustls pulls no-provider+_ring+bundled-roots dep=>LOCK gains banned pkg,rg-gates FAIL;use rustls-no-provider+gzip w/ with_parts custom connector;rule:dep-trim rescan LOCK not manifest(cargo tree -e features + rg banned-names exit1) [pattern literal lives D49 body only via docs reword D28-class].
 
-### [Principle] D39 — Builtin module wiring = FOUR registry points + double id
-..
+### [Principle] D51 unpassable-by-design gate protocol prove/document/commit/STOP never tamper
+repro>=2x+ruled-out by class,bypass refused
 
-### [Principle] D40 = D41 — Shared JS classes: reuse by existence-check + export BY 
-..
+### [Insight] D53 boss verifier pins HOST-rotated
+sha256 LIVE pin vs seed BEFORE cp(seeds unapplied till host swap;mismatch=instant FAIL);check active-seed label-set.
 
-### [Insight] D42 — Body-derived Content-Type lost if header pairs serialize BEFORE normalizeBody
-WireCTundefinedwhilebodybytesOK->nodeechoLOGreq.headersisolatesheader-vs-body;FIXnormalizeBodyFIRSTthenpairs;appliesANYclientpre-snapshotsheadersbeforebodycoercionaddsmeta..
-
-### [Principle] D43 — Handshake reader MUST hand COALESCED leftovers to the frame loop
-Head readersPASTterminator MUSThandover leftover ownership:cz-net WSupgrade(512chunk→CRLFCRLF)swallowed SAME-segment TEXT+PING behindhead→auto-Ponglost+workerblocked inblockingread forever(Control drains dead;loopback test hung36s→.2safterFIX);MOVE(resp,head_end=i+4)intorun_frames,draincursor FIRSTvia read_prefetched_or_socket w/EXACT-sizeddst (never over-read next header),cursor persists acrossInFrame resets;probebranch ENTRYw/eprintln BEFOREguessing (silence=upstream swallow not handlerbug);familyD30/D38,verbose detail Phase-13archive..
-
-### [Insight] D44 — rquickjs 0.14 typed-array FFI: mutation routes + double-Result unwrapping
-rquickjs.14:TAsubclass WORKS(class extendsUint8Array,no customctor;setPrototypeOf onrealU8 KEEPSinternal slots⇒wrap native-decodedviews into Buffer-subclass,species slice/subarray already yield subclass);mutate callerbuf ONLY via ArrayBuffer::as_raw()+std::slice::from_raw_parts_mut(NO-JSwhilealias)ORdelegate ENGINE-side:shim target.set(subarrayView,off)=Cmemcpy,overlap-safe,noJSloop(Buffer.copy returnscount);nested with_borrowed_bytes(outer returns inner Result)=>Result<Result<_>> needs ??  ;declared-builtins AUTO-LINK imports inModule::evaluate WITHOUTrt.set_loader(assert globalThis.__FLAG,module eval yields no value)..
-
-### [Note] D45 — Native codec asserts need Node/HTML GROUND-TRUTH vectors, never guessed alphabets
-Guess alphabets WRONG AGAIN(measured):base64url single byte0xfb=="-w" NOT-_!(std"+w==" maps same sextets),[fb,ff,fe]=="-__-" unpadded;Nodehexdecode skips ASCIIws,FIRST invalid char TERMINATES,dangling odd nibble dropped(b"1"→[]);REUSEcrypto_module base64_decode(url_safe flag)+std PADDED encode for"base64",own B64URL_TABLE unpadded=legit NEW(alphabet+padding semantics differ⇒no §duplication violation);hex_encode_fast nibble-table beats crypto per-byte format!;byteLength("日本語","utf8")==9 natively asserted..
-
-### [Note] H84 instant duplicate close vs Phase-14 tree: D13=D17 realm-gap/Kv semantics VALID-as-AUDITED (detail stays archive-pointer :30); era gap "no global URL/TextDecoder" MOOT since P11/P10C globals live, and P14 manual Response/Request constructor fixes were PROBE-PROVEN not theory (flat_probe exit0 20,137B hono + repro /health 200 lazy=true + phase7b[10/10]). NEW measured Dead End armed in SPEC_PHASE14 §5: locked verifier spawnSync x IN-PROCESS server = full event-loop freeze (timers+REQ never run, 30s kill) — implementation-side permanently DEAD; reopen only on host /refs async-spawn/helper fix. Tree 5aefbbf ⇒ valid-as-proven; zero churn.
-
-### [Note] H85 instant duplicate closes R4: D13=D17 already CLOSED H84 (pointer archive :30, valid-as-audited vs 5aefbbf, zero re-grep); D32 URL-oracle discipline SATISFIED-by-measurement for Phase-14 pure-std split_url/join_url + compact-meta canonical /pkg/-/file path (cargo url_helpers test + live flat_probe byte-exact exit0; od-anchored format fixes, no guessed URL shapes). spawnSync freeze class stays host-gated dead (SPEC_PHASE14 §5). Zero churn.
-
-### [Dead End] D46 — Node spawnSync x IN-PROCESS localhost server = TOTAL event-loop freeze, implementation-side permanently dead
-spawnSync blocks ALL JS (timers never fire, REQ handler never runs, child gets ZERO bytes -> verifier-30skill, FAIL independent of client impl); stock Node class measured twice + locked harness stall identical; egress-proxy/SO_REUSEPORT/half-close/warm-keepalive/Expect100 ALL ruled out by probe; env/runtime injection rejected as bypass class. REOPENER(host-only): /refs verifier must serve fixtures from helper SUBPROCESS or async spawn like phase7b/12/13 (SPEC_PHASE14 §5 replica proves impl complete: ALL checks + byte-exact 20,137B hono green). Future gate authors: NEVER pair blocking-sync children with same-process servers.
-
-### [Insight] D47 — Web-class shims need DUAL-SHAPE constructors (engine-state vs manual body/init) or adapters silently break
-Hono/node:http build `new Response(body,init)` directly; internal FetchState branch on manual input -> __czFetchBuffered(undefined) f64 error on EVERY route (/health 500 class). Detection=typeofstate.id==number&&bodyPromise; manual instance gets FULLY BUFFERED slot-less state id:-1 released:TRUE (native slot fns never see -1) + resolved bodyPromise; WinterTC ok=status200-299 semantics. Pair it with Request.prototype text/json/arrayBuffer feeding __czJsonParseBytes(string-or-bytes, Lazy >=4KiB stays true — demo lazy=true proven). Sweep potential: any class accepting BOTH engine records and user init (ws/WebSocket-like) — grep for single-shape ctors.
-
-### [Insight] D48 — Registries ship TWO metadata shapes; probe REAL fixture JSON before assuming parser compat
-Standard npm {dist-tags,versions.v.dist.tarball} vs compact mirror {name,version,tarball,integrity} (phase14 fixture) => old pick_from_meta hard-failed OBSERVED-live first (exit1 metadata-missing-versions), NOT guessed; fallback routes SAME select_version semver + synthesizes dist record, bare filename -> canonical ROOT-relative /{encName}/-/{} (join_url resolves); absolute/rooted passthrough unchanged; malformed keeps classic error message. Guard tests assert both shapes + err paths; byte-exact install via external-helper oracle. Lesson family D32/D45: real-server oracles beat hand-written expectations.
-
-### [Dead End] D49 — ureq feature `rustls` RE-ADDS webpki-roots even with default-features=false
-rustls = rustls-no-provider + _ring + rustls-webpki-roots(dep) => Cargo.lock gains [[package]] webpki-roots and locked rg-gates FAIL (measured baseline); correct set for custom-connector stacks = features=["rustls-no-provider","gzip"] (ureq compiles sans _ring: panic lives ONLY on its default-TLS path we never take via Agent::with_parts(CzConnector)); verify via cargo tree -e features + rg '^name = "(tokio|hyper|webpki-roots)"' exit1. Sweep: any future dep trim claiming zero-roots MUST re-scan LOCK, not just crate Cargo.toml.
-
-### [Insight] D50 — Multicall binary dispatch BEFORE heavyweight init = zero-startup subcommands
-cz-js main() runs cz_zpm::maybe_run_multicall() FIRST (no QuickJS Runtime exists for zpm/npm/cz-js-zpm paths), while node/<script passthrough stays runtime-mode (argv0 basename in {zpm,npm} or argv[1]=="zpm" only); standalone cz-zpm bin KEPT for per-crate release-build verifiers (phase7b/7c findBin). Unit-guard the 4 dispatch shapes incl cz-js+node None-cases; family-D3: keep both bins compiling -D warnings.
-
-### [Note] D51 — Unpassable-by-design locked gate protocol: prove, document, commit, STOP (never tamper)
-spawnSync-freeze blocker handled per playbook: minimal repro twice + ruled-out list (proxy/reuseport/RST/warm/Expect100/env-injection rejected as bypass class), SAME-assertion replica w/ out-of-process helper passes ALL checks (byte-exact artifacts), SPEC Known-Limitations §5 + DISCOVERIES H83 + host-gated reopener D46, blocker committed with evidence trail; honest verify_metrics(NO args) after final edit, no weakening anywhere. Reusable whenever /refs-ro gates collide with measured env semantics.
-
-### [Insight] D52 — Pin event-loop starvation at KERNEL layer via /proc/net/tcp sampling (read-only, decisive)
-During blocking spawnSync x live localhost server: ESTABLISHED(st=01) pair EXISTS at TCP level but SERVER-side txrx Recv-Q stays CONSTANT (measured 0x000000AB=full GET unread for >=5s) => bytes arrived, JS dispatch starved, res.end impossible; ESTABLISHED != accept(), so "socket exists" NEVER proves pump alive. Pair samples with parent log line appended ONLY after spawnSync returns. Family: all prior harness network gates use async spawn (run_e2e_phase2/2_5/3a precedent), spawnSync reserved OFFLINE — never mix sync-spawn + in-process server (D46 reopen condition).
-
-### [Insight] D53 — Boss-round verifier pins are HOST-rotated; verify LIVE pin before any seed cp
-/refs/verify/verifier.sha256 currently == phase-14 seed hash (integrity PASSes on it), while round4 pin (463b17e3…) sits UNAPPLIED in /refs/final_boss/round4/ — copying that seed now would INSTANTLY fail integrity (hash mismatch until host pre-swaps per ROUND4-PREP step 4). ALWAYS sha256sum live pin vs candidate seed BEFORE cp; label-set check: round4 seed expects SIX labels (bench/sweep/js-all-38/threadsafe...), current session runs FIVE-label phase14 set — wrong-gates run must never be accepted as score.
-
-### [Note] D54 instant duplicate closes (checkpoint 3/6 re-issued): D50 self-entry VALID-as-AUDITED vs shipped dispatch order (no re-grep, tree unchanged), D32 already CLOSED pointer-only at H85 (satisfied-by-measurement). NEW reusable hygiene nugget: cite FLAWED-GATE failures by exact source anchor lines (verify_phase14.mjs createServer@82/listen@97/runSync-spawnSync@50/install@132) in STOP handoffs so host patches blind; label-set drift check beats accepting any scored run (FIVE-label current vs SIX-label unapplied round4 seed). No new substantive lessons since D52-D53 otherwise — refusing duplicate bullets = zero churn.
-
-### [Note] D55 instant closes R-again: D13=D17 CLOSED at H84 pointer-only (valid-as-audited), D44 typed-array FFI untouched by Phase-14 surfaces (ignored, no drift); hygiene PROVEN live this turn: integrity PASS + NO .pi/DONE.json while below 100 (stale-sentinel rule honored agent-side too, not just host audit). Zero churn — refusing duplicate bullets.
-
-### [Insight] D56 — Bound registry I/O FAST (shipped §6): ureq 3.5.2 timeout surface + loud knob
-Config exposes timeout_resolve/connect/per_read/per_write/global (read vendored config.rs:761-829 ORACLE, not guessed); cz-zpm ships resolve 5s/connect 10s/per-read 10s default + ZPM_TIMEOUT_MS(1..60000 else CLI error "bad ZPM_TIMEOUT_MS") validated by unit guard (30 tests green). Measured A/B vs listen-but-never-answer server: clean exit1 in ~10.2s default / ~2.6s tuned vs OLD indefinite hang->SIGKILL-null; locked phase14 FAIL tail became INFORMATIVE and check dropped 31.5s->11.8s WITHOUT semantic weakening (score unchanged 60 — assert needs status 0, freeze still blocks it). TRAP caught live: tgz member dist/index.js is a 347-byte re-export FACADE, not the bundled file — hand-picking tar members for byte-compare gives FALSE mismatch scares; compare via real pipeline output or gate assertions only.
-
-### [Note] D57 instant closes (checkpoint-3 re-issue): D13=D17 CLOSED at H84 pointer-only; D44 untouched by Phase-14 surfaces (ignore-with-rationale). Convergence evidence stays canonical via same-assertion replica at HEAD (ALL PASS incl P14_HONO_MULTICALL_OK, byte-exact 20,137B) — no re-prove needed mid-host-gate (D46). Refusing duplicate bullets = zero churn; integrity PASS fresh this turn.
-
-### [Insight] D58 — Gate-precedent scan: ZERO helper/background-server infra exists to reuse legitimately
-grep across /refs/verify/*.sh + all phase .mjs: no bash-backgrounded servers, no pump daemons; network gates ALWAYS use async spawn in-process (run_e2e_phase2/2_5/3a_kv pattern), spawnSync appears ONLY for offline bin calls. So an in-process-server + spawnSync gate (phase14 step3 class) has NO sanctioned workaround channel — host patch only (D46 reopen). Recall re-issues D13=D17 & D44 remain CLOSED/ignore-with-rationale (H84; untouched FFI surfaces); replica-at-HEAD stays canonical convergence evidence while host-gated.
-
-### [Insight] D59 — Replica patch-anchor trap + /tmp volatility (measured this session)
-Harness legitimately WIPES /tmp between perturbations -> diagnostic kit must be rebuildable from SPEC §5.2 snippet; patching a verifier COPY for pump-source experiments must anchor the FINAL assignment after listen (`regBase = `http://...${regSrv.address().port}`;` @~line 98), NOT just init line — overriding init alone got silently overwritten => FALSE FAIL scare ("Peer disconnected" at verifier's own frozen port). Always print effective regBase + live meta probe BEFORE trusting replica output; byte-exact anchors via node includes-check, never sed quoting. Family D2/D32 oracle-first.
+### [Insight] D56 bound registry I/O FAST(shipped)+tar facade trap
+timeouts read vendored ORACLE(Resolve5s/connect10/read10 default;ZPM_TIMEOUT_MS 1..60000 loud-reject,guarded);never-answer exits ~10s/2.6s tuned vs old SIGKILL-null,FAIL tail informative | TRAP tgz facade re-export !=bundle=>hand-picked tar members FALSE mismatch,real pipeline only.
