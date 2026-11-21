@@ -40,5 +40,14 @@ KIND_BOOL/KIND_NULL span (0,0): raw slice EMPTY so serialize passthrough emits N
 ### [Principle] D16 — Lazy CoW transparency + non-reentrant edits-mutex recursion
 Materialize ONLY while WHOLE doc is_clean(), else Proxy handles (dirty doc + materialized GRANDchildren silently detaches nested writes). is_clean() fast-path BEFORE locking; under-guard refs not Vec clones; ONE last-wins view/dirty node; DROP MutexGuard BEFORE recursing or child subtree re-lock deadlocks the same std mutex.
 
+### [Principle] D24 — rquickjs Vec->Uint8Array ownership move beats new_copy
+ArrayBuffer::new(ctx, Vec<u8>) + TypedArray::from_arraybuffer = ZERO memcpy (ManuallyDrop ptr handoff); EMPTY Vec hands a null ptr -> separate new_copy(&[]) branch. Prove JS-owns-the-buffer by mutate-through-view then native re-read via with_borrowed_bytes (ffi-move test). JsString.to_cstring() borrow -> as_str().as_bytes().to_vec() THEN move; Opt<Value> strict flag reads as_ref().and_then(as_bool()).
+
+### [Insight] D25 — Native codec inside a borrowed slice + QuickJS view gotchas
+Building a JS string INSIDE with_borrowed_bytes is legal (alloc != JS exec; the JS arg stays rooted on the stack) so valid UTF-8 needs NO Rust String copy. QuickJS `new Uint8Array(dataView)` treats DataView ARRAY-LIKE -> empty; byteSource must resolve input.buffer for DataView/typed views (byteOffset+byteLength stay relative). Lossy U+FFFD counts differ from hand loops -> measure lengths with node Buffer.byteLength oracle before asserting (never guess multibyte totals).
+
+### [Principle] D26 — Combined loop-drain scope + rustls config memoization
+One ctx.with per pass may chain fetch->tls->httpCloses->http->timers ONLY if jobs pump AFTER the scope; the follow-up rescan MUST SKIP timers (interval fires twice in one iteration) and runner test helpers must bind the glue too (else callbacks silently never run). Cache rustls default ClientConfig in OnceLock ONLY for default opts; CA-env tests use build_client_config_uncached + Arc::ptr_eq under the shared ca_env_lock. Content-Length hint takes &HeaderMap (unit-testable, no Body build); pre-size ONLY when buffer empty else reserve_exact(saturating_sub).
+
 ### [Principle] D18 — Font glyph cache: hits and misses blend identically
 swash ScaleContext + bounded cache (glyph_id,f32 size bits) FIFO cap 256 = zero-alloc repeat draw_text ONLY if cached AND fresh share ONE blend_alpha routine; separate compositing drifts pixels -> pixel-exact E2E fails; assert hit-vs-fresh BYTE equality. &mut *guard deref once per string; re-lock same Mutex panics; one guard per STRING not glyph..
