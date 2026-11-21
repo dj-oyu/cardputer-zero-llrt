@@ -14,7 +14,6 @@
 //! - **No panics** on hostile input.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::io::Write as _;
 
 /// Hard cap on decoded request body bytes (1 MiB) — protects the 512MB CardputerZero.
@@ -81,35 +80,87 @@ pub fn reason_phrase(code: u16) -> &'static str {
     "Unknown"
 }
 
-/// One parsed request head (request line + header fields, names lowercased).
+/// One parsed request head (request line + header fields, names lowercased) held in **one owned
+/// buffer**: `raw` carries the normalized head bytes (method upper-cased, header field names
+/// lower-cased in place, obs-fold continuations folded into the preceding value), and every field
+/// is addressed through byte offset *spans* into that buffer instead of 20–40 independent heap
+/// `String` allocations per request. All accessors borrow `&str` slices — zero allocations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestHead {
-    /// Uppercase method token, e.g. `"GET"`.
-    pub method: String,
-    /// Raw request target including any query string, e.g. `"/api/status?v=1"`.
-    pub target: String,
-    /// HTTP version digits without the `HTTP/` prefix, e.g. `"1.1"`.
-    pub version: String,
-    /// Header fields in wire order with lowercased names.
-    pub headers: Vec<(String, String)>,
+    /// Owned normalized head bytes (always valid UTF-8 by construction).
+    raw: Box<[u8]>,
+    /// `(start, end)` byte span of the uppercase method token inside [`Self::raw`].
+    method_span: (usize, usize),
+    /// `(start, end)` byte span of the raw request target (incl. query string) inside `raw`.
+    target_span: (usize, usize),
+    /// HTTP minor version digit (`0` for `"1.0"`, `1` for `"1.1"`, ...); the parser only accepts
+    /// exactly one ASCII digit.
+    version_minor: u8,
+    /// Header fields in wire order as `(name_span, value_span)` pairs into `raw`; names lowercase.
+    header_spans: Vec<((usize, usize), (usize, usize))>,
 }
 
+/// Static `"1.x"` version strings indexed by the parsed minor digit (borrowed, never rebuilt).
+pub const HTTP_VERSIONS: [&str; 10] = [
+    "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9",
+];
+
 impl RequestHead {
+    /// Borrow a `&str` out of a span. Spans are built exclusively from valid UTF-8 slices, so the
+    /// checked conversion borrows (never allocates); the defensive clamps make hostile offsets
+    /// yield `""` instead of panicking.
+    #[inline]
+    fn span_str(&self, span: (usize, usize)) -> &str {
+        let start = span.0.min(self.raw.len());
+        let end = span.1.min(self.raw.len()).max(start);
+        std::str::from_utf8(&self.raw[start..end]).unwrap_or("")
+    }
+
+    /// Uppercase method token borrowed from `raw`, e.g. `"GET"`.
+    pub fn method(&self) -> &str {
+        self.span_str(self.method_span)
+    }
+
+    /// Raw request target including any query string, borrowed from `raw`.
+    pub fn target(&self) -> &str {
+        self.span_str(self.target_span)
+    }
+
+    /// HTTP version digits without the `HTTP/` prefix as a static string, e.g. `"1.1"`.
+    pub fn version(&self) -> &str {
+        HTTP_VERSIONS
+            .get(self.version_minor as usize)
+            .copied()
+            .unwrap_or("1.1")
+    }
+
+    /// Iterate `(name, value)` pairs in wire order, borrowing directly from `raw` (zero allocs).
+    pub fn headers_iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.header_spans
+            .iter()
+            .map(|(name, value)| (self.span_str(*name), self.span_str(*value)))
+    }
+
+    /// Number of header fields parsed off the wire (duplicate names counted separately).
+    pub fn header_count(&self) -> usize {
+        self.header_spans.len()
+    }
+
     /// Case-insensitive iterator over all values for `name` in wire order (zero allocations).
     pub fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        self.headers
-            .iter()
+        self.headers_iter()
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v)
     }
 
     /// Case-insensitive lookup; duplicate fields are joined with `", "` like Node.js.
     pub fn header(&self, name: &str) -> Option<Cow<'_, str>> {
+        // Inline chain (not via `header_values`) so the yielded values borrow ONLY from `self`,
+        // never from the lookup-name lifetime.
         let mut vals = self
-            .headers
-            .iter()
+            .headers_iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str());
+            .map(|(_, v)| v);
         let first = vals.next()?;
         match vals.next() {
             None => Some(Cow::Borrowed(first)),
@@ -129,7 +180,7 @@ impl RequestHead {
 
     /// True when the request is HTTP/1.0 (default connection semantics differ).
     pub fn is_http10(&self) -> bool {
-        self.version == "1.0"
+        self.version_minor == 0
     }
 
     /// Whether this connection should stay open after the response (HTTP/1.1 default keep-alive,
@@ -253,8 +304,16 @@ enum ChunkPhase {
 /// Incremental HTTP/1.1 request parser. Feed bytes with [`RequestParser::push`] and pull steps
 /// with [`RequestParser::step`]. After a request completes the parser resets automatically so the
 /// same instance keeps serving the connection (keep-alive / pipelining).
+///
+/// Phase 10D: the input lives in a **flat linear `Vec<u8>` plus a `read_pos` cursor** — parsed
+/// bytes are skipped in O(1) instead of drained, and the unread tail is memmoved ONLY when the
+/// buffer empties or an append would exceed capacity. This removes every
+/// `VecDeque::make_contiguous()` wrap-around memmove from the hot path.
 pub struct RequestParser {
-    buf: VecDeque<u8>,
+    /// Flat linear receive buffer (bytes before `read_pos` are already parsed away).
+    buf: Vec<u8>,
+    /// Cursor of the first not-yet-parsed byte inside `buf`.
+    read_pos: usize,
     state: State,
     /// Head parsed from the request currently being assembled (reset once the request completes).
     parsed_head: Option<RequestHead>,
@@ -273,7 +332,8 @@ impl Default for RequestParser {
 impl RequestParser {
     pub fn new() -> Self {
         Self {
-            buf: VecDeque::new(),
+            buf: Vec::new(),
+            read_pos: 0,
             state: State::Head,
             parsed_head: None,
             body: Vec::new(),
@@ -283,19 +343,55 @@ impl RequestParser {
         }
     }
 
-    /// Append raw bytes received from the stream.
+    /// Append raw bytes received from the stream. Compaction of the unread tail happens here and
+    /// ONLY under the two conditions of the linear-cursor rule (buffer fully consumed, or the
+    /// append cannot fit without moving bytes).
     pub fn push(&mut self, data: &[u8]) {
-        self.buf.extend(data.iter().copied());
+        self.compact_for(data.len());
+        self.buf.extend_from_slice(data);
     }
 
     /// Buffered (not yet consumed) byte count.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.read_pos
     }
 
     /// Bytes of request body decoded so far on the current request.
     pub fn body_progress(&self) -> u64 {
         self.body_read
+    }
+
+    #[inline]
+    fn readable(&self) -> &[u8] {
+        &self.buf[self.read_pos..]
+    }
+
+    /// Skip `n` parsed bytes; when everything buffered has been consumed the cursor and buffer
+    /// reset together (free, no memmove).
+    fn consume(&mut self, n: usize) {
+        self.read_pos += n;
+        if self.read_pos == self.buf.len() {
+            self.buf.clear();
+            self.read_pos = 0;
+        }
+    }
+
+    /// Linear-cursor compaction: move the unread tail to offset 0 with `copy_within` ONLY when
+    /// `read_pos > 0` and either `read_pos == buf.len()` or an append of `incoming` bytes would
+    /// exceed capacity. Mid-stream pushes leave bytes untouched in place.
+    fn compact_for(&mut self, incoming: usize) {
+        if self.read_pos == 0 {
+            return;
+        }
+        if self.read_pos == self.buf.len() {
+            self.buf.clear();
+            self.read_pos = 0;
+        } else if self.buf.len() - self.read_pos + incoming > self.buf.capacity() {
+            self.buf.copy_within(self.read_pos.., 0);
+            let kept = self.buf.len() - self.read_pos;
+            self.buf.truncate(kept);
+            self.read_pos = 0;
+        }
     }
 
     /// A sticky fatal error short-circuits every later step (caller must close the connection).
@@ -338,7 +434,7 @@ impl RequestParser {
                     if need == 0 {
                         return self.finish_request();
                     }
-                    let take = std::cmp::min(need as usize, self.buf.len());
+                    let take = std::cmp::min(need as usize, self.buffered());
                     if take == 0 {
                         return Ok(ParseStep::NeedMore);
                     }
@@ -368,12 +464,12 @@ impl RequestParser {
     fn try_head(&mut self) -> Result<Option<State>, HttpError> {
         // Tolerate leading empty lines (some clients send stray CRLFs before a request).
         let skip = {
-            let contig = self.buf.make_contiguous();
+            let r = self.readable();
             let mut n = 0usize;
-            while n < contig.len() {
-                if contig[n] == b'\n' {
+            while n < r.len() {
+                if r[n] == b'\n' {
                     n += 1;
-                } else if contig[n] == b'\r' && n + 1 < contig.len() && contig[n + 1] == b'\n' {
+                } else if r[n] == b'\r' && n + 1 < r.len() && r[n + 1] == b'\n' {
                     n += 2;
                 } else {
                     break;
@@ -382,13 +478,13 @@ impl RequestParser {
             n
         };
         if skip > 0 {
-            self.buf.drain(..skip);
+            self.consume(skip);
         }
 
-        let (end, term_len) = match find_head_terminator(&mut self.buf) {
+        let (end, term_len) = match find_head_terminator(self.readable()) {
             Some(v) => v,
             None => {
-                if self.buf.len() > MAX_HEAD_BYTES {
+                if self.buffered() > MAX_HEAD_BYTES {
                     return Err(HttpError::BadRequest("header section too large".into()));
                 }
                 return Ok(None);
@@ -398,8 +494,8 @@ impl RequestParser {
         if end > MAX_HEAD_BYTES {
             return Err(HttpError::BadRequest("header section too large".into()));
         }
-        let head_res = parse_head_lines(&self.buf.make_contiguous()[..end]);
-        self.buf.drain(..end + term_len);
+        let head_res = parse_head_lines(&self.buf[self.read_pos..self.read_pos + end]);
+        self.consume(end + term_len);
         let head = head_res?;
 
         // Chunked transfer-encoding wins over Content-Length per RFC 9112 / Node.js behavior.
@@ -438,14 +534,10 @@ impl RequestParser {
                 MAX_BODY_BYTES
             )));
         }
-        let (front, back) = self.buf.as_slices();
-        let n1 = take.min(front.len());
-        self.body.extend_from_slice(&front[..n1]);
-        let n2 = take - n1;
-        if n2 > 0 {
-            self.body.extend_from_slice(&back[..n2]);
-        }
-        self.buf.drain(..take);
+        let start = self.read_pos;
+        // The linear buffer's readable slice is contiguous by construction — one copy, no ring.
+        self.body.extend_from_slice(&self.buf[start..start + take]);
+        self.consume(take);
         self.body_read = next;
         Ok(())
     }
@@ -453,23 +545,23 @@ impl RequestParser {
     fn step_chunked(&mut self, phase: ChunkPhase) -> Result<ChunkMove, HttpError> {
         match phase {
             ChunkPhase::SizeLine => {
-                let (line_len, drain_len) = match peek_line_len(&mut self.buf) {
+                let (line_len, drain_len) = match peek_line_len(self.readable()) {
                     Some(v) => v,
                     None => {
-                        if self.buf.len() > MAX_CHUNK_LINE_BYTES {
+                        if self.buffered() > MAX_CHUNK_LINE_BYTES {
                             return Err(HttpError::BadRequest("chunk-size line too long".into()));
                         }
                         return Ok(ChunkMove::NeedMore(ChunkPhase::SizeLine));
                     }
                 };
                 let size_res = {
-                    let line = &self.buf.make_contiguous()[..line_len];
+                    let line = &self.readable()[..line_len];
                     let token = String::from_utf8_lossy(line);
                     let hex = token.split(';').next().unwrap_or("").trim();
                     u64::from_str_radix(hex, 16)
                         .map_err(|_| HttpError::BadRequest(format!("invalid chunk size {hex:?}")))
                 };
-                self.buf.drain(..drain_len);
+                self.consume(drain_len);
                 let size = size_res?;
                 if self.body_read + size > MAX_BODY_BYTES as u64 {
                     return Err(HttpError::PayloadTooLarge(format!(
@@ -487,7 +579,7 @@ impl RequestParser {
                 if size == 0 {
                     return Ok(ChunkMove::Advanced(ChunkPhase::DataEol));
                 }
-                let take = std::cmp::min(size as usize, self.buf.len());
+                let take = std::cmp::min(size as usize, self.buffered());
                 if take == 0 {
                     return Ok(ChunkMove::NeedMore(ChunkPhase::Data(size)));
                 }
@@ -499,21 +591,21 @@ impl RequestParser {
                     Ok(ChunkMove::Advanced(ChunkPhase::Data(remaining)))
                 }
             }
-            ChunkPhase::DataEol => match peek_line_len(&mut self.buf) {
+            ChunkPhase::DataEol => match peek_line_len(self.readable()) {
                 Some((_, drain_len)) => {
-                    self.buf.drain(..drain_len);
+                    self.consume(drain_len);
                     Ok(ChunkMove::Advanced(ChunkPhase::SizeLine))
                 }
                 None => {
-                    if self.buf.len() > MAX_CHUNK_LINE_BYTES {
+                    if self.buffered() > MAX_CHUNK_LINE_BYTES {
                         return Err(HttpError::BadRequest("chunk framing error: missing CRLF".into()));
                     }
                     Ok(ChunkMove::NeedMore(ChunkPhase::DataEol))
                 }
             },
-            ChunkPhase::Trailers => match peek_line_len(&mut self.buf) {
+            ChunkPhase::Trailers => match peek_line_len(self.readable()) {
                 Some((line_len, drain_len)) => {
-                    self.buf.drain(..drain_len);
+                    self.consume(drain_len);
                     if line_len == 0 {
                         Ok(ChunkMove::Done)
                     } else {
@@ -521,7 +613,7 @@ impl RequestParser {
                     }
                 }
                 None => {
-                    if self.buf.len() > MAX_HEAD_BYTES {
+                    if self.buffered() > MAX_HEAD_BYTES {
                         return Err(HttpError::BadRequest("trailer section too large".into()));
                     }
                     Ok(ChunkMove::NeedMore(ChunkPhase::Trailers))
@@ -558,16 +650,16 @@ enum ChunkMove {
 }
 
 /// Find the end of the header section: either `\r\n\r\n` or bare `\n\n`, whichever comes first.
-/// Returns `(header_block_end_index, terminator_length)`.
+/// Returns `(header_block_end_index, terminator_length)` relative to the given slice.
 ///
 /// Round 3 (Stall #1 kill): instead of two byte-at-a-time `find_subslice` walks over the whole
 /// buffer, one vectorized newline-candidate scan (`scan_newline`) drives exact-local checks at
 /// each `\n`. Matches are discovered in ascending START order (`\n\n` starts at the candidate,
 /// `\r\n\r\n` starts one byte earlier), so the first event reported equals the legacy
 /// `min(crlf_first, lf_first)` with crlf winning a tie. Semantics identical, including the
-/// "pattern must be fully present" rule.
-fn find_head_terminator(buf: &mut VecDeque<u8>) -> Option<(usize, usize)> {
-    let contig = buf.make_contiguous();
+/// "pattern must be fully present" rule. Phase 10D: operates directly on the parser's linear
+/// readable slice — no `make_contiguous()` anywhere.
+fn find_head_terminator(contig: &[u8]) -> Option<(usize, usize)> {
     let n = contig.len();
     let mut p = scan_newline(contig, 0);
     loop {
@@ -686,30 +778,37 @@ fn scan_newline(bytes: &[u8], start: usize) -> Option<usize> {
     }
 }
 
-/// Inspect the next `\r\n` or `\n` terminated line at the front of `buf` without allocating.
-/// Returns `(content_len_without_cr, drain_len_including_lf)` when a full line has arrived.
-fn peek_line_len(buf: &mut VecDeque<u8>) -> Option<(usize, usize)> {
-    let contig = buf.make_contiguous();
+/// Inspect the next `\r\n` or `\n` terminated line at the front of the linear readable slice
+/// without allocating. Returns `(content_len_without_cr, advance_len_including_lf)` when a full
+/// line has arrived.
+fn peek_line_len(contig: &[u8]) -> Option<(usize, usize)> {
     let nl = scan_newline(contig, 0)?;
     let content_len = if nl > 0 && contig[nl - 1] == b'\r' { nl - 1 } else { nl };
     Some((content_len, nl + 1))
 }
 
-/// Remove one header/trailer line (`\r\n` or `\n` terminated) from the front of `buf`.
-/// Returns `None` when the terminator has not arrived yet.
+/// Consume one `\r\n` / `\n` terminated line from a LINEAR cursor (copies it out and advances
+/// `read_pos`; resets when the buffer empties). Mirrors the old VecDeque `take_line` semantics for
+/// the parity fuzz test without memmoving the tail.
 #[cfg(test)]
-fn take_line(buf: &mut VecDeque<u8>) -> Option<Vec<u8>> {
-    let contig = buf.make_contiguous();
-    let nl = scan_newline(contig, 0)?;
-    let mut line: Vec<u8> = contig[..nl].to_vec();
+fn take_line(buf: &mut Vec<u8>, read_pos: &mut usize) -> Option<Vec<u8>> {
+    let nl = scan_newline(&buf[*read_pos..], 0)?;
+    let mut line: Vec<u8> = buf[*read_pos..*read_pos + nl].to_vec();
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    buf.drain(..nl + 1);
+    *read_pos += nl + 1;
+    if *read_pos == buf.len() {
+        buf.clear();
+        *read_pos = 0;
+    }
     Some(line)
 }
 
-/// Parse the request line plus header fields out of raw head bytes.
+/// Parse the request line plus header fields out of raw head bytes into a **span-backed**
+/// [`RequestHead`]: exactly ONE owned normalized buffer is built (method upper-cased, field names
+/// lower-cased in place, obs-fold continuations appended inside the preceding value span) and all
+/// fields are recorded as `(start, end)` spans — no per-field `String` allocations.
 fn parse_head_lines(head_bytes: &[u8]) -> Result<RequestHead, HttpError> {
     let text = String::from_utf8_lossy(head_bytes);
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
@@ -740,24 +839,51 @@ fn parse_head_lines(head_bytes: &[u8]) -> Result<RequestHead, HttpError> {
             "unsupported http version {version_token:?}"
         )));
     }
-    let method = raw_method.to_ascii_uppercase();
-    if method.is_empty() || !method.chars().all(|c| c.is_ascii_graphic()) {
+    // Exactly one ASCII digit at this point (`version_token.len() >= 8` rules out an empty minor).
+    let version_minor = minor.as_bytes()[0] - b'0';
+    let method_upper_ok =
+        !raw_method.is_empty() && raw_method.bytes().all(|b| b.to_ascii_uppercase().is_ascii_graphic());
+    if !method_upper_ok {
         return Err(HttpError::BadRequest("invalid method token".into()));
     }
     if raw_target.is_empty() {
         return Err(HttpError::BadRequest("empty request target".into()));
     }
 
-    let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
+    // One owned buffer for the whole normalized head; spans address each field inside it.
+    let mut raw: Vec<u8> = Vec::with_capacity(head_bytes.len() + 16);
+    let m0 = raw.len();
+    for b in raw_method.bytes() {
+        raw.push(b.to_ascii_uppercase());
+    }
+    let method_span = (m0, raw.len());
+    raw.push(b' ');
+    let t0 = raw.len();
+    raw.extend_from_slice(raw_target.as_bytes());
+    let target_span = (t0, raw.len());
+    raw.push(b' ');
+    raw.extend_from_slice(b"HTTP/1.");
+    raw.push(minor.as_bytes()[0]);
+    raw.extend_from_slice(b"\r\n");
+
+    let mut header_spans: Vec<((usize, usize), (usize, usize))> = Vec::with_capacity(16);
     for line in lines {
         if line.is_empty() {
             break;
         }
-        // Obs-fold continuation lines (starting with space/tab) are appended to the last value.
+        // Obs-fold continuation lines (starting with space/tab) are appended to the last value —
+        // INSIDE `raw`, extending that span so lookups still borrow a single contiguous slice.
         if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(last) = headers.last_mut() {
-                last.1.push(' ');
-                last.1.push_str(line.trim());
+            if let Some(last) = header_spans.last_mut() {
+                // Fold the continuation INTO the previous value span: retract the field's line
+                // separator, then append " " + trimmed continuation so lookups still borrow one
+                // contiguous slice (byte-for-byte the legacy `" " + trim` join semantics).
+                if raw.ends_with(b"\r\n") {
+                    raw.truncate(raw.len() - 2);
+                }
+                raw.push(b' ');
+                raw.extend_from_slice(line.trim().as_bytes());
+                last.1.1 = raw.len();
                 continue;
             }
             return Err(HttpError::BadRequest("header continuation without field".into()));
@@ -765,23 +891,35 @@ fn parse_head_lines(head_bytes: &[u8]) -> Result<RequestHead, HttpError> {
         let idx = line
             .find(':')
             .ok_or_else(|| HttpError::BadRequest(format!("invalid header field {line:?}")))?;
-        let name = line[..idx].trim().to_ascii_lowercase();
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_graphic() && c != ':') {
+        let name = line[..idx].trim();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic() && b != b':') {
             return Err(HttpError::BadRequest(format!("invalid header name {line:?}")));
         }
-        let value = line[idx + 1..].trim().to_string();
-        headers.push((name, value));
+        let value = line[idx + 1..].trim();
+        // Restore a missing line separator after a preceding obs-fold so `raw` stays a cleanly
+        // normalized head; normal fields already end on "\r\n".
+        if !raw.is_empty() && !raw.ends_with(b"\r\n") {
+            raw.extend_from_slice(b"\r\n");
+        }
+        let n0 = raw.len();
+        for b in name.bytes() {
+            raw.push(b.to_ascii_lowercase());
+        }
+        let name_span = (n0, raw.len());
+        raw.extend_from_slice(b": ");
+        let v0 = raw.len();
+        raw.extend_from_slice(value.as_bytes());
+        let value_span = (v0, raw.len());
+        raw.extend_from_slice(b"\r\n");
+        header_spans.push((name_span, value_span));
     }
 
-    let mut version = String::with_capacity(2 + minor.len());
-    version.push_str("1.");
-    version.push_str(minor);
-
     Ok(RequestHead {
-        method,
-        target: raw_target.to_string(),
-        version,
-        headers,
+        raw: raw.into_boxed_slice(),
+        method_span,
+        target_span,
+        version_minor,
+        header_spans,
     })
 }
 
@@ -851,9 +989,38 @@ fn write_filtered_headers(
     has_len
 }
 
+/// Serialize **only** the status line + headers into a caller-owned reusable `out` buffer (the
+/// Phase 10D zero-body-copy TX path): the response body is never copied here — `body_len` only
+/// drives the auto `Content-Length`. `out` is cleared first, so a long-lived connection can reuse
+/// one scratch allocation across Keep-Alive responses. Reserved/duplicate header skip rules are
+/// identical to [`serialize_response`].
+pub fn serialize_response_head_into(
+    out: &mut Vec<u8>,
+    status: u16,
+    reason: Option<&str>,
+    headers: &[(String, String)],
+    body_len: usize,
+    keep_alive: bool,
+) {
+    let phrase = reason.unwrap_or_else(|| reason_phrase(status));
+    out.clear();
+    out.reserve(64 + headers.len() * 40);
+    let _ = write!(out, "HTTP/1.1 {status} {phrase}\r\n");
+    let has_len = write_filtered_headers(out, headers, false);
+    if !has_len {
+        let _ = write!(out, "Content-Length: {}\r\n", body_len);
+    }
+    out.extend_from_slice(if keep_alive {
+        b"Connection: keep-alive\r\n\r\n"
+    } else {
+        b"Connection: close\r\n\r\n"
+    });
+}
+
 /// Serialize a complete HTTP/1.1 response. `Content-Length` is added when absent and any
 /// caller-supplied `Connection` / duplicated reserved headers are dropped in favor of the engine
-/// decision (`Connection: keep-alive` or `Connection: close`).
+/// decision (`Connection: keep-alive` or `Connection: close`). Delegates the head to
+/// [`serialize_response_head_into`] then appends the body once.
 pub fn serialize_response(
     status: u16,
     reason: Option<&str>,
@@ -861,21 +1028,8 @@ pub fn serialize_response(
     body: &[u8],
     keep_alive: bool,
 ) -> Vec<u8> {
-    let phrase = reason.unwrap_or_else(|| reason_phrase(status));
-    // H23 (semantics-identical): exact-capacity reserve and direct byte emission instead of a
-    // format! allocation per line. Dedup/skip rules are byte-for-byte the original logic.
     let mut out: Vec<u8> = Vec::with_capacity(64 + headers.len() * 40 + body.len());
-    let _ = write!(out, "HTTP/1.1 {status} {phrase}\r\n");
-
-    let has_len = write_filtered_headers(&mut out, headers, false);
-    if !has_len {
-        let _ = write!(out, "Content-Length: {}\r\n", body.len());
-    }
-    out.extend_from_slice(if keep_alive {
-        b"Connection: keep-alive\r\n\r\n"
-    } else {
-        b"Connection: close\r\n\r\n"
-    });
+    serialize_response_head_into(&mut out, status, reason, headers, body.len(), keep_alive);
     out.extend_from_slice(body);
     out
 }
@@ -1004,9 +1158,11 @@ mod http_tests {
     }
 
     #[test]
-    fn head_terminator_and_take_line_match_legacy_on_wrapped_buffers() {
-        // Deterministic fuzz: every pattern class, compared against the legacy two-subsearch
-        // algorithm, including VecDeque states whose data wraps (non-contiguous ring layout).
+    fn head_terminator_and_take_line_match_legacy_on_linear_buffers() {
+        // Deterministic fuzz for the Phase 10D LINEAR cursor: every pattern class compared
+        // against the legacy two-subsearch algorithm — both on full buffers and on partially
+        // consumed cursors whose unread tail was compacted with `copy_within` (the VecDeque ring
+        // layout is gone; readable slices are contiguous by construction).
         let mut s = 0xC0FFEE11u32;
         for trial in 0..240usize {
             s ^= s << 13;
@@ -1027,32 +1183,43 @@ mod http_tests {
                 }
             }
             let want = legacy_head_terminator(&data);
-            // Force a wrapped ring layout on odd trials: push, drain a prefix, push the rest,
-            // then compare BOTH implementations on the same logical queue content.
-            let mut q = VecDeque::with_capacity(16);
             if trial % 2 == 1 && data.len() > 10 {
-                q.extend(data[..6].iter().copied());
-                q.drain(..4);
-                q.extend(data[6..].iter().copied());
-                let lin = q.make_contiguous().to_vec();
-                assert_eq!(find_head_terminator(&mut q), legacy_head_terminator(&lin), "wrapped terminator mismatch trial={trial}");
+                // Simulate a consumed prefix, then compact the unread tail to offset 0.
+                let mut buf: Vec<u8> = Vec::with_capacity(16);
+                buf.extend_from_slice(&data);
+                buf.copy_within(4.., 0);
+                buf.truncate(buf.len() - 4);
+                assert_eq!(find_head_terminator(&buf), legacy_head_terminator(&data[4..]),
+                    "compacted-tail terminator mismatch trial={trial}");
                 continue;
-            } else {
-                q.extend(data.iter().copied());
             }
-            assert_eq!(find_head_terminator(&mut q), want, "terminator mismatch trial={trial}");
-            // take_line parity over the first line of the same buffer state.
-            let mut q2 = VecDeque::<u8>::with_capacity(16);
-            q2.extend(data.iter().copied());
-            let nl_ref = data.iter().position(|b| *b == b'\n');
-            let got = take_line(&mut q2);
-            match nl_ref {
-                Some(nl) => {
-                    let line = &data[..nl];
-                    let expect = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
-                    assert_eq!(got.as_deref(), Some(expect), "take_line mismatch trial={trial}");
+            assert_eq!(find_head_terminator(&data), want, "terminator mismatch trial={trial}");
+            // take_line parity over the first line at several cursor offsets (no memmove).
+            for shift in [0usize, 1, 3] {
+                if shift > data.len() {
+                    continue;
                 }
-                None => assert_eq!(got, None, "take_line must be None trial={trial}"),
+                let mut b2 = data.clone();
+                let mut p2 = shift;
+                if p2 == b2.len() {
+                    b2.clear();
+                    p2 = 0;
+                }
+                let nl_ref = data[shift..].iter().position(|b| *b == b'\n');
+                let got = take_line(&mut b2, &mut p2);
+                match nl_ref {
+                    Some(nl) => {
+                        let line = &data[shift..shift + nl];
+                        let expect = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
+                        assert_eq!(got.as_deref(), Some(expect), "take_line mismatch trial={trial} shift={shift}");
+                        if shift + nl + 1 == data.len() && !data.is_empty() {
+                            assert_eq!((b2.len(), p2), (0, 0), "full line consumed must reset");
+                        } else {
+                            assert_eq!(p2, shift + nl + 1, "cursor advance mismatch trial={trial} shift={shift}");
+                        }
+                    }
+                    None => assert_eq!(got, None, "take_line must be None trial={trial} shift={shift}"),
+                }
             }
         }
     }
@@ -1063,15 +1230,16 @@ mod http_tests {
             "GET /api/status?v=1&src=tailscale HTTP/1.1\r\nHost: cz0\r\nX-Test-Client: phone\r\nUser-Agent: curl/8\r\n\r\n",
         )
         .expect("parse");
-        assert_eq!(r.head.method, "GET");
-        assert_eq!(r.head.target, "/api/status?v=1&src=tailscale");
-        assert_eq!(r.head.version, "1.1");
+        assert_eq!(r.head.method(), "GET");
+        assert_eq!(r.head.target(), "/api/status?v=1&src=tailscale");
+        assert_eq!(r.head.version(), "1.1");
         assert_eq!(r.body, Vec::<u8>::new());
         assert_eq!(r.head.header("x-test-client").as_deref(), Some("phone"));
         assert_eq!(r.head.header("X-TEST-CLIENT").as_deref(), Some("phone"));
         assert!(r.keep_alive, "HTTP/1.1 defaults to keep-alive");
-        // Header order preserved and names lowercased on the wire struct.
-        assert_eq!(r.head.headers[0].0, "host");
+        // Header order preserved and names lowercased on the span-backed struct.
+        assert_eq!(r.head.header_count(), 3);
+        assert_eq!(r.head.headers_iter().next().unwrap().0, "host");
     }
 
     #[test]
@@ -1083,7 +1251,7 @@ mod http_tests {
             Ok(ParseStep::Request(r)) => r,
             other => panic!("expected first request, got {other:?}"),
         };
-        assert_eq!(first.head.method, "POST");
+        assert_eq!(first.head.method(), "POST");
         assert_eq!(first.body, b"hello".to_vec());
         assert!(first.keep_alive);
         // Leftover bytes remain buffered: a second sequential request parses (keep-alive).
@@ -1091,7 +1259,7 @@ mod http_tests {
             Ok(ParseStep::Request(r)) => r,
             other => panic!("expected pipelined request, got {other:?}"),
         };
-        assert_eq!(second.head.target, "/next");
+        assert_eq!(second.head.target(), "/next");
         assert!(!second.keep_alive, "Connection: close honored");
         assert_eq!(p.buffered(), 0);
     }
@@ -1102,7 +1270,7 @@ mod http_tests {
         assert!(!a.keep_alive);
         let b = one_request("GET / HTTP/1.0\r\nHost: cz0\r\nConnection: keep-alive\r\n\r\n").expect("parse");
         assert!(b.keep_alive);
-        assert_eq!(b.head.version, "1.0");
+        assert_eq!(b.head.version(), "1.0");
     }
 
     #[test]
@@ -1125,7 +1293,7 @@ mod http_tests {
         assert_eq!(req.body, b"abc123second-chunk-value!".to_vec());
         assert!(req.keep_alive);
         match p.step() {
-            Ok(ParseStep::Request(next)) => assert_eq!(next.head.target, "/after"),
+            Ok(ParseStep::Request(next)) => assert_eq!(next.head.target(), "/after"),
             other => panic!("expected follow-up request after chunked body, got {other:?}"),
         }
     }
@@ -1143,7 +1311,7 @@ mod http_tests {
     #[test]
     fn bare_lf_line_endings_tolerated() {
         let r = one_request("GET /lf HTTP/1.1\nHost: cz0\nContent-Length: 2\n\nhi").expect("bare lf parse");
-        assert_eq!(r.head.target, "/lf");
+        assert_eq!(r.head.target(), "/lf");
         assert_eq!(r.body, b"hi".to_vec());
     }
 
@@ -1260,7 +1428,7 @@ mod http_tests {
         p.push(b"data");
         match p.step().unwrap() {
             ParseStep::Request(r) => {
-                assert_eq!(r.head.method, "PUT");
+                assert_eq!(r.head.method(), "PUT");
                 assert_eq!(r.body, b"data".to_vec());
             }
             other => panic!("expected request after continue, got {other:?}"),
@@ -1440,6 +1608,135 @@ mod http_tests {
         assert_eq!(got[0].body, b"xyz".to_vec());
         assert_eq!(got[1].body, b"hello".to_vec());
         assert!(!got[1].keep_alive);
+    }
+
+    #[test]
+    fn span_backed_head_accessors_borrow_from_one_owned_buffer() {
+        let r = one_request(
+            "post /spans?q=1 HTTP/1.1\r\nMixed-Case: Alpha\r\nhost: cz0\r\nEmpty:\r\n\r\n",
+        )
+        .expect("span head parse");
+        assert_eq!(r.head.method(), "POST");
+        assert_eq!(r.head.target(), "/spans?q=1");
+        assert_eq!(r.head.version(), "1.1");
+        assert_eq!(r.head.header_count(), 3);
+        let pairs: Vec<(&str, &str)> = r.head.headers_iter().collect();
+        assert_eq!(pairs, vec![("mixed-case", "Alpha"), ("host", "cz0"), ("empty", "")]);
+        // Lookups borrow straight out of the single owned buffer (zero allocation).
+        assert!(matches!(r.head.header("MiXeD-Case"), Some(Cow::Borrowed("Alpha"))));
+        assert!(matches!(r.head.header("EMPTY"), Some(Cow::Borrowed(""))));
+        assert!(r.head.header("absent").is_none());
+        // `raw` holds the whole normalized head: upper-cased method + lowercased field names.
+        let raw_text = std::str::from_utf8(&r.head.raw).expect("normalized head is valid utf8");
+        assert!(raw_text.starts_with("POST /spans?q=1 HTTP/1.1\r\n"), "raw={raw_text:?}");
+        assert!(raw_text.contains("mixed-case: Alpha\r\n"), "raw={raw_text:?}");
+    }
+
+    #[test]
+    fn obs_fold_continuations_normalize_into_a_single_value_span() {
+        let r = one_request(
+            "GET /fold HTTP/1.1\r\nX-Long: one\r\n\tfolded\r\n  deeper\r\nHost: cz0\r\n\r\n",
+        )
+        .expect("multi fold parse");
+        // Both continuations live INSIDE the previous value span -> one borrowed &str, no join.
+        assert_eq!(r.head.header_count(), 2);
+        assert!(matches!(r.head.header("x-long"), Some(Cow::Borrowed("one folded deeper"))));
+        let vals: Vec<&str> = r.head.header_values("X-LONG").collect();
+        assert_eq!(vals, vec!["one folded deeper"]);
+    }
+
+    #[test]
+    fn cursor_compaction_fires_only_on_full_drain_or_capacity_pressure() {
+        // Linear-cursor rule (explicit 32-byte capacity so the outcomes are deterministic):
+        // * mid-buffer append that fits  -> bytes stay exactly where they are;
+        // * append that cannot fit       -> unread tail memmoves to offset 0;
+        // * everything consumed          -> cursor + buffer reset with NO memmove.
+        let mut p = RequestParser::new();
+        p.buf = Vec::with_capacity(32);
+        p.buf.extend_from_slice(b"0123456789");
+        p.read_pos = 4;
+        p.compact_for(1); // spare capacity available -> untouched
+        assert_eq!(p.read_pos, 4);
+        assert_eq!(p.readable(), b"456789");
+        assert_eq!(&p.buf[..], b"0123456789", "no premature memmove");
+        p.compact_for(64); // this append genuinely cannot fit without moving -> compact
+        assert_eq!(p.read_pos, 0);
+        assert_eq!(&p.buf[..], b"456789");
+        // Full drain resets without any memmove at all.
+        p.read_pos = p.buf.len();
+        p.compact_for(1);
+        assert_eq!((p.buf.len(), p.read_pos), (0, 0));
+    }
+
+    #[test]
+    fn linear_cursor_serves_pipelined_keepalive_requests_across_split_pushes() {
+        // Stray leading CRLFs, one request parsed completely while a pipelined follow-up is only
+        // partially buffered, then that follow-up fed in small chunks: the cursor skips parsed
+        // bytes in place (no drain memmove) and stays coherent across compactions.
+        let mut p = RequestParser::new();
+        p.push(b"\r\n\r\nGET /a HTTP/1.1\r\nHost: cz0\r\nContent-Length: 3\r\n\r\nabc\r\nPOST /b HTT");
+        let first = match p.step() {
+            Ok(ParseStep::Request(r)) => r,
+            other => panic!("expected first request, got {other:?}"),
+        };
+        assert_eq!(first.head.method(), "GET");
+        assert_eq!(first.body, b"abc".to_vec());
+        assert!(first.keep_alive);
+        // The pipelined remnant (13 bytes) stays parked AFTER the cursor:
+        assert_eq!(p.buffered(), 13, "partial second request still unparsed");
+        assert_eq!(p.read_pos, p.buf.len() - 13, "cursor skipped parsed bytes in place");
+        assert!(p.read_pos > 0, "parsed prefix is skipped, not drained");
+
+        let rest = "P/1.1\r\nHost: cz0\r\nContent-Length: 4\r\nConnection: close\r\n\r\nxyzw";
+        let mut second = None;
+        for chunk in rest.as_bytes().chunks(7) {
+            p.push(chunk);
+            loop {
+                match p.step() {
+                    Ok(ParseStep::NeedMore) => break,
+                    Ok(ParseStep::InterimContinue) => {}
+                    Ok(ParseStep::Request(r)) => second = Some(r),
+                    Err(e) => panic!("pipelined linear-cursor parse failed: {e}"),
+                }
+            }
+        }
+        let r2 = second.expect("second keep-alive request parsed");
+        assert_eq!(r2.head.target(), "/b");
+        assert_eq!(r2.head.method(), "POST");
+        assert_eq!(r2.body, b"xyzw".to_vec());
+        assert!(!r2.keep_alive, "Connection: close honored");
+        assert_eq!((p.buf.len(), p.read_pos), (0, 0), "full drain resets cursor + buffer");
+    }
+
+    #[test]
+    fn serialize_response_head_into_is_body_free_reusable_and_serialize_response_delegates() {
+        let headers = vec![("Content-Type".into(), "application/json".into())];
+        let mut scratch: Vec<u8> = Vec::with_capacity(4096);
+        scratch.extend_from_slice(b"STALE GARBAGE FROM A PREVIOUS RESPONSE");
+        let cap_before = scratch.capacity();
+        serialize_response_head_into(&mut scratch, 201, None, &headers, 11, true);
+        let text = String::from_utf8(scratch.clone()).expect("head utf8");
+        assert!(text.starts_with("HTTP/1.1 201 Created\r\n"), "{text:?}");
+        assert!(text.contains("Content-Type: application/json\r\n"));
+        assert!(text.contains("Content-Length: 11\r\n"), "length reflects body_len arg");
+        assert!(text.ends_with("Connection: keep-alive\r\n\r\n"), "{text:?}");
+        assert!(!text.contains("STALE"), "reused buffer must be cleared first: {text:?}");
+
+        // Reuse across Keep-Alive responses keeps the allocation (no shrink).
+        serialize_response_head_into(&mut scratch, 404, Some("Nope"), &[], 0, false);
+        assert_eq!(scratch.capacity(), cap_before, "buffer reuse must not reallocate");
+        let again = String::from_utf8(scratch.clone()).unwrap();
+        assert!(again.starts_with("HTTP/1.1 404 Nope\r\n"));
+        assert!(again.contains("Content-Length: 0\r\n"));
+        assert!(again.ends_with("Connection: close\r\n\r\n"));
+
+        // The body NEVER appears in the head serialization; serialize_response delegates: exact
+        // head bytes + body appended byte-for-byte.
+        let full = serialize_response(201, None, &headers, b"{\"ok\":true}", true);
+        serialize_response_head_into(&mut scratch, 201, None, &headers, 11, true);
+        let mut want = scratch.clone();
+        want.extend_from_slice(b"{\"ok\":true}");
+        assert_eq!(full, want, "serialize_response must equal head_into + body");
     }
 
 }

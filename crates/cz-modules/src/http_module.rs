@@ -22,8 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use rquickjs::{
-    convert::Coerced, Array, Ctx, Exception, FromJs, Function, Object, Result, String as JsString,
-    TypedArray, Value,
+    convert::Coerced, function::Opt, Array, Ctx, Exception, FromJs, Function, Object, Result,
+    String as JsString, TypedArray, Value,
 };
 
 use cz_hal::http::STATUS_CODES;
@@ -31,6 +31,7 @@ use cz_hal::http_server::{
     client_closed, take_disconnect_events, ConnectionEvent, Listener, ReplyFrame, ReplySender,
     ResponseAction,
 };
+use crate::vec_to_uint8array;
 
 /// Node.js-compatible HTTP methods exposed by the module.
 pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -279,7 +280,9 @@ const HTTP_SHIM: &str = r#"
             this.connection = desc.socket;
             this._enc = "utf8";
             this._bodyBytes = desc.bodyBytes;
-            this._bodyText = desc.bodyText;
+            // Phase 10D lazy bodyText: undefined = not decoded yet, null = decoded but invalid
+            // UTF-8 (binary payloads keep flowing as Uint8Array exactly like before).
+            this._bodyText = undefined;
             this._connId = desc.connId;
             this._closed = false;
             this._lis = { data: [], end: [], error: [], close: [] };
@@ -304,12 +307,27 @@ const HTTP_SHIM: &str = r#"
 
     function czChunk(req) {
         if (!req._bodyBytes || req._bodyBytes.length === 0) return null;
-        const enc = String(req._enc).toLowerCase();
-        if (enc === "utf8" || enc === "utf-8") {
-            return req._bodyText !== null ? req._bodyText : req._bodyBytes;
-        }
+        const text = czLazyBodyText(req);
         // Text bodies are delivered as strings, binary stays a Uint8Array.
-        return req._bodyText !== null ? req._bodyText : req._bodyBytes;
+        return text !== null ? text : req._bodyBytes;
+    }
+
+    // Lazy UTF-8 decode (Phase 10D): descriptors no longer eagerly decode every request body.
+    // The native `__czUtf8Decode` runs ONLY when a data chunk is actually requested as text
+    // (setEncoding("utf8") paths); strict mode mirrors the previous eager `from_utf8` split:
+    // invalid UTF-8 yields null so raw bytes keep flowing. One cached decode per request.
+    function czLazyBodyText(req) {
+        if (req._bodyText === undefined) {
+            let text = null;
+            try {
+                const fn = globalThis.__czUtf8Decode || globalThis.__czHttpUtf8DecodeStrict;
+                if (typeof fn === "function") text = fn(req._bodyBytes, true);
+            } catch (_e) {
+                text = null; // strict decode failed: payload is binary, deliver bytes
+            }
+            req._bodyText = typeof text === "string" ? text : null;
+        }
+        return req._bodyText;
     }
 
     function czDeliver(req) {
@@ -712,6 +730,36 @@ fn install_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
         })?,
     )?;
 
+    // Lazy `bodyText` needs a native strict UTF-8 decoder even in contexts where the fetch glue
+    // has not installed `__czUtf8Decode` yet (bare-module tests). Register an equivalent helper
+    // under a module-local name ONLY when it is absent; the shim prefers `__czUtf8Decode` itself.
+    // No JS runs while the typed-array slice is borrowed (rquickjs RefCell rule).
+    if ctx.globals().get::<_, Option<Value>>("__czHttpUtf8DecodeStrict")?.is_none() {
+        ctx.globals().set(
+            "__czHttpUtf8DecodeStrict",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, input: Value<'js>, fatal: Opt<Value<'js>>| -> Result<Value<'js>> {
+                    let strict = fatal.0.as_ref().and_then(|v| v.as_bool()).unwrap_or(false);
+                    crate::with_borrowed_bytes(&input, |b| -> Result<Value<'js>> {
+                        match std::str::from_utf8(b) {
+                            Ok(text) => Ok(JsString::from_str(ctx.clone(), text)?.into_value()),
+                            Err(_) if strict => {
+                                Err(Exception::throw_type(&ctx, "The encoded data was not valid for encoding utf-8"))
+                            }
+                            // Lossy mode mirrors Node's default decoder (U+FFFD replacements).
+                            Err(_) => Ok(JsString::from_str(
+                                ctx.clone(),
+                                String::from_utf8_lossy(b).as_ref(),
+                            )?
+                            .into_value()),
+                        }
+                    })?
+                },
+            )?,
+        )?;
+    }
+
     ctx.eval::<(), _>(HTTP_SHIM)?;
     Ok(())
 }
@@ -764,25 +812,31 @@ fn build_descriptor<'js>(ctx: &Ctx<'js>, ev: ConnectionEvent) -> Result<Value<'j
     let obj = Object::new(ctx.clone())?;
     obj.set("serverId", ev.server_id as f64)?;
     obj.set("connId", ev.conn_id as f64)?;
-    obj.set("method", ev.request.head.method.as_str())?;
-    obj.set("url", ev.request.head.target.as_str())?;
-    obj.set("httpVersion", ev.request.head.version.as_str())?;
+    obj.set("method", ev.request.head.method())?;
+    obj.set("url", ev.request.head.target())?;
+    obj.set("httpVersion", ev.request.head.version())?;
 
-    // Header names are lowercased; duplicates joined with ", " exactly like Node.js.
+    // Phase 10D: NO per-request Rust join scaffolding (no name->values map, no value vectors);
+    // the JS `headers` object is built in ONE pass over the borrowed lowercased spans. A
+    // repeated field name appends ", " + value onto the existing JS string exactly like
+    // Node.js; single fields are set directly with zero Rust-side allocations.
     let headers = Object::new(ctx.clone())?;
-    let mut joined: HashMap<String, Vec<String>> = HashMap::new();
-    for (name, value) in &ev.request.head.headers {
-        joined.entry(name.clone()).or_default().push(value.clone());
-    }
-    for (name, values) in joined {
-        headers.set(name.as_str(), values.join(", ").as_str())?;
+    for (name, value) in ev.request.head.headers_iter() {
+        let prev = headers.get::<_, Option<JsString>>(name)?;
+        match prev {
+            None => headers.set(name, value)?,
+            Some(old) => {
+                let joined = format!("{}, {}", old.to_string()?, value);
+                headers.set(name, joined.as_str())?;
+            }
+        }
     }
     obj.set("headers", headers)?;
 
     let socket = Object::new(ctx.clone())?;
-    socket.set("remoteAddress", ev.remote_address.as_str())?;
+    socket.set("remoteAddress", &*ev.remote_address)?;
     socket.set("remotePort", ev.remote_port as f64)?;
-    socket.set("localAddress", ev.local_address.as_str())?;
+    socket.set("localAddress", &*ev.local_address)?;
     socket.set("localPort", ev.local_port as f64)?;
     // Phase 8B: `req.socket.encrypted` — true only for TLS-upgraded connections.
     socket.set("encrypted", ev.encrypted)?;
@@ -790,13 +844,11 @@ fn build_descriptor<'js>(ctx: &Ctx<'js>, ev: ConnectionEvent) -> Result<Value<'j
 
     obj.set("keepAlive", ev.keep_alive)?;
 
-    // Body: always a Uint8Array copy, plus a string form when the payload is valid UTF-8.
-    let bytes = TypedArray::<u8>::new_copy(ctx.clone(), &ev.request.body[..])?;
-    obj.set("bodyBytes", bytes)?;
-    match std::str::from_utf8(&ev.request.body) {
-        Ok(text) => obj.set("bodyText", text)?,
-        Err(_) => obj.set("bodyText", Value::new_null(ctx.clone()))?,
-    }
+    // Phase 10D: the body's ownership MOVES straight into a QuickJS ArrayBuffer-backed
+    // Uint8Array (no second memcpy like the old `TypedArray::new_copy`), and there is NO eager
+    // UTF-8 decode any more: the shim materializes text lazily via native `__czUtf8Decode`
+    // only when a data chunk is requested as a string.
+    obj.set("bodyBytes", vec_to_uint8array(ctx, ev.request.body)?)?;
 
     // Remember this connection's reply channel so res.end() can flush onto the socket.
     registry().replies.lock().expect("replies lock").insert(ev.conn_id, ev.reply);

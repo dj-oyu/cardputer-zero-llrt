@@ -14,7 +14,7 @@
 //! No panics: every socket error is handled by closing that connection only.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,8 +24,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::http::{
-    chunk_frame, error_response, serialize_response, serialize_stream_head, CONTINUE_FRAME,
-    LAST_CHUNK_FRAME, ParsedRequest, RequestParser, ResponseFrame,
+    chunk_frame, error_response, serialize_response, serialize_response_head_into,
+    serialize_stream_head, CONTINUE_FRAME, LAST_CHUNK_FRAME, ParsedRequest, RequestParser,
+    ResponseFrame,
 };
 
 /// Abstract per-connection byte stream: a plain TCP socket OR a TLS-wrapped one.
@@ -379,9 +380,11 @@ pub struct ConnectionEvent {
     pub request: ParsedRequest,
     /// Whether the socket may stay open after the response is written.
     pub keep_alive: bool,
-    pub remote_address: String,
+    /// Phase 10D: per-connection address strings shared through `Arc<str>` — each Keep-Alive
+    /// request clones the refcount instead of copying the whole address text.
+    pub remote_address: Arc<str>,
     pub remote_port: u16,
-    pub local_address: String,
+    pub local_address: Arc<str>,
     pub local_port: u16,
     /// Phase 8B: `true` when this connection was upgraded by a TLS `StreamAcceptor`; the JS glue
     /// surfaces it as `req.socket.encrypted`.
@@ -633,10 +636,15 @@ fn spawn_connection(
             };
             conn.set_nodelay().ok();
             let local = conn.local_addr().unwrap_or(peer);
-            let remote_ip = peer.ip().to_string();
-            let local_ip = local.ip().to_string();
+            // Phase 10D: resolve the addresses ONCE per connection; every Keep-Alive request
+            // clones these `Arc<str>` refcounts instead of allocating a fresh String.
+            let remote_ip: Arc<str> = peer.ip().to_string().into();
+            let local_ip: Arc<str> = local.ip().to_string().into();
             let mut parser = RequestParser::new();
             let mut buf = [0u8; READ_CHUNK];
+            // Reusable response-head scratch (Phase 10D): the formatted head lives here and goes
+            // onto the wire together with the body via vectored writes — no combined copy.
+            let mut tx_head_buf: Vec<u8> = Vec::with_capacity(512);
             loop {
                 // Drive the parser until one complete request (or a protocol failure) is reached.
                 let req: ParsedRequest = loop {
@@ -702,8 +710,19 @@ fn spawn_connection(
                             deadline = Instant::now() + reply_timeout;
                             match action {
                                 ResponseAction::Buffered(frame) => {
-                                    let bytes = frame.encode();
-                                    if write_all_eof_free(&mut conn, &bytes).is_err() {
+                                    // Zero-body-copy TX (Phase 10D): format ONLY the head into the
+                                    // reusable scratch, then send head + body as one frame.
+                                    serialize_response_head_into(
+                                        &mut tx_head_buf,
+                                        frame.status,
+                                        frame.reason.as_deref(),
+                                        &frame.headers,
+                                        frame.body.len(),
+                                        frame.keep_alive,
+                                    );
+                                    if write_all_vectored_eof_free(&mut conn, &tx_head_buf, &frame.body)
+                                        .is_err()
+                                    {
                                         mark_client_closed(conn_id);
                                         conn.shutdown_both();
                                         return;
@@ -828,6 +847,43 @@ fn write_all_eof_free(stream: &mut dyn ConnStream, bytes: &[u8]) -> std::io::Res
             Err(e) => return Err(e),
         }
     }
+    stream.flush()
+}
+
+/// Write `head` + `body` onto the stream as ONE logical response frame WITHOUT materializing a
+/// combined `head + body` buffer: plain TCP coalesces both slices into a single `writev` syscall
+/// through `IoSlice`, while TLS sessions fall back to sequential writes via std's default
+/// `write_vectored` — zero memcpy of the response body either way. A global byte offset maps
+/// retries exactly onto the (head, body) pair, and once the head is fully flushed the remainder
+/// travels as a single plain write (no leading zero-length vectored element). Wire bytes and the
+/// final flush are identical to the previous `encode()` + `write_all_eof_free()` path.
+fn write_all_vectored_eof_free(
+    stream: &mut dyn ConnStream,
+    head: &[u8],
+    body: &[u8],
+) -> std::io::Result<()> {
+    let total = head.len() + body.len();
+    let mut off = 0usize;
+    while off < total {
+        let n = if off < head.len() {
+            match stream.write_vectored(&[IoSlice::new(&head[off..]), IoSlice::new(body)]) {
+                Ok(v) => v,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        } else {
+            match stream.write(&body[off - head.len()..]) {
+                Ok(v) => v,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(ErrorKind::BrokenPipe, "socket closed"));
+        }
+        off += n;
+    }
+    // One flush for the whole frame (identical wire semantics to the old combined write).
     stream.flush()
 }
 
@@ -984,8 +1040,8 @@ mod server_tests {
         let consumer = std::thread::spawn(move || {
             let ev = rx.recv_timeout(Duration::from_secs(5)).expect("event");
             assert_eq!(ev.server_id, 7);
-            assert_eq!(ev.request.head.method, "GET");
-            assert_eq!(ev.request.head.target, "/tail");
+            assert_eq!(ev.request.head.method(), "GET");
+            assert_eq!(ev.request.head.target(), "/tail");
             assert_eq!(ev.request.head.header("x-test").as_deref(), Some("phone"));
             assert!(!ev.remote_address.is_empty());
             assert!(ev.remote_port > 0);
@@ -1029,7 +1085,7 @@ mod server_tests {
                 let ev = rx.recv_timeout(Duration::from_secs(5)).expect("event");
                 ids.push(ev.conn_id);
                 assert_eq!(ev.conn_id, ids[0], "same socket reused -> same conn id");
-                let body = format!("route-{}", ev.request.head.target);
+                let body = format!("route-{}", ev.request.head.target());
                 ev.reply
                     .send(ResponseAction::Buffered(ReplyFrame::new(
                         if i == 0 { 200 } else { 201 },
@@ -1078,7 +1134,7 @@ mod server_tests {
             .write_all(b"GET /alive HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let ev = good.join().unwrap();
-        assert_eq!(ev.request.head.target, "/alive");
+        assert_eq!(ev.request.head.target(), "/alive");
         ev.reply
             .send(ResponseAction::Buffered(ReplyFrame::new(200, b"still-up".to_vec(), false)))
             .unwrap();
@@ -1106,7 +1162,7 @@ mod server_tests {
         fine.set_nodelay(true).ok();
         fine.write_all(b"GET /fine HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
         let ev = second.join().unwrap();
-        assert_eq!(ev.request.head.target, "/fine");
+        assert_eq!(ev.request.head.target(), "/fine");
         ev.reply
             .send(ResponseAction::Buffered(ReplyFrame::new(200, b"fine".to_vec(), false)))
             .unwrap();
@@ -1127,7 +1183,7 @@ mod server_tests {
             loop {
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(ev) => {
-                        let body = format!("hello {}", ev.request.head.target);
+                        let body = format!("hello {}", ev.request.head.target());
                         ev.reply
                             .send(ResponseAction::Buffered(ReplyFrame::new(
                                 200,
@@ -1270,7 +1326,7 @@ mod server_tests {
         let mut listener = spawn_listener("127.0.0.1", 0, 47, tx).expect("bind");
         let consumer = std::thread::spawn(move || {
             let ev = rx.recv_timeout(Duration::from_secs(5)).expect("expect-continue event");
-            assert_eq!(ev.request.head.method, "PUT");
+            assert_eq!(ev.request.head.method(), "PUT");
             assert_eq!(ev.request.body, b"payload-here".to_vec());
             ev.reply
                 .send(ResponseAction::Buffered(ReplyFrame::new(201, b"stored".to_vec(), false)))
@@ -1343,7 +1399,7 @@ mod server_tests {
             ev.reply.send(ResponseAction::StreamEnd { keep_alive: true }).expect("stream end");
             // Keep-alive: the same socket then serves a *buffered* Phase 2 request.
             let stats = rx.recv_timeout(Duration::from_secs(5)).expect("stats request");
-            assert_eq!(stats.request.head.target, "/stats");
+            assert_eq!(stats.request.head.target(), "/stats");
             stats
                 .reply
                 .send(ResponseAction::Buffered(ReplyFrame::new(200, b"done".to_vec(), false)))

@@ -289,8 +289,8 @@ mod https_tests {
         )
         .expect("TLS roundtrip must succeed");
         assert!(ev.encrypted, "TLS connections must report encrypted=true");
-        assert_eq!(ev.request.head.method, "GET");
-        assert_eq!(ev.request.head.target, "/hi");
+        assert_eq!(ev.request.head.method(), "GET");
+        assert_eq!(ev.request.head.target(), "/hi");
         let text = String::from_utf8(resp).expect("response utf-8");
         assert!(text.starts_with("HTTP/1.1 200 OK"), "200 expected: {text:?}");
         assert!(text.contains("tls-pong"), "body expected: {text:?}");
@@ -515,7 +515,7 @@ mod https_tests {
             .expect("req");
         stream.flush().expect("flush");
         let ev = rx.recv_timeout(Duration::from_secs(8)).expect("mTLS event");
-        assert!(ev.encrypted && ev.request.head.target == "/mtls");
+        assert!(ev.encrypted && ev.request.head.target() == "/mtls");
         ev.reply
             .send(ResponseAction::Buffered(ReplyFrame {
                 status: 200,

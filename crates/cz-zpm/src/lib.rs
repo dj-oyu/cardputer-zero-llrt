@@ -457,13 +457,20 @@ pub fn verify_integrity(bytes: &[u8], sri: &str) -> Result<bool, String> {
     let expected = BASE64
         .decode(b64)
         .map_err(|e| format!("bad base64 in integrity {sri:?}: {e}"))?;
-    let got = Sha512::new().chain_update(bytes).finalize();
+    let got = sha512_digest(bytes);
     Ok(got.as_slice() == expected.as_slice())
 }
 
-fn sha512_sri(bytes: &[u8]) -> String {
-    let got = Sha512::new().chain_update(bytes).finalize();
-    format!("sha512-{}", BASE64.encode(got.as_slice()))
+/// Compute the SHA-512 digest of `bytes` exactly once (shared by SRI verification and by the
+/// recorded integrity string — Phase 10D removes the second hashing pass over up-to-5 MiB
+/// tarballs).
+fn sha512_digest(bytes: &[u8]) -> sha2::digest::Output<Sha512> {
+    Sha512::new().chain_update(bytes).finalize()
+}
+
+/// Format a computed SHA-512 digest as a `sha512-<base64>` SRI string.
+fn sri_from_digest(digest: &sha2::digest::Output<Sha512>) -> String {
+    format!("sha512-{}", BASE64.encode(digest.as_slice()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -533,7 +540,9 @@ fn entry_is_native_artifact(rel: &Path) -> bool {
 /// into `dest`. Enforces zip-slip, symlink/hardlink and native-addon guards; returns the parsed
 /// root `package.json`. NEVER spawns external `tar`; NEVER touches `.tgz` on disk.
 pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<Json, String> {
-    let dec = GzDecoder::new(Cursor::new(bytes.to_vec()));
+    // Phase 10D: borrow the tarball bytes through the cursor instead of copying the whole
+    // (up-to-5 MiB) `.tgz` buffer (`Cursor<&[u8]>` implements `Read` directly).
+    let dec = GzDecoder::new(Cursor::new(bytes));
     let mut ar = Archive::new(dec);
     let mut pkg_json: Option<Json> = None;
     for entry in ar.entries().map_err(|e| format!("tar parse error: {e}"))? {
@@ -796,15 +805,25 @@ async fn fetch_dep_tree(client: &HttpsClient, registry: &str, stage: &Path, spec
             .and_then(|d| d.get("integrity"))
             .and_then(|i| i.as_str())
             .unwrap_or("");
-        // Verify sha512 integrity BEFORE extracting anything.
-        if !verify_integrity(&tb, sri)? {
+        // Verify sha512 integrity BEFORE extracting anything — and hash the tarball EXACTLY ONCE:
+        // the same digest both checks the declared SRI and supplies the recorded integrity string
+        // (no second SHA-512 pass over up-to-5 MiB of bytes).
+        let b64 = match sri.strip_prefix("sha512-") {
+            Some(rest) => rest.trim(),
+            None => return Err(format!("unsupported/missing integrity algorithm: {sri:?}")),
+        };
+        let expected = BASE64
+            .decode(b64)
+            .map_err(|e| format!("bad base64 in integrity {sri:?}: {e}"))?;
+        let got = sha512_digest(&tb);
+        if got.as_slice() != expected.as_slice() {
             return Err(format!("{name}@{ver}: sha512 integrity MISMATCH (refusing to extract)"));
         }
         let pkg_json = extract_tarball(&tb, &dest)?;
         if let Some(msg) = native_addon_reject(&pkg_json) {
             return Err(format!("{name}@{ver}: {msg}"));
         }
-        let integrity = sha512_sri(&tb);
+        let integrity = sri_from_digest(&got);
         for (dn, dr) in dep_map(&pkg_json) {
             let dep_dest = stage.join("node_modules").join(&dn);
             queue.push_back((dn, dr, dep_dest, false));
@@ -1817,7 +1836,7 @@ mod tests {
     #[test]
     fn integrity_verify_match_mismatch_and_format() {
         let data = b"tarball-bytes".to_vec();
-        let sri = sha512_sri(&data);
+        let sri = sri_from_digest(&sha512_digest(&data));
         assert!(verify_integrity(&data, &sri).unwrap());
         assert!(!verify_integrity(b"other", &sri).unwrap());
         // base64 sanity: decoded digest must be 64 bytes (SHA-512)
