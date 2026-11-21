@@ -143,6 +143,15 @@ pub fn install_json<'js>(ctx: &Ctx<'js>) -> Result<()> {
     )?;
     ctx.globals().set("__czJsonParseNative", parse_native)?;
 
+    // ---- byte-direct parse (Phase 10C) --------------------------------------
+    // `Response.json()` consumes buffered bytes; parsing them straight into the engine keeps large
+    // JSON responses Lazy without ever materializing a JavaScript string copy of the body.
+    let parse_bytes_native = Function::new(
+        ctx.clone(),
+        |ctx: Ctx<'js>, input: Value<'js>| -> Result<Value<'js>> { json_parse_bytes_native(&ctx, &input) },
+    )?;
+    ctx.globals().set("__czJsonParseBytes", parse_bytes_native)?;
+
     // ---- Lazy handle natives ------------------------------------------------
     let is_array = Function::new(ctx.clone(), |id: f64, node: f64| -> bool {
         match cz_json::lazy::doc(as_idx(id)) {
@@ -293,6 +302,52 @@ fn parse_lazy<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>> {
             make_lazy_handle(ctx, id, 0)
         }
         Err(e) => Err(Exception::throw_syntax(ctx, &e.to_string())),
+    }
+}
+
+/// Outcome of a direct byte parse: `>= LAZY_THRESHOLD_BYTES` documents land as a registered
+/// immutable Tape document, smaller ones as an owned DOM tree.
+pub(crate) enum ByteParse {
+    /// Registered [`LazyDoc`] id (root node 0); the raw bytes stay untouched inside it.
+    Lazy(u32),
+    /// Small-document DOM (`Val<'static>` so it outlives the borrowed JS buffer slice).
+    Dom(Val<'static>),
+}
+
+/// Phase 10C: feed a raw `&[u8]` response body straight into the cz-json engine with NO
+/// intermediate JavaScript `String`: small documents take the one-pass DOM, `>= 4096`-byte
+/// documents build the immutable `Arc<[u8]>` + Tape arena (Lazy), exactly like [`do_parse`].
+pub(crate) fn parse_bytes_direct(bytes: &[u8]) -> std::result::Result<ByteParse, String> {
+    if bytes.len() < LAZY_THRESHOLD_BYTES {
+        match cz_json::parse_owned(bytes) {
+            Ok(dom) => Ok(ByteParse::Dom(dom)),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        match LazyDoc::build(bytes) {
+            Ok(doc) => Ok(ByteParse::Lazy(cz_json::lazy::register(doc))),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// `globalThis.__czJsonParseBytes(input)` core: borrows the JS `Uint8Array`/`ArrayBuffer` slice and
+/// parses it directly. The registration/DOM copy happens while the slice is borrowed; the Lazy Proxy
+/// / JS value construction runs only AFTER the borrow is released (no JavaScript may execute inside
+/// it). A string argument still routes through the text entry point for compatibility.
+pub(crate) fn json_parse_bytes_native<'js>(ctx: &Ctx<'js>, input: &Value<'js>) -> Result<Value<'js>> {
+    if let Some(s) = input.as_string() {
+        // Text fallback: same engine, but only when the caller handed us a string.
+        let cs = s.clone().to_cstring()?;
+        return do_parse(ctx, cs.as_str());
+    }
+    let outcome = crate::with_borrowed_bytes(input, |b| parse_bytes_direct(b)).map_err(|_| {
+        Exception::throw_type(ctx, "__czJsonParseBytes expects a Uint8Array or ArrayBuffer")
+    })?;
+    match outcome {
+        Err(msg) => Err(Exception::throw_syntax(ctx, &msg)),
+        Ok(ByteParse::Lazy(id)) => make_lazy_handle(ctx, id, 0),
+        Ok(ByteParse::Dom(dom)) => dom_to_js(ctx, &dom),
     }
 }
 
@@ -1161,6 +1216,48 @@ mod json_module_tests {
                 "#
             ),
             "MODULE_SHAPE_OK"
+        );
+    }
+
+    #[test]
+    fn byte_direct_parse_keeps_large_bodies_lazy_and_small_ones_eager() {
+        // Phase 10C: `__czJsonParseBytes` feeds a borrowed &[u8] straight into the engine — NO
+        // intermediate JavaScript string, `>= 4 KiB` documents stay Lazy, smaller ones are plain.
+        assert_eq!(
+            run_with_json(
+                r#"
+                import * as czJson from "cardputer:json";
+                function bytesOf(s) {           // ASCII-only body, so charCodeAt is exact UTF-8
+                    const b = new Uint8Array(s.length);
+                    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff;
+                    return b;
+                }
+                const src = '{"pad": "' + 'y'.repeat(5000) + '", "meta":{"seq":7},"items":[1,2,3]}';
+                const b = bytesOf(src);
+                if (b.length < 4096) throw new Error("payload must exceed the lazy threshold");
+                const doc = __czJsonParseBytes(b);
+                if (!czJson.isLazy(doc)) throw new Error(">=4KB byte body must be Lazy");
+                if (doc.pad.length !== 5000 || doc.meta.seq !== 7 || doc.items[2] !== 3) throw new Error("lazy read");
+                if (JSON.stringify(doc) !== src) throw new Error("clean passthrough mismatch");
+                const st = czJson.lazyStats(doc);
+                if (st.rawBytes !== b.length || st.materialized !== false) throw new Error("stats " + JSON.stringify(st));
+
+                // ArrayBuffer input takes the same byte path.
+                const ab = new ArrayBuffer(b.length);
+                new Uint8Array(ab).set(b);
+                const doc2 = __czJsonParseBytes(ab);
+                if (!czJson.isLazy(doc2) || doc2.meta.seq !== 7) throw new Error("ArrayBuffer byte parse");
+
+                // Small payload stays an eager plain object; invalid bytes raise SyntaxError.
+                const small = __czJsonParseBytes(bytesOf('{"n":5,"arr":[1,2]}'));
+                if (czJson.isLazy(small) || small.n !== 5 || small.arr[1] !== 2) throw new Error("small dom parse");
+                let threw = false;
+                try { __czJsonParseBytes(bytesOf("{bad")); } catch (e) { threw = e instanceof SyntaxError; }
+                if (!threw) throw new Error("invalid bytes must throw SyntaxError");
+                globalThis.__R = "BYTES_PARSE_OK";
+                "#
+            ),
+            "BYTES_PARSE_OK"
         );
     }
 }

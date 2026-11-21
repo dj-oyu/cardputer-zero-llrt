@@ -20,6 +20,7 @@
 
 use rquickjs::{Array, Ctx, Exception, Function, Object, Result, Value};
 
+use crate::vec_to_uint8array;
 use cz_net::tls::{TlsClientOptions, TlsServerOptions};
 use cz_net::tls_socket::{
     close_tls_server, connect_tls, create_tls_server, next_tls_event, tls_active_count,
@@ -151,8 +152,8 @@ fn tls_event_descriptor<'js>(ctx: &Ctx<'js>, ev: TlsEngineEvent) -> Result<Value
         TlsEngineEvent::Data { socket_id, bytes } => {
             obj.set("kind", "data")?;
             obj.set("socketId", socket_id as f64)?;
-            let ta = rquickjs::TypedArray::<u8>::new_copy(ctx.clone(), &bytes[..])?;
-            obj.set("value", ta)?;
+            // Phase 10C: ownership move (no second memcpy of the decrypted bytes).
+            obj.set("value", vec_to_uint8array(ctx, bytes)?)?;
         }
         TlsEngineEvent::End { socket_id } => {
             obj.set("kind", "end")?;

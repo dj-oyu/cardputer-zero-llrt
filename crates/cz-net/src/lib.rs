@@ -22,9 +22,9 @@ pub use fetch::{
 };
 pub use https::{make_tls_acceptor, TlsConnStream, HANDSHAKE_TIMEOUT};
 pub use tls::{
-    build_client_config, build_server_config, load_system_roots_uncached, parse_certificates,
-    parse_private_key, status_text, system_root_store, TlsClientOptions, TlsServerOptions,
-    NO_ROOTS_ERROR,
+    build_client_config, build_client_config_uncached, build_server_config, is_default_client_options,
+    load_system_roots_uncached, parse_certificates, parse_private_key, status_text,
+    system_root_store, TlsClientOptions, TlsServerOptions, NO_ROOTS_ERROR,
 };
 pub use tls_socket::{
     close_tls_server, connect_tls, create_tls_server, next_tls_event, tls_active_count,
@@ -205,6 +205,52 @@ mod tests {
         let a = system_root_store().expect("system roots present in sandbox");
         let b = system_root_store().expect("cached system roots");
         assert!(Arc::ptr_eq(&a, &b), "OnceLock must return the same Arc");
+    }
+
+    #[test]
+    fn default_client_config_is_memoized_while_non_default_options_build_fresh() {
+        // Phase 10C: standard HTTPS fetches share ONE Arc<ClientConfig> instead of rebuilding the
+        // config + WebPkiServerVerifier per request; anything custom still builds a fresh config,
+        // and `build_client_config_uncached` keeps the CA-env-sensitive path observable.
+        let _lock = ca_env_lock();
+        assert!(is_default_client_options(&TlsClientOptions::default()));
+        let first = build_client_config(&TlsClientOptions::default());
+        let second = build_client_config(&TlsClientOptions::default());
+        match (&first, &second) {
+            (Ok(a), Ok(b)) => assert!(Arc::ptr_eq(a, b), "default ClientConfig must be cached"),
+            (Err(a), Err(b)) => assert_eq!(a, b, "both attempts report the same root-store failure"),
+            _ => panic!("cached client config outcome must be deterministic per process"),
+        }
+
+        // The uncached helper always rebuilds (used by CA-env unit tests), so its Arc differs.
+        let fresh = build_client_config_uncached(&TlsClientOptions::default()).expect("uncached default");
+        if let Ok(cached) = &first {
+            assert!(!Arc::ptr_eq(cached, &fresh), "uncached build must not reuse the cache");
+        }
+
+        // Non-default options are never served from the cache.
+        let ca_opts = TlsClientOptions {
+            ca_pem: Some(fixture("ca.pem")),
+            ..Default::default()
+        };
+        assert!(!is_default_client_options(&ca_opts));
+        let ca1 = build_client_config(&ca_opts).expect("explicit CA");
+        let ca2 = build_client_config(&ca_opts).expect("explicit CA again");
+        assert!(!Arc::ptr_eq(&ca1, &ca2), "explicit CA configs must be built fresh each call");
+        let unchecked = build_client_config(&TlsClientOptions {
+            reject_unauthorized: false,
+            ..Default::default()
+        })
+        .expect("accept-any config");
+        if let Ok(cached) = &first {
+            assert!(!Arc::ptr_eq(cached, &unchecked), "reject_unauthorized:false is not the default");
+        }
+        let alpn = build_client_config(&TlsClientOptions {
+            alpn_protocols: vec![b"h2".to_vec()],
+            ..Default::default()
+        })
+        .expect("alpn config");
+        assert_eq!(alpn.alpn_protocols.len(), 1);
     }
 
         /// Ground-truth TLS harness: real handshake + encrypted byte roundtrip over loopback with

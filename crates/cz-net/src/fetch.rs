@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Builder;
@@ -154,23 +155,34 @@ fn set_write_timeout(cache: &mut Option<Duration>, stream: &TcpStream, t: NextTi
 
 /// Non-blocking probe used by `is_open()` (ureq semantics: readable bytes or an error means the
 /// connection is not reusable).
+///
+/// Phase 10C: `libc::recv(..., MSG_PEEK | MSG_DONTWAIT)` on the live fd replaces the old
+/// `stream.try_clone()` + `set_nonblocking()` dance — no extra descriptor dup per keep-alive check
+/// and no temporary blocking-mode flip that could race with the socket's real reads.
 fn probe_open(stream: &TcpStream) -> bool {
-    let dup = match stream.try_clone() {
-        Ok(d) => d,
-        Err(_) => return false,
+    let mut one = [0u8; 1];
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            one.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
     };
-    if dup.set_nonblocking(true).is_err() {
+    if n > 0 {
+        // Bytes are already queued (pipelined body, garbage, or TLS records): not reusable.
         return false;
     }
-    let mut one = [0u8; 1];
-    let open = match (&dup).read(&mut one) {
-        Ok(0) => false,
-        Ok(_) => false,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
-    };
-    let _ = dup.set_nonblocking(false);
-    open
+    if n == 0 {
+        // EOF: the peer closed the connection.
+        return false;
+    }
+    // -1 -> open only when the socket is merely "not ready right now" (EAGAIN/EWOULDBLOCK);
+    // any other errno (ECONNRESET, ENOTCONN, ...) means it cannot be reused.
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(e) => e == libc::EAGAIN || e == libc::EWOULDBLOCK,
+        None => false,
+    }
 }
 
 impl Transport for PlainTransport {
@@ -912,6 +924,23 @@ fn build_config(redirect: RedirectMode) -> Config {
     builder.build()
 }
 
+/// Buffered-body capacity hint from a valid `Content-Length` header that stays inside the
+/// [`MAX_BUFFERED_BODY`] cap (`None` when absent, unparsable or oversized).
+///
+/// Phase 10C: pre-sizing `SlotInner::buffer` once from the declared length removes the repeated
+/// realloc/copy cycle while appending 16 KiB chunks to a buffered body.
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn content_length_hint(headers: &ureq::http::HeaderMap) -> Option<usize> {
+    let raw = headers.get("content-length")?.as_bytes();
+    let text = std::str::from_utf8(raw).ok()?;
+    let n: usize = text.trim().parse().ok()?;
+    if n > MAX_BUFFERED_BODY {
+        return None;
+    }
+    Some(n)
+}
+
 fn header_pairs(res: &ureq::http::Response<ureq::Body>) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(res.headers().len());
     // HeaderMap::iter yields a key once per associated value (duplicates included), which the JS
@@ -986,6 +1015,20 @@ fn worker_main(mut spec: FetchSpec, slot: Arc<Slot>, abort: Arc<AbortHandle>) {
         redirected,
         headers: header_pairs(&res),
     });
+
+    // 3b. Phase 10C: when the peer declared a trustworthy Content-Length inside the buffered cap,
+    //     give the engine buffer that exact capacity NOW so the chunk appends below never re-grow.
+    if let Some(cap) = content_length_hint(res.headers()) {
+        let mut g = slot.inner.lock().expect("slot events lock");
+        if g.mode == Mode::Buffered && g.buffer.capacity() < cap {
+            if g.buffer.is_empty() {
+                g.buffer = Vec::with_capacity(cap);
+            } else {
+                let have = g.buffer.len();
+                g.buffer.reserve_exact(cap.saturating_sub(have));
+            }
+        }
+    }
 
     // 4. Body pump honoring the consumer mode (Buffered vs Streaming) with backpressure.
     let mut reader = res.body_mut().as_reader();
@@ -1172,5 +1215,96 @@ mod backpressure_tests {
         writer.join().expect("parked push must return after abort");
         assert!(started.elapsed() < Duration::from_millis(1000), "abort wake slow: {:?}", started.elapsed());
         release_slot(999_002);
+    }
+
+    #[test]
+    fn msg_peek_probe_open_flags_idle_open_pending_bytes_and_eof_correctly() {
+        // Phase 10C: the libc MSG_PEEK | MSG_DONTWAIT probe replaces the fd-dup `try_clone()` path.
+        let _lock = registry_test_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local").port();
+        let client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (mut server, _) = listener.accept().expect("accept");
+
+        assert!(probe_open(&client), "an idle keep-alive socket must probe as open");
+
+        server.write_all(b"pipelined!").expect("write");
+        let mut saw_pending = false;
+        for _ in 0..200 {
+            if !probe_open(&client) {
+                saw_pending = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_pending, "readable bytes mean the connection is NOT reusable");
+
+        // MSG_PEEK does not consume anything: a real read still gets the full payload back.
+        let mut client = client;
+        client.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
+        let mut got = [0u8; 10];
+        client.read_exact(&mut got).expect("peeked bytes remain readable");
+        assert_eq!(&got, b"pipelined!");
+
+        drop(server);
+        let mut saw_eof = false;
+        for _ in 0..200 {
+            if !probe_open(&client) {
+                saw_eof = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_eof, "a peer close must make the socket unusable");
+    }
+
+    #[test]
+    fn content_length_hint_presizes_the_buffered_slot_body_without_losing_bytes() {
+        use ureq::http::{HeaderMap, HeaderValue};
+
+        let mut ok = HeaderMap::new();
+        ok.insert("content-length", HeaderValue::from_static("4096"));
+        assert_eq!(content_length_hint(&ok), Some(4096));
+
+        let mut spaced = HeaderMap::new();
+        spaced.insert("content-length", HeaderValue::from_static(" 123 "));
+        assert_eq!(content_length_hint(&spaced), Some(123));
+
+        let mut bad = HeaderMap::new();
+        bad.insert("content-length", HeaderValue::from_static("not-a-number"));
+        assert_eq!(content_length_hint(&bad), None);
+
+        let mut huge = HeaderMap::new();
+        huge.insert(
+            "content-length",
+            HeaderValue::from_str(&format!("{}", MAX_BUFFERED_BODY + 1)).expect("huge value"),
+        );
+        assert_eq!(content_length_hint(&huge), None, "over-cap lengths must not pre-allocate");
+
+        assert_eq!(content_length_hint(&HeaderMap::new()), None, "absent header yields no hint");
+
+        // Exercise the worker's exact pre-size branch on a live slot: capacity grows once, and any
+        // already-buffered bytes survive.
+        let _lock = registry_test_lock();
+        let abort = Arc::new(AbortHandle::new());
+        let slot = Arc::new(Slot::new(999_010, abort.clone()));
+        engine().slots.lock().expect("slots").push(slot.clone());
+        {
+            let mut g = slot.inner.lock().expect("inner");
+            let cap = content_length_hint(&ok).unwrap() * 2;
+            if g.buffer.capacity() < cap {
+                if g.buffer.is_empty() {
+                    g.buffer = Vec::with_capacity(cap);
+                } else {
+                    let have = g.buffer.len();
+                    g.buffer.reserve_exact(cap.saturating_sub(have));
+                }
+            }
+            g.buffer.extend_from_slice(&[7u8; 5]);
+            assert!(g.buffer.capacity() >= cap, "buffer must be pre-sized from Content-Length");
+            assert_eq!(g.buffer.len(), 5);
+            assert_eq!(g.buffer[0], 7);
+        }
+        release_slot(999_010);
     }
 }

@@ -9,9 +9,10 @@
 use std::path::Path;
 
 use cz_hal::io::{self, MAX_UART_READ};
-use rquickjs::{Array, Ctx, Exception, Function, Object, Result, TypedArray, Value};
+use rquickjs::{Array, Ctx, Exception, Function, Object, Result, Value};
 
 use crate::bytes_from_value;
+use crate::vec_to_uint8array;
 
 /// Clamp a JS double into a non-negative integer byte count.
 fn to_usize(v: f64) -> usize {
@@ -114,8 +115,8 @@ impl rquickjs::module::ModuleDef for IoModule {
                         &format!("uartRead({device_path}) failed: {}", describe_io(&e)),
                     )
                 })?;
-                let ta = TypedArray::<u8>::new_copy(ctx, &bytes[..])?;
-                Ok(ta.into_value())
+                // Phase 10C: transfer the read buffer's ownership straight into the Uint8Array.
+                vec_to_uint8array(&ctx, bytes)
             },
         )?;
 

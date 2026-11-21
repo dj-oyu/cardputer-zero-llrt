@@ -710,6 +710,27 @@ pub(crate) fn u8_array_from_vec<'js>(ctx: &Ctx<'js>, v: Vec<u8>) -> Result<Value
     Ok(ta.into_value())
 }
 
+/// Transfer ownership of a Rust `Vec<u8>` into a QuickJS `Uint8Array` backed by
+/// `ArrayBuffer::new(ctx, data)` — zero copy!
+///
+/// `ArrayBuffer::new` takes the Vec's allocation pointer directly (`ManuallyDrop` + `JS_NewArrayBuffer`
+/// with a realloc/free callback bound to that buffer's capacity), so the payload is NEVER memcpy'd a
+/// second time the way `TypedArray::<u8>::new_copy` does (`JS_NewArrayBufferCopy`). Wrapping it with
+/// `TypedArray::from_arraybuffer` only creates the view object. Hot binary paths (fetch chunks/bodies,
+/// `node:tls` data, binary `readFileSync`, WAV generation, `uartRead`) use this helper instead of the
+/// copying constructor.
+pub(crate) fn vec_to_uint8array<'js>(ctx: &Ctx<'js>, data: Vec<u8>) -> Result<Value<'js>> {
+    // An empty `Vec` has no allocation to hand over (`JS_NewArrayBuffer` would receive a null
+    // pointer), so the trivial zero-length case takes the plain copying constructor instead.
+    if data.is_empty() {
+        let ta = rquickjs::TypedArray::<u8>::new_copy(ctx.clone(), &[] as &[u8])?;
+        return Ok(ta.into_value());
+    }
+    let ab = rquickjs::ArrayBuffer::new(ctx.clone(), data)?;
+    let ta = rquickjs::TypedArray::<u8>::from_arraybuffer(ab)?;
+    Ok(ta.into_value())
+}
+
 // ---------------------------------------------------------------------------
 // cardputer:display
 // ---------------------------------------------------------------------------
@@ -919,6 +940,10 @@ impl rquickjs::module::ModuleDef for DisplayModule {
 
 use rquickjs::Error;
 
+/// Phase 10C: native FFI UTF-8 / direct JSON-byte-parse tests for the `fetch` surface.
+#[cfg(test)]
+mod fetch_ffi_tests;
+
 #[cfg(test)]
 mod module_tests {
     use super::*;
@@ -1024,6 +1049,62 @@ mod module_tests {
 
         std::env::remove_var("CARDPUTER_FB_PATH");
         std::fs::remove_file(&fb).ok();
+    }
+
+    #[test]
+    fn vec_to_uint8array_moves_vec_ownership_into_the_buffer_backing_the_view() {
+        // Phase 10C FFI binary move: the JS view must be backed by the moved Vec's own allocation
+        // (writes through the view land inside that buffer, and byteLength matches exactly).
+        let rt = Runtime::new().expect("rt");
+        let ctx = Context::full(&rt).expect("ctx");
+        let payload: Vec<u8> = (0u8..64).collect();
+        let shape = ctx
+            .with(|ctx| -> Result<(bool, usize, usize, usize)> {
+                let value = vec_to_uint8array(&ctx, payload.clone())?;
+                ctx.globals().set("__mv", value)?;
+                let is_u8: bool = ctx.eval("globalThis.__mv instanceof Uint8Array")?;
+                let len: usize = ctx.eval("globalThis.__mv.length")?;
+                let buf_len: usize = ctx.eval("globalThis.__mv.buffer.byteLength")?;
+                // Mutate through the JS view, then read the SAME memory back natively: proof the
+                // buffer is JavaScript-owned (the moved allocation), not a detached snapshot.
+                ctx.eval::<(), _>("globalThis.__mv[7] = 200")?;
+                let view = ctx.globals().get::<_, Value>("__mv")?;
+                let byte7 = with_borrowed_bytes(&view, |b| b[7] as usize)?;
+                Ok((is_u8, len, buf_len, byte7))
+            })
+            .expect("ffi move eval");
+        while let Ok(true) = rt.execute_pending_job() {}
+        assert!(shape.0, "must be a Uint8Array");
+        assert_eq!(shape.1, 64);
+        assert_eq!(shape.2, 64, "exact-sized ArrayBuffer (no slack copy)");
+        assert_eq!(shape.3, 200, "JS writes land inside the moved Rust allocation");
+
+        // Content round-trip through a second moved buffer.
+        let rt2 = Runtime::new().expect("rt2");
+        let ctx2 = Context::full(&rt2).expect("ctx2");
+        let got = ctx2
+            .with(|ctx| -> Result<String> {
+                let data: Vec<u8> = vec![0xef, 0xbb, 0xbf, 0x41, 0x42];
+                let value = vec_to_uint8array(&ctx, data)?;
+                ctx.globals().set("__b", value)?;
+                ctx.eval::<String, _>("[...globalThis.__b].join(',')")
+            })
+            .expect("moved content eval");
+        while let Ok(true) = rt2.execute_pending_job() {}
+        assert_eq!(got, "239,187,191,65,66");
+
+        // The empty Vec takes the safe constructing branch instead of handing over a null pointer.
+        let rt3 = Runtime::new().expect("rt3");
+        let ctx3 = Context::full(&rt3).expect("ctx3");
+        let empty_len = ctx3
+            .with(|ctx| -> Result<f64> {
+                let value = vec_to_uint8array(&ctx, Vec::new())?;
+                ctx.globals().set("__empty", value)?;
+                ctx.eval::<f64, _>("globalThis.__empty.length")
+            })
+            .expect("empty eval");
+        while let Ok(true) = rt3.execute_pending_job() {}
+        assert_eq!(empty_len, 0.0);
     }
 
     #[test]

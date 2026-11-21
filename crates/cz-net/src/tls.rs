@@ -284,8 +284,22 @@ impl ServerCertVerifier for AcceptAnyVerifier {
     }
 }
 
-/// Build a `rustls::ClientConfig` from [`TlsClientOptions`], always using the `ring` provider.
-pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>, String> {
+/// True when the options describe the plain default HTTPS client (system roots, verification on,
+/// no mTLS, no ALPN, no CA override). Exactly those configs are process-stable, so they can be
+/// memoized and shared by every standard HTTPS `fetch()`.
+pub fn is_default_client_options(opts: &TlsClientOptions) -> bool {
+    opts.ca_pem.is_none()
+        && opts.cert_pem.is_none()
+        && opts.key_pem.is_none()
+        && opts.reject_unauthorized
+        && opts.alpn_protocols.is_empty()
+}
+
+/// Build a fresh `rustls::ClientConfig` from [`TlsClientOptions`] on every call (always the `ring`
+/// provider). Unit tests that vary `SSL_CERT_FILE` / `SSL_CERT_DIR` / `NODE_EXTRA_CA_CERTS` must use
+/// this entry point so their environment changes are actually observed; production HTTPS reuses the
+/// memoized default through [`build_client_config`].
+pub fn build_client_config_uncached(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     // Clone cheaply: the CA-verifier branch also needs the same ring provider.
     let builder = ClientConfig::builder_with_provider(provider.clone())
@@ -345,6 +359,25 @@ pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>,
         config.alpn_protocols = opts.alpn_protocols.clone();
     }
     Ok(Arc::new(config))
+}
+
+/// Build a `rustls::ClientConfig` from [`TlsClientOptions`], always using the `ring` provider.
+///
+/// Phase 10C: the DEFAULT configuration (system roots + verification on, no mTLS, no ALPN, no CA
+/// override) is memoized in a process-wide `OnceLock`, so standard HTTPS `fetch()` calls share one
+/// `Arc<ClientConfig>` instead of rebuilding the config and its `WebPkiServerVerifier` on every
+/// request (that config also keeps holding the shared cached `Arc<RootCertStore>`). Anything that
+/// differs from the default — explicit `ca`, mTLS pairs, `reject_unauthorized: false`, ALPN — still
+/// builds fresh through [`build_client_config_uncached`].
+pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>, String> {
+    if !is_default_client_options(opts) {
+        return build_client_config_uncached(opts);
+    }
+    static CACHE: std::sync::OnceLock<Result<Arc<ClientConfig>, String>> = std::sync::OnceLock::new();
+    match CACHE.get_or_init(|| build_client_config_uncached(opts)) {
+        Ok(cfg) => Ok(cfg.clone()),
+        Err(msg) => Err(msg.clone()),
+    }
 }
 
 /// Build a `rustls::ServerConfig` (used by Phase 8B/8C; complete and tested already).

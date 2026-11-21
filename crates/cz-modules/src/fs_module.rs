@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
-use rquickjs::{Ctx, Function, Object, Result, TypedArray, Value};
+use rquickjs::{Ctx, Function, Object, Result, Value};
+
+use crate::vec_to_uint8array;
 
 /// Read a file into a descriptor: `{ ok, text, bytes, message }`.
 fn js_fs_read<'js>(ctx: &Ctx<'js>, path: String, want_text: bool) -> Result<Object<'js>> {
@@ -19,11 +21,14 @@ fn js_fs_read<'js>(ctx: &Ctx<'js>, path: String, want_text: bool) -> Result<Obje
             if want_text {
                 // Text mode is lossy-tolerant like Node's default utf8 decoding.
                 obj.set("text", String::from_utf8_lossy(&data).as_ref())?;
+                // Phase 10C: the utf8 return needs NO second buffer — skip the `bytes` Uint8Array
+                // allocation entirely (the shim only reads `d.bytes` in binary mode).
+                obj.set("bytes", Value::new_null(ctx.clone()))?;
             } else {
                 obj.set("text", Value::new_null(ctx.clone()))?;
+                // Binary mode moves the read file's ownership straight into the typed array.
+                obj.set("bytes", vec_to_uint8array(ctx, data)?)?;
             }
-            let ta = TypedArray::<u8>::new_copy(ctx.clone(), &data[..])?;
-            obj.set("bytes", ta)?;
             obj.set("message", Value::new_null(ctx.clone()))?;
         }
         Err(e) => {

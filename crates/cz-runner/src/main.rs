@@ -301,20 +301,24 @@ fn bind_timers(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
             if (globalThis.__czTimersInstalled) return;
             const timers = new Map();
             let nextId = 1;
+            // Phase 10C: a shared frozen empty list stands in for "no extra arguments", so the
+            // common setTimeout(fn, delay) call never allocates through Array.prototype.slice.
+            const EMPTY_ARGS = Object.freeze([]);
             function delayOf(d) {
                 const n = Number(d);
                 return Number.isFinite(n) && n > 0 ? n : 0;
             }
             globalThis.setTimeout = function (fn, delay) {
                 if (typeof fn !== "function") throw new TypeError("setTimeout callback must be a function");
-                const extra = Array.prototype.slice.call(arguments, 2);
+                // Only slice when the caller really passed extra arguments (arguments.length > 2).
+                const extra = arguments.length > 2 ? Array.prototype.slice.call(arguments, 2) : EMPTY_ARGS;
                 const id = nextId++;
                 timers.set(id, { fn: fn, at: Date.now() + delayOf(delay), every: null, extra: extra });
                 return id;
             };
             globalThis.setInterval = function (fn, delay) {
                 if (typeof fn !== "function") throw new TypeError("setInterval callback must be a function");
-                const extra = Array.prototype.slice.call(arguments, 2);
+                const extra = arguments.length > 2 ? Array.prototype.slice.call(arguments, 2) : EMPTY_ARGS;
                 const id = nextId++;
                 const step = delayOf(delay);
                 timers.set(id, { fn: fn, at: Date.now() + (step > 0 ? step : 1), every: step > 0 ? step : 1, extra: extra });
@@ -334,7 +338,9 @@ fn bind_timers(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
                     const id = pair[0], t = pair[1];
                     // A callback may clear/replace timers, so re-check membership before firing.
                     if (!timers.has(id)) continue;
-                    if (t.every !== null) timers.set(id, { fn: t.fn, at: Date.now() + t.every, every: t.every, extra: t.extra });
+                    // Phase 10C: mutate `t.at` IN PLACE for intervals instead of allocating a fresh
+                    // timer object on every tick (the interval registry entry is reused).
+                    if (t.every !== null) t.at = Date.now() + t.every;
                     else timers.delete(id);
                     try { t.fn.apply(undefined, t.extra); }
                     catch (e) {
@@ -348,6 +354,43 @@ fn bind_timers(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
         })();
     "#;
     ctx.eval::<(), _>(shim)?;
+    Ok(())
+}
+
+/// One JS scope per event-loop iteration drives every engine drain in the exact order the
+/// standalone passes used to run them (fetch -> TLS -> HTTP close notifications -> HTTP requests ->
+/// timers). Without it `loop_pass` would open five separate `ctx.with()` scopes and perform five
+/// `globalThis` lookups on every idle pass.
+const LOOP_DRAIN_GLUE: &str = r#"
+    (function () {
+        if (globalThis.__czLoopDrainInstalled) return;
+        // Full pass: engine events first, then HTTP closes/requests, then due timers.
+        globalThis.__czLoopDrain = function () {
+            var n = 0;
+            if (typeof __czFetchDrainLoop === "function") n += __czFetchDrainLoop();
+            if (typeof __czTlsDrainLoop === "function") n += __czTlsDrainLoop();
+            if (typeof __czHttpCheckCloses === "function") n += __czHttpCheckCloses();
+            if (typeof __czHttpDrainLoop === "function") n += __czHttpDrainLoop();
+            if (typeof __czTimersTick === "function") n += __czTimersTick();
+            return n;
+        };
+        // Follow-up rescan for work created BY the pass above; deliberately skips timers so an
+        // interval cannot fire twice inside one event-loop iteration.
+        globalThis.__czRescanDrain = function () {
+            var n = 0;
+            if (typeof __czHttpCheckCloses === "function") n += __czHttpCheckCloses();
+            if (typeof __czHttpDrainLoop === "function") n += __czHttpDrainLoop();
+            if (typeof __czFetchDrainLoop === "function") n += __czFetchDrainLoop();
+            if (typeof __czTlsDrainLoop === "function") n += __czTlsDrainLoop();
+            return n;
+        };
+        globalThis.__czLoopDrainInstalled = true;
+    })();
+"#;
+
+/// Install the combined drain glue (idempotent; safe when no engine module was ever imported).
+fn bind_loop_drain_glue(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+    ctx.eval::<(), _>(LOOP_DRAIN_GLUE)?;
     Ok(())
 }
 
@@ -376,38 +419,19 @@ fn has_http_glue(ctx: &Ctx<'_>) -> bool {
 /// `Context::with()` scope, otherwise the runtime `RefCell` is re-entered and panics with
 /// "RefCell already borrowed". So scopes are opened, closed, and only then jobs are pumped.
 fn loop_pass(rt: &Runtime, ctx: &Context) {
-    // 0a. Deliver arrived fetch events (headers/chunks/body/done/error) into the JS shim.
-    //     Engine threads call `notify_event_loop()` on arrival, so this wakes promptly.
-    ctx.with(|c| call_js_i64(&c, "__czFetchDrainLoop", 0));
+    // Phase 10C: ONE scope per iteration drives arrived fetch events, raw TLS socket events, HTTP
+    // "close" notifications, queued HTTP requests and due timers — the exact order the five separate
+    // `ctx.with()` scopes used to use (engine threads still `notify_event_loop()` on every arrival).
+    // QuickJS promise jobs created along the way are pumped strictly OUTSIDE the scope (RefCell rule).
+    ctx.with(|c| call_js_i64(&c, "__czLoopDrain", 0));
     drain_jobs(rt);
 
-    // 0b. Deliver arrived raw TLS socket events (secureConnect/secureConnection/data/end/close/
-    //     error) into the node:tls shim. Engine threads call notify_event_loop() on arrival.
-    ctx.with(|c| call_js_i64(&c, "__czTlsDrainLoop", 0));
-    drain_jobs(rt);
-
-    // 0. Fire HTTP "close" notifications (Phase 2.5): client disconnects or server-forced
-    //    stream ends queue conn ids in the engine; JS clears intervals / releases streams here.
-    ctx.with(|c| call_js_i64(&c, "__czHttpCheckCloses", 0));
-    drain_jobs(rt);
-
-    // 1. Serve any queued HTTP requests inside a short scope.
-    ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
-    drain_jobs(rt);
-
-    // 2. Fire due timers (callbacks may schedule more timers/jobs or close servers).
-    ctx.with(|c| call_js_i64(&c, "__czTimersTick", 0));
-    drain_jobs(rt);
-
-    // 3. Give promise jobs created by timers one more dispatch pass in this iteration.
+    // 3. Give work CREATED by the pass above one more dispatch round (still a single scope, and it
+    //    skips timers so an interval can never fire twice inside one iteration).
     if rt.is_job_pending() || cz_modules::http_has_pending() || cz_modules::fetch_has_pending()
         || cz_modules::tls_has_pending()
     {
-        ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
-        drain_jobs(rt);
-        ctx.with(|c| call_js_i64(&c, "__czFetchDrainLoop", 0));
-        drain_jobs(rt);
-        ctx.with(|c| call_js_i64(&c, "__czTlsDrainLoop", 0));
+        ctx.with(|c| call_js_i64(&c, "__czRescanDrain", 0));
         drain_jobs(rt);
     }
 }
@@ -521,6 +545,9 @@ fn main() {
     let run_result = ctx.with(|ctx| -> Result<(), String> {
         bind_console(&ctx).map_err(|e| format!("{e}"))?;
         bind_timers(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 10C: one JS scope per event-loop pass drains fetch + TLS + HTTP closes/requests +
+        // timers in the original order.
+        bind_loop_drain_glue(&ctx).map_err(|e| format!("loop drain glue: {e}"))?;
         ctx.globals().set("__czRunnerManagedPump", true).map_err(|e| format!("{e}"))?;
         // Phase 5: swap globalThis.JSON.parse / JSON.stringify for the cz-json NEON engine
         // (fast < 4 KiB path, transparent Lazy handles for larger documents, kv-row shortcut).
@@ -728,6 +755,7 @@ mod runner_tests {
         ctx.with(|c| {
             bind_console(&c).unwrap();
             bind_timers(&c).unwrap();
+            bind_loop_drain_glue(&c).unwrap();
         });
         (rt, ctx)
     }

@@ -10,7 +10,9 @@
 use std::path::Path;
 
 use cz_hal::audio;
-use rquickjs::{Ctx, Function, Object, Result, TypedArray, Value};
+use rquickjs::{Ctx, Function, Object, Result, Value};
+
+use crate::vec_to_uint8array;
 
 /// JS glue: normalize optional args into required numeric scalars before calling the natives.
 const AUDIO_SHIM: &str = r#"
@@ -33,9 +35,8 @@ const AUDIO_SHIM: &str = r#"
 "#;
 
 fn generate_wav_native<'js>(ctx: &Ctx<'js>, freq: f64, duration: f64, volume: f64) -> Result<Value<'js>> {
-    let wav = audio::generate_wav(freq, duration, volume);
-    let ta = TypedArray::<u8>::new_copy(ctx.clone(), &wav[..])?;
-    Ok(ta.into_value())
+    // Phase 10C: hand the freshly generated WAV over by ownership (zero FFI copy).
+    vec_to_uint8array(ctx, audio::generate_wav(freq, duration, volume))
 }
 
 fn beep_native(freq: f64, duration: f64, volume: f64) -> bool {

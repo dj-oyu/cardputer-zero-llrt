@@ -16,9 +16,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rquickjs::{
-    convert::Coerced, ArrayBuffer, Array, Ctx, Exception, FromJs, Function, Object, Result, String
-    as JsString, TypedArray, Value,
+    convert::Coerced, function::Opt, ArrayBuffer, Array, Ctx, Exception, FromJs, Function, Object,
+    Result, String as JsString, Value,
 };
+
+use crate::{json_module::json_parse_bytes_native, vec_to_uint8array};
 
 use cz_net::fetch::{
     active_fetch_count, cancel_fetch, live_ids, next_event, parse_redirect_mode, release_slot,
@@ -178,6 +180,55 @@ pub fn install_fetch<'js>(ctx: &Ctx<'js>) -> Result<()> {
         fetch_has_pending()
     })?)?;
 
+    // ---- native UTF-8 helpers (Phase 10C) ------------------------------------
+    // Replace the pure-JS char-by-char TextEncoder/TextDecoder loops with one native pass over a
+    // borrowed slice of the JS buffer. `__czUtf8Decode` builds the QuickJS string directly from the
+    // source bytes (valid UTF-8 needs no intermediate Rust `String` at all); the input argument stays
+    // rooted on the JS stack while borrowed and NO JavaScript executes inside the borrow.
+    ctx.globals().set(
+        "__czUtf8Decode",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, input: Value<'js>, fatal: Opt<Value<'js>>| -> Result<Value<'js>> {
+                let strict = fatal.0.as_ref().and_then(|v| v.as_bool()).unwrap_or(false);
+                crate::with_borrowed_bytes(&input, |b| -> Result<Value<'js>> {
+                    match std::str::from_utf8(b) {
+                        Ok(text) => Ok(JsString::from_str(ctx.clone(), text)?.into_value()),
+                        Err(_) if strict => {
+                            Err(Exception::throw_type(&ctx, "The encoded data was not valid for encoding utf-8"))
+                        }
+                        // Lossy mode mirrors Node's default decoder (U+FFFD replacements).
+                        Err(_) => Ok(JsString::from_str(ctx.clone(), String::from_utf8_lossy(b).as_ref())?.into_value()),
+                    }
+                })?
+            },
+        )?,
+    )?;
+
+    // UTF-8 payload of the JS string is taken once and moved into the ArrayBuffer-backed Uint8Array.
+    ctx.globals().set(
+        "__czUtf8Encode",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, text: JsString| -> Result<Value<'js>> {
+                let cs = text.to_cstring()?;
+                vec_to_uint8array(&ctx, cs.as_str().as_bytes().to_vec())
+            },
+        )?,
+    )?;
+
+    // `Response.json()` byte entry point (same native as the one `install_json` registers, so the
+    // binding works even when a context never imported `cardputer:json`).
+    ctx.globals().set(
+        "__czJsonParseBytes",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, input: Value<'js>| -> Result<Value<'js>> {
+                json_parse_bytes_native(&ctx, &input)
+            },
+        )?,
+    )?;
+
     ctx.eval::<(), _>(FETCH_SHIM)?;
     INSTALLED.store(true, Ordering::SeqCst);
     Ok(())
@@ -204,8 +255,8 @@ fn event_descriptor<'js>(ctx: &Ctx<'js>, ev: EngineEvent) -> Result<Value<'js>> 
         }
         EngineEvent::Chunk(bytes) => {
             obj.set("kind", "chunk")?;
-            let ta = TypedArray::<u8>::new_copy(ctx.clone(), &bytes[..])?;
-            obj.set("value", ta)?;
+            // Phase 10C: move the worker's chunk into the Uint8Array (ownership transfer, zero copy).
+            obj.set("value", vec_to_uint8array(ctx, bytes)?)?;
         }
         EngineEvent::Body(bytes) => {
             obj.set("kind", "body")?;
@@ -236,7 +287,7 @@ fn event_descriptor<'js>(ctx: &Ctx<'js>, ev: EngineEvent) -> Result<Value<'js>> 
 /// Public shim installing `fetch`, `Headers`, `Request`, `Response`, `AbortController`,
 /// `AbortSignal` (+ `.abort()` / `.timeout()` statics), a minimal `ReadableStream` and
 /// `URLSearchParams`. QuickJS-safe syntax only (no optional chaining / nullish coalescing).
-const FETCH_SHIM: &str = r#"
+pub(crate) const FETCH_SHIM: &str = r#"
 (function () {
     if (globalThis.__czFetchInstalled) return;
 
@@ -446,7 +497,9 @@ const FETCH_SHIM: &str = r#"
             if (input instanceof ArrayBuffer) return new Uint8Array(input);
             if (typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer) return new Uint8Array(input);
         }
-        var o = (typeof DataView !== "undefined" && input instanceof DataView) ? input : (input.buffer || null);
+        // Views (typed arrays AND DataView) expose their backing `buffer`, so a `DataView` slice
+        // decodes as a zero-copy view over the same memory instead of an array-like character copy.
+        var o = input.buffer || null;
         if (!o) return null;
         var off = Number(input.byteOffset) || 0;
         var len = Number(input.byteLength);
@@ -458,23 +511,17 @@ const FETCH_SHIM: &str = r#"
         globalThis.TextEncoder = class TextEncoder {
             constructor() { this.encoding = "utf-8"; }
             encode(text) {
-                var str = text === undefined ? "" : String(text);
-                var out = [];
-                for (var i = 0; i < str.length; i++) {
-                    var cp = str.codePointAt(i);
-                    if (cp > 0xffff) { i++; }
-                    if (cp < 0x80) out.push(cp);
-                    else if (cp < 0x800) { out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f)); }
-                    else if (cp < 0x10000) { out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)); }
-                    else { out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)); }
-                }
-                return new Uint8Array(out);
+                // Phase 10C: single native UTF-8 pass — `__czUtf8Encode` transfers the encoded bytes
+                // into the ArrayBuffer backing the view instead of pushing one JS number per code
+                // point (the old char-by-char loop is gone).
+                return __czUtf8Encode(text === undefined ? "" : String(text));
             }
             encodeInto(text, dest) {
                 var bytes = this.encode(text);
-                var max = Math.min(bytes.length, byteSource(dest) ? byteSource(dest).length : 0);
                 var view = byteSource(dest);
-                for (var i = 0; i < max; i++) view[i] = bytes[i];
+                var max = view ? Math.min(bytes.length, view.length) : 0;
+                // Bulk copy through a view over the destination (no byte-by-byte JavaScript writes).
+                if (view && max > 0) new Uint8Array(view.buffer, view.byteOffset, max).set(bytes.subarray(0, max));
                 return { read: max, written: max };
             }
         };
@@ -491,49 +538,15 @@ const FETCH_SHIM: &str = r#"
                 this.ignoreBOM = !!opts.ignoreBOM;
             }
             decode(input) {
-                var u8 = input == null ? new Uint8Array(0) : byteSource(input);
+                if (input == null) return "";
+                var u8 = byteSource(input);
                 if (!u8) return String(input);
                 var start = 0;
                 if (!this.ignoreBOM && u8.length >= 3 && u8[0] === 0xef && u8[1] === 0xbb && u8[2] === 0xbf) start = 3;
-                var parts = [];
-                var pending = null; // code points awaiting a surrogate pair
-                for (var i = start; i < u8.length; ) {
-                    var b0 = u8[i];
-                    var cp, n;
-                    if (b0 < 0x80) { cp = b0; n = 1; }
-                    else if ((b0 & 0xe0) === 0xc0) { cp = b0 & 0x1f; n = 2; }
-                    else if ((b0 & 0xf0) === 0xe0) { cp = b0 & 0x0f; n = 3; }
-                    else if ((b0 & 0xf8) === 0xf0) { cp = b0 & 0x07; n = 4; }
-                    else { throw new TypeError("invalid UTF-8 leading byte"); }
-                    if (i + n > u8.length) { if (this.fatal) throw new TypeError("truncated UTF-8 sequence"); break; }
-                    var okSeq = true;
-                    for (var j = 1; j < n; j++) {
-                        var bj = u8[i + j];
-                        if ((bj & 0xc0) !== 0x80) { okSeq = false; break; }
-                        cp = (cp << 6) | (bj & 0x3f);
-                    }
-                    i += n;
-                    if (!okSeq) { if (this.fatal) throw new TypeError("invalid UTF-8 continuation byte"); cp = 0xfffd; }
-                    // Reject overlong / surrogate / out-of-range encodings.
-                    if ((n === 2 && cp < 0x80) || (n === 3 && cp < 0x800) || (n === 4 && cp < 0x10000) || (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) {
-                        if (this.fatal) throw new TypeError("invalid UTF-8 sequence");
-                        cp = 0xfffd;
-                    }
-                    if (cp > 0xffff) {
-                        var hi = 0xd800 + (((cp - 0x10000) >> 10) & 0x3ff);
-                        var lo = 0xdc00 + ((cp - 0x10000) & 0x3ff);
-                        parts.push(String.fromCharCode(hi, lo));
-                    } else if (pending !== null) {
-                        parts.push(String.fromCharCode(pending, cp));
-                        pending = null;
-                    } else if (cp >= 0xd800 && cp <= 0xdbff) {
-                        pending = cp;
-                    } else {
-                        parts.push(String.fromCharCode(cp));
-                    }
-                }
-                if (pending !== null) parts.push("\ufffd");
-                return parts.join("");
+                // Phase 10C: ONE native pass over a borrowed slice of the buffer. `subarray` skips the
+                // BOM as a view (zero copy) and `fatal` surfaces invalid UTF-8 as a real TypeError;
+                // lossy mode mirrors Node's default decoder with U+FFFD replacements.
+                return __czUtf8Decode(start === 0 ? u8 : u8.subarray(3), this.fatal);
             }
         };
     }
@@ -760,6 +773,9 @@ const FETCH_SHIM: &str = r#"
         this.url = "";
         this.redirected = false;
         this.statusText = "";
+        // Phase 10C: cloned Responses share one buffered body, so each consumer needs its own
+        // defensive copy. An uncloned single-use Response can hand out the received view directly.
+        this._shared = false;
     }
     Response.prototype._finalizeHeaders = function (status, statusText, url, redirected, headers) {
         this.status = status;
@@ -796,19 +812,26 @@ const FETCH_SHIM: &str = r#"
         return decodeText(bytes);
     };
     Response.prototype.json = async function () {
-        const text = await this.text();
-        // globalThis.JSON.parse is cz-json's NEON/Lazy entry point installed by the runner.
-        return globalThis.JSON.parse(text);
+        const bytes = await consumeBody(this);
+        // Direct byte entry into cz-json: `>= 4 KiB` documents stay Lazy with ZERO intermediate JS
+        // string, and small documents take the one-pass DOM. `JSON.parse` remains the fallback.
+        if (typeof globalThis.__czJsonParseBytes === "function") return globalThis.__czJsonParseBytes(bytes);
+        return globalThis.JSON.parse(decodeText(bytes));
     };
     Response.prototype.bytes = async function () {
         const bytes = await consumeBody(this);
-        // Return a fresh view so independent clones cannot alias mutations.
+        // Uncloned + single use: return the received Uint8Array itself (no second allocation).
+        if (!this._shared) return bytes;
         const copy = new Uint8Array(bytes.length);
         copy.set(bytes, 0);
         return copy;
     };
     Response.prototype.arrayBuffer = async function () {
         const bytes = await consumeBody(this);
+        // The engine's ArrayBuffer is already exact-sized, so an uncloned Response can move it out.
+        if (!this._shared && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+            return bytes.buffer;
+        }
         const buffer = new ArrayBuffer(bytes.length);
         const view = new Uint8Array(buffer);
         view.set(bytes, 0);
@@ -819,6 +842,9 @@ const FETCH_SHIM: &str = r#"
         if (this.bodyUsed || s.consumedChunks > 0) throw new TypeError("Response body already consumed; cannot clone");
         const c = new Response(s);
         c._finalizeHeaders(this.status, this.statusText, this.url, this.redirected, new Headers(this.headers));
+        // Both sides now share one buffered body: force defensive copies on consumption.
+        this._shared = true;
+        c._shared = true;
         return c;
     };
 
