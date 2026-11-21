@@ -1,0 +1,101 @@
+name: Build full cz-llrt (.deb with node/zpm/npm aliases)
+
+on:
+  push:
+    tags:
+      - 'llrt-v*'
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Debian package version (e.g. 0.1.0)'
+        required: false
+        default: '0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-llrt-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cardputer-zero-llrt
+        uses: actions/checkout@v4
+
+      - name: Install system build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git make cmake zip unzip xz-utils zstd curl dpkg-dev binutils-aarch64-linux-gnu
+
+      - name: Setup Node.js + yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install -g yarn
+
+      - name: Setup nightly Rust toolchain (nightly-2026-08-26 + rust-src)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-26
+          components: rust-src
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install zig 0.17.1 & cargo-zigbuild
+        run: |
+          ZIG_VER="0.17.1"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" -o /tmp/zig.tar.xz || \
+          curl -fsSL "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/.local/zig"
+          tar -xf /tmp/zig.tar.xz -C "$HOME/.local/zig" --strip-components=1
+          echo "$HOME/.local/zig" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild --version 0.24.1
+
+      - name: Checkout awslabs/llrt v0.10.0-beta
+        run: |
+          git clone --depth 1 --branch v0.10.0-beta https://github.com/awslabs/llrt.git /tmp/llrt-src
+
+      - name: Resolve package version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/llrt-v* ]]; then
+            V="${GITHUB_REF_NAME#llrt-v}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="0.1.0+git.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Patch & build Cortex-A53 cz-llrt
+        run: |
+          export CZ_MODULES_DIR="$PWD/crates/cz-modules"
+          export CZ_ZPM_DIR="$PWD/crates/cz-zpm"
+          bash scripts/build-llrt-a53.sh --apply-only /tmp/llrt-src
+          sed -i 's/"-Ctarget-feature=+crt-static"/"-Ctarget-feature=+crt-static,-aes,-sha2"/' /tmp/llrt-src/.cargo/config.toml
+          cd /tmp/llrt-src
+          yarn install --frozen-lockfile || yarn install
+          export CFLAGS_aarch64_unknown_linux_musl="-mcpu=cortex_a53"
+          make libs-arm64
+          make -B llrt-linux-arm64-no-sdk.zip
+
+      - name: Build cardputer-zero-llrt arm64 .deb
+        run: |
+          bash scripts/build-llrt-deb.sh "${{ steps.ver.outputs.version }}" /tmp/llrt-src/target/aarch64-unknown-linux-musl/release/llrt
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-zero-llrt-${{ steps.ver.outputs.version }}-arm64
+          path: |
+            dist/cardputer-zero-llrt_*.deb
+            dist/cardputer-zero-llrt_*.deb.sha256
+
+      - name: Attach .deb to GitHub Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cardputer-zero-llrt_*.deb
+            dist/cardputer-zero-llrt_*.deb.sha256
