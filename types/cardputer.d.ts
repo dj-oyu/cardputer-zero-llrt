@@ -625,3 +625,135 @@ declare function setTimeout(callback: (...args: unknown[]) => void, delayMs?: nu
 declare function clearTimeout(id: number): void;
 declare function setInterval(callback: (...args: unknown[]) => void, delayMs?: number, ...args: unknown[]): number;
 declare function clearInterval(id: number): void;
+
+// ---------------------------------------------------------------------------
+// Phase 8A: WHATWG fetch() with rustls/ring TLS (crates/cz-net)
+// ---------------------------------------------------------------------------
+
+/** Per-request TLS overrides accepted as `init.tls` (PEM bytes or strings). */
+interface CzFetchTlsOptions {
+  /** Custom trust anchor(s) in PEM format replacing the system roots for this request. */
+  ca?: string | Uint8Array | ArrayBuffer;
+  /** Client certificate (PEM) for mutual TLS (used together with `key`). */
+  cert?: string | Uint8Array | ArrayBuffer;
+  /** Private key matching `cert` (PEM; PKCS#8 or PKCS#1 RSA/EC). */
+  key?: string | Uint8Array | ArrayBuffer;
+  /** Skip server-certificate validation entirely when `false` (self-signed / wrong CA). */
+  rejectUnauthorized?: boolean;
+}
+
+/** WHATWG-compatible header bag (lowercase lookups, multi-value `get-all`, iterators). */
+interface Headers {
+  get(name: string): string | null;
+  getAll(name: string): string[];
+  set(name: string, value: string): void;
+  append(name: string, value: string): void;
+  delete(name: string): void;
+  has(name: string): boolean;
+  forEach(callback: (value: string, name: string) => void): void;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string>;
+  entries(): IterableIterator<[string, string]>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+}
+
+/** WHATWG-style request object (`fetch(Request)` passes url/method/headers/body/redirect/signal/tls). */
+declare class Request {
+  constructor(input: string | Request, init?: {
+    method?: string;
+    headers?: HeadersInit;
+    body?: BodyInit | null;
+    redirect?: "follow" | "manual" | "error";
+    signal?: AbortSignal | null;
+    tls?: CzFetchTlsOptions | null;
+  });
+  readonly url: string;
+  readonly method: string;
+  readonly headers: Headers;
+  readonly redirect: string;
+  readonly bodyUsed: boolean;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+  bytes(): Promise<Uint8Array>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  clone(): Request;
+}
+
+type HeadersInit = Headers | Record<string, string> | Array<[string, string]> | string;
+type BodyInit = string | Uint8Array | ArrayBuffer | URLSearchParams | ReadableStream | null;
+
+/** WHATWG-style response carrying the fetched body (buffered or streamed consumption). */
+declare class Response {
+  readonly type: string;
+  readonly url: string;
+  readonly redirected: boolean;
+  readonly status: number;
+  readonly ok: boolean;
+  readonly statusText: string;
+  readonly headers: Headers;
+  readonly bodyUsed: boolean;
+  readonly body: ReadableStream | null;
+  /** Buffered full-body promise (resolves only after EOF; rejects when already consumed/streaming). */
+  readonly buffered: Promise<Uint8Array>;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+  bytes(): Promise<Uint8Array>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  clone(): Response;
+}
+
+/** AbortController wired into `fetch({ signal })`; abort interrupts in-flight requests immediately. */
+declare class AbortController {
+  constructor();
+  readonly signal: AbortSignal;
+  abort(reason?: unknown): void;
+}
+
+/** AbortSignal with `reason`, `onabort` handling and the Phase 8A `AbortSignal.timeout(ms)` helper. */
+interface AbortSignal {
+  readonly aborted: boolean;
+  readonly reason: unknown;
+  onabort: ((ev?: unknown) => void) | null;
+  addEventListener(type: "abort", listener: (ev?: unknown) => void): void;
+  removeEventListener(type: "abort", listener: (ev?: unknown) => void): void;
+  throwIfAborted(): void;
+}
+
+declare class AbortSignalCtor {
+  static abort(reason?: unknown): AbortSignal;
+  /** Auto-aborts after `ms`; fetch fails with `DOMException` name `TimeoutError`. */
+  static timeout(ms: number): AbortSignal;
+}
+declare const AbortSignalImpl: typeof AbortSignalCtor;
+
+/** Pull-based byte stream over the engine's bounded chunk queue (reader, cancel, async iterator). */
+interface ReadableStream {
+  locked: boolean;
+  getReader(): {
+    read(): Promise<{ value: Uint8Array | undefined; done: boolean }>;
+    cancel(reason?: unknown): Promise<void>;
+    releaseLock(): void;
+    closed: Promise<void>;
+  };
+  cancel(reason?: unknown): Promise<void>;
+  [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array>;
+}
+
+/** Global fetch entry point installed by the runner (`crates/cz-net` rustls/ring engine). */
+declare function fetch(input: string | Request, init?: {
+  method?: string;
+  headers?: HeadersInit;
+  body?: BodyInit | null;
+  redirect?: "follow" | "manual" | "error";
+  signal?: AbortSignal | null;
+  tls?: CzFetchTlsOptions | null;
+  keepalive?: boolean;
+}): Promise<Response>;
+
+declare global {
+  interface AbortSignalConstructor extends AbortSignalCtor {}
+  const AbortSignal: AbortSignalCtor;
+  const Headers: { new (init?: HeadersInit): Headers };
+  const RequestCtor: typeof Request;
+  const ResponseCtor: typeof Response;
+}

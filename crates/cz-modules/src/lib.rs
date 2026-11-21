@@ -20,6 +20,7 @@ use cz_hal::input::{InputState, KeyEvent as HalKeyEvent, Mods};
 use cz_hal::power::PowerStatus;
 
 pub mod audio_module;
+pub mod fetch_module;
 pub mod fs_module;
 pub mod http_module;
 pub mod imu_module;
@@ -42,6 +43,7 @@ pub use imu_module::ImuModule;
 pub use io_module::IoModule;
 pub use ir_module::IrModule;
 pub use json_module::{install_json, JsonModule};
+pub use fetch_module::{fetch_active_count, fetch_has_pending, install_fetch};
 pub use kv_module::KvModule;
 
 /// Every Cardputer module specifier the LLRT bridge exposes (display, input, app, power, kv,

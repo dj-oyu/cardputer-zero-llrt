@@ -8,6 +8,7 @@ license.workspace = true
 cz-hal = { path = "../cz-hal" }
 cz-gfx = { path = "../cz-gfx" }
 cz-json = { path = "../cz-json" }
+cz-net = { path = "../cz-net" }
 rquickjs.workspace = true
 libc.workspace = true
 

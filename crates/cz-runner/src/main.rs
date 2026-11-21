@@ -162,6 +162,7 @@ fn bind_console(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
 }
 
 /// Evaluate one ES module source under `name` (must be called inside a context scope).
+#[cfg(test)]
 fn eval_module(ctx: &Ctx<'_>, name: &str, source: &str) -> Result<(), String> {
     let promise = match Module::evaluate(ctx.clone(), name, source).catch(ctx) {
         Ok(p) => p,
@@ -178,6 +179,99 @@ fn eval_module(ctx: &Ctx<'_>, name: &str, source: &str) -> Result<(), String> {
 /// `Context::with` scope is open re-enters the runtime lock and panics inside rquickjs.
 fn drain_jobs(rt: &Runtime) {
     while let Ok(true) = rt.execute_pending_job() {}
+}
+
+// ---------------------------------------------------------------------------
+// Top-level-await module settlement (Phase 8A)
+// ---------------------------------------------------------------------------
+//
+// `Promise::finish()` spins the QuickJS job queue and returns `WouldBlock` when the queue empties
+// before a top-level awaited promise can settle (fetch/TLS waits on worker threads). Instead of
+// blocking, we attach JavaScript settlement handlers through a tiny glue function (correct `this`
+// binding) that record the outcome on `globalThis`, then pump the event loop OUTSIDE any
+// `Context::with` scope until those flags flip.
+const MODULE_GLUE: &str = r#"
+    (function () {
+        globalThis.__czModuleDone = false;
+        globalThis.__czModuleErrText = "";
+        globalThis.__czWireModule = function (promise) {
+            promise.then(
+                function (_v) { globalThis.__czModuleDone = true; },
+                function (err) {
+                    var text = "unknown script error";
+                    if (err && typeof err === "object") {
+                        var name = err.name ? String(err.name) : "Error";
+                        var msg = err.message !== undefined && err.message !== null ? String(err.message) : String(err);
+                        var head = msg.indexOf(name) === 0 ? msg : name + ": " + msg;
+                        var stack = err.stack ? String(err.stack) : "";
+                        text = stack && stack.indexOf(head) < 0 ? head + "\n" + stack : head;
+                    } else if (err !== undefined && err !== null) {
+                        text = String(err);
+                    }
+                    globalThis.__czModuleErrText = text;
+                    globalThis.__czModuleDone = true;
+                }
+            );
+        };
+        globalThis.__czModuleSettled = function () { return globalThis.__czModuleDone ? 1 : 0; };
+        globalThis.__czModuleError = function () { return globalThis.__czModuleErrText; };
+    })();
+"#;
+
+/// Evaluate an ES module WITHOUT blocking on its promise: settlement lands on the JS flags above.
+fn start_module<'js>(ctx: &Ctx<'js>, name: &str, source: &str) -> Result<(), String> {
+    let promise = match Module::evaluate(ctx.clone(), name, source).catch(ctx) {
+        Ok(p) => p,
+        Err(caught) => return Err(render_caught(ctx, &caught)),
+    };
+    let wire: Function = ctx.globals().get("__czWireModule").map_err(|e| format!("glue missing: {e}"))?;
+    wire.call::<_, ()>((promise.into_value(),)).map_err(|e| format!("wire call: {e}"))?;
+    Ok(())
+}
+
+/// True once the module promise settled (JS flag). Only ever read between job drains.
+fn module_settled(ctx: &Context) -> bool {
+    ctx.with(|c| call_js_i64(&c, "__czModuleSettled", 0) != 0)
+}
+
+/// The rejected error text when the module threw (empty when it resolved cleanly).
+fn module_error_text(ctx: &Context) -> Option<String> {
+    match ctx.with(|c| c.globals().get::<_, String>("__czModuleErrText")) {
+        Ok(text) if !text.is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+/// Pump the engine (HTTP + fetch + timers + QuickJS jobs) until the module settles. Returns `Ok(true)`
+/// when settled, `Ok(false)` when nothing can make progress anymore (deadlock). Never pumps jobs
+/// while a context scope is open (rquickjs RefCell rule).
+fn settle_module(rt: &Runtime, ctx: &Context) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    let mut idle_passes = 0usize;
+    while !module_settled(ctx) {
+        if cz_modules::should_quit() {
+            return Ok(false);
+        }
+        loop_pass(rt, ctx);
+        if module_settled(ctx) {
+            return Ok(true);
+        }
+        let (_, timers, extra_work, fetch_active) = loop_liveness(rt, ctx);
+        if !extra_work && timers <= 0 && fetch_active == 0 && cz_modules::http_listening_count() == 0 {
+            idle_passes += 1;
+            // Brief grace window: a worker thread may be between notify and dispatch.
+            if idle_passes > 60 {
+                return Ok(false);
+            }
+        } else {
+            idle_passes = 0;
+        }
+        if started.elapsed().as_secs() > 3600 {
+            return Err("module evaluation exceeded the 1h safety valve".to_string());
+        }
+        cz_modules::http_idle_pause();
+    }
+    Ok(true)
 }
 
 
@@ -264,6 +358,11 @@ fn has_http_glue(ctx: &Ctx<'_>) -> bool {
 /// `Context::with()` scope, otherwise the runtime `RefCell` is re-entered and panics with
 /// "RefCell already borrowed". So scopes are opened, closed, and only then jobs are pumped.
 fn loop_pass(rt: &Runtime, ctx: &Context) {
+    // 0a. Deliver arrived fetch events (headers/chunks/body/done/error) into the JS shim.
+    //     Engine threads call `notify_event_loop()` on arrival, so this wakes promptly.
+    ctx.with(|c| call_js_i64(&c, "__czFetchDrainLoop", 0));
+    drain_jobs(rt);
+
     // 0. Fire HTTP "close" notifications (Phase 2.5): client disconnects or server-forced
     //    stream ends queue conn ids in the engine; JS clears intervals / releases streams here.
     ctx.with(|c| call_js_i64(&c, "__czHttpCheckCloses", 0));
@@ -278,20 +377,24 @@ fn loop_pass(rt: &Runtime, ctx: &Context) {
     drain_jobs(rt);
 
     // 3. Give promise jobs created by timers one more dispatch pass in this iteration.
-    if rt.is_job_pending() || cz_modules::http_has_pending() {
+    if rt.is_job_pending() || cz_modules::http_has_pending() || cz_modules::fetch_has_pending() {
         ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
+        drain_jobs(rt);
+        ctx.with(|c| call_js_i64(&c, "__czFetchDrainLoop", 0));
         drain_jobs(rt);
     }
 }
 
 /// Liveness snapshot: listening servers, pending JS timers, plus queued engine requests or
 /// pending QuickJS jobs. Runtime queries run outside any context scope.
-fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool) {
+fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool, usize) {
     let listening = cz_modules::http_listening_count();
-    let queued = cz_modules::http_has_pending();
+    let queued = cz_modules::http_has_pending() || cz_modules::fetch_has_pending();
     let job_pending = rt.is_job_pending();
     let timers = ctx.with(|c| call_js_i64(&c, "__czTimerCount", 0));
-    (listening, timers, queued || job_pending)
+    // Live fetch slots keep the process alive even when no node:http server exists.
+    let fetch_active = cz_modules::fetch_active_count();
+    (listening, timers, queued || job_pending, fetch_active)
 }
 
 /// Keep the process alive while any HTTP server listens or any timer is pending. The idle pause
@@ -311,11 +414,11 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
             break;
         }
         loop_pass(rt, ctx);
-        let (listening, timers, extra_work) = loop_liveness(rt, ctx);
-        if listening == 0 && timers <= 0 && !extra_work {
+        let (listening, timers, extra_work, fetch_active) = loop_liveness(rt, ctx);
+        if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 {
             break;
         }
-        if !has_http && listening == 0 && timers <= 0 {
+        if !has_http && listening == 0 && timers <= 0 && fetch_active == 0 {
             break;
         }
         if started.elapsed().as_secs() > 3600 {
@@ -390,13 +493,40 @@ fn main() {
         // Phase 5: swap globalThis.JSON.parse / JSON.stringify for the cz-json NEON engine
         // (fast < 4 KiB path, transparent Lazy handles for larger documents, kv-row shortcut).
         cz_modules::install_json(&ctx).map_err(|e| format!("{e}"))?;
-        eval_module(&ctx, &name, &source)
+        // Phase 8A: global fetch()/Headers/Request/Response/AbortController/AbortSignal/
+        // ReadableStream (+ URLSearchParams when absent) built on cz-net's sync worker engine.
+        cz_modules::install_fetch(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 8A: top-level `await fetch(...)` must not deadlock — evaluate the module without
+        // blocking on its promise (JS glue records settlement), then pump the loop outside scopes.
+        ctx.eval::<(), _>(MODULE_GLUE).map_err(|e| format!("module glue: {e}"))?;
+        start_module(&ctx, &name, &source)
     });
     // Drain any remaining QuickJS jobs outside the context scope.
     drain_jobs(&rt);
 
     match run_result {
         Ok(()) => {
+            // Settle the module's top-level await by pumping HTTP/fetch/timers + jobs (never while
+            // a context scope is open), then exit non-zero when the script threw.
+            match settle_module(&rt, &ctx) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let msg = module_error_text(&ctx)
+                        .unwrap_or_else(|| "script's top-level await never resolved (deadlock)".to_string());
+                    eprintln!("cz-js: {msg}");
+                    std::process::exit(1);
+                }
+                Err(msg) => {
+                    eprintln!("cz-js: {msg}");
+                    std::process::exit(1);
+                }
+            }
+            if let Some(text) = module_error_text(&ctx) {
+                eprintln!("cz-js: {text}");
+                std::io::stdout().flush().ok();
+                std::io::stderr().flush().ok();
+                std::process::exit(1);
+            }
             // Stay alive while an HTTP server is listening or timers are pending, then exit 0.
             if let Err(msg) = run_event_loop(&rt, &ctx) {
                 eprintln!("cz-js: {msg}");
