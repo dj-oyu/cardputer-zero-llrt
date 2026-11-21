@@ -42,10 +42,76 @@ fn hex_nibble(b: u8) -> Option<u8> {
 
 /// Node-style hex decode: ASCII whitespace is skipped and the first non-hex character terminates
 /// the stream (a dangling nibble is dropped exactly like `Buffer.from(hex,'hex')` does).
+///
+/// On `aarch64`, clean 32-char blocks take an ARMv8.0 baseline NEON fast path (`vld2q_u8` ->
+/// disjoint range decode + `vminvq_u8` validation -> `vst1q_u8`, 32B -> 16B) and break to the
+/// exact scalar state machine on any whitespace or non-hex byte.
 fn hex_decode(text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() / 2 + 1);
+    let n = text.len();
+    let mut out = Vec::<u8>::with_capacity(n / 2 + 1);
+    #[allow(unused_mut)]
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{
+            uint8x16_t, vaddq_u8, vandq_u8, vcgeq_u8, vcleq_u8, vdupq_n_u8, vld2q_u8, vminvq_u8,
+            vorrq_u8, vshlq_n_u8, vst1q_u8,
+        };
+        if n >= 32 {
+            unsafe {
+                let c_0 = vdupq_n_u8(b'0');
+                let c_9 = vdupq_n_u8(b'9');
+                let c_a = vdupq_n_u8(b'a');
+                let c_f = vdupq_n_u8(b'f');
+                let bit_lc = vdupq_n_u8(0x20);
+                // Wrapping add offsets: '0'..'9' (-48 = 208), 'a'..'f' (-97 + 10 = -87 = 169).
+                let off_dig = vdupq_n_u8(208);
+                let off_hex = vdupq_n_u8(169);
+
+                #[inline(always)]
+                unsafe fn decode_nibbles(
+                    v: uint8x16_t,
+                    c_0: uint8x16_t,
+                    c_9: uint8x16_t,
+                    c_a: uint8x16_t,
+                    c_f: uint8x16_t,
+                    bit_lc: uint8x16_t,
+                    off_dig: uint8x16_t,
+                    off_hex: uint8x16_t,
+                ) -> (uint8x16_t, uint8x16_t) {
+                    let m_dig = vandq_u8(vcgeq_u8(v, c_0), vcleq_u8(v, c_9));
+                    let v_lc = vorrq_u8(v, bit_lc);
+                    let m_hex = vandq_u8(vcgeq_u8(v_lc, c_a), vcleq_u8(v_lc, c_f));
+                    let valid = vorrq_u8(m_dig, m_hex);
+                    let nib = vorrq_u8(
+                        vandq_u8(m_dig, vaddq_u8(v, off_dig)),
+                        vandq_u8(m_hex, vaddq_u8(v_lc, off_hex)),
+                    );
+                    (nib, valid)
+                }
+
+                let src = text.as_ptr();
+                let dst = out.as_mut_ptr();
+                let mut o = 0usize;
+                while i + 32 <= n {
+                    let raw = vld2q_u8(src.add(i));
+                    let (n0, ok0) = decode_nibbles(raw.0, c_0, c_9, c_a, c_f, bit_lc, off_dig, off_hex);
+                    let (n1, ok1) = decode_nibbles(raw.1, c_0, c_9, c_a, c_f, bit_lc, off_dig, off_hex);
+                    if vminvq_u8(vandq_u8(ok0, ok1)) == 0 {
+                        break;
+                    }
+                    vst1q_u8(dst.add(o), vorrq_u8(vshlq_n_u8(n0, 4), n1));
+                    i += 32;
+                    o += 16;
+                }
+                out.set_len(o);
+            }
+        }
+    }
+
     let mut hi: Option<u8> = None;
-    for &b in text {
+    for &b in &text[i..] {
         if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
             continue;
         }

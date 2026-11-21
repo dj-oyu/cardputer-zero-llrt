@@ -95,6 +95,91 @@ fn neon_scan(bytes: &[u8], start: usize) -> usize {
     n
 }
 
+/// Returns `(end_idx, all_ascii)` in ONE pass: `end_idx` is the first byte at or after `start`
+/// that is `"`, `\` or `< 0x20` (or `bytes.len()`), and `all_ascii` is true iff every byte in
+/// `bytes[start..end_idx]` is `< 0x80`. Eliminates the redundant second-pass `is_ascii_fast`
+/// scan on short JSON keys/strings.
+#[inline]
+pub fn scan_unescaped_run_ascii(bytes: &[u8], start: usize) -> (usize, bool) {
+    let n = bytes.len();
+    if start >= n {
+        return (n, true);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_scan_ascii(bytes, start)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let end = swar_scan(bytes, start);
+        (end, swar_is_ascii(&bytes[start..end]))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn neon_scan_ascii(bytes: &[u8], start: usize) -> (usize, bool) {
+    use core::arch::aarch64::vandq_u8;
+    let n = bytes.len();
+    let lanes: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let mut i = start;
+    let mut hi_byte: u8;
+    unsafe {
+        let p = bytes.as_ptr();
+        let lane_v = vld1q_u8(lanes.as_ptr());
+        let quote_v = vdupq_n_u8(QUOTE);
+        let slash_v = vdupq_n_u8(BACKSLASH);
+        let ctrl_v = vdupq_n_u8(0x20);
+        let all_ones = vdupq_n_u8(u8::MAX);
+        let mut hi_v = vdupq_n_u8(0);
+
+        while i + 32 <= n {
+            let v0 = vld1q_u8(p.add(i));
+            let v1 = vld1q_u8(p.add(i + 16));
+            let hit0 = vorrq_u8(vorrq_u8(vceqq_u8(v0, quote_v), vceqq_u8(v0, slash_v)), vcltq_u8(v0, ctrl_v));
+            let hit1 = vorrq_u8(vorrq_u8(vceqq_u8(v1, quote_v), vceqq_u8(v1, slash_v)), vcltq_u8(v1, ctrl_v));
+            if vmaxvq_u8(vorrq_u8(hit0, hit1)) == 0 {
+                hi_v = vorrq_u8(hi_v, vorrq_u8(v0, v1));
+                i += 32;
+                continue;
+            }
+            if vmaxvq_u8(hit0) != 0 {
+                let k = vminvq_u8(vbslq_u8(hit0, lane_v, all_ones));
+                let before = vandq_u8(v0, vcltq_u8(lane_v, vdupq_n_u8(k)));
+                let ascii = vmaxvq_u8(vorrq_u8(hi_v, before)) < 0x80;
+                return (i + k as usize, ascii);
+            }
+            hi_v = vorrq_u8(hi_v, v0);
+            let k = vminvq_u8(vbslq_u8(hit1, lane_v, all_ones));
+            let before = vandq_u8(v1, vcltq_u8(lane_v, vdupq_n_u8(k)));
+            let ascii = vmaxvq_u8(vorrq_u8(hi_v, before)) < 0x80;
+            return (i + 16 + k as usize, ascii);
+        }
+
+        while i + 16 <= n {
+            let v = vld1q_u8(p.add(i));
+            let hit = vorrq_u8(vorrq_u8(vceqq_u8(v, quote_v), vceqq_u8(v, slash_v)), vcltq_u8(v, ctrl_v));
+            if vmaxvq_u8(hit) != 0 {
+                let k = vminvq_u8(vbslq_u8(hit, lane_v, all_ones));
+                let before = vandq_u8(v, vcltq_u8(lane_v, vdupq_n_u8(k)));
+                let ascii = vmaxvq_u8(vorrq_u8(hi_v, before)) < 0x80;
+                return (i + k as usize, ascii);
+            }
+            hi_v = vorrq_u8(hi_v, v);
+            i += 16;
+        }
+        hi_byte = vmaxvq_u8(hi_v);
+    }
+    while i < n {
+        let b = bytes[i];
+        if b == QUOTE || b == BACKSLASH || b < 0x20 {
+            return (i, hi_byte < 0x80);
+        }
+        hi_byte |= b;
+        i += 1;
+    }
+    (n, hi_byte < 0x80)
+}
+
 // ---------------------------------------------------------------------------
 // Fast ASCII check (used to skip UTF-8 state machines on pure-ASCII slices)
 // ---------------------------------------------------------------------------

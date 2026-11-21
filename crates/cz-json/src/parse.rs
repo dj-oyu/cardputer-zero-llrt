@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use crate::simd::{is_ascii_fast, scan_unescaped_run};
+use crate::simd::{scan_unescaped_run, scan_unescaped_run_ascii};
 use crate::val::{Span, Val};
 
 /// Nesting cap (mirrors QuickJS's recursion guard) so adversarial documents cannot overflow.
@@ -140,12 +140,12 @@ impl<'a> Scanner<'a> {
         let open = self.p;
         self.expect(b'"')?;
         let cs = self.p;
-        let first = scan_unescaped_run(self.b, cs);
+        let (first, all_ascii) = scan_unescaped_run_ascii(self.b, cs);
         if first < self.b.len() && self.b[first] == b'"' {
             // Clean run: borrow straight from the input buffer (zero copy, no intermediate Vec).
             let body = &self.b[cs..first];
-            // Fast path: pure-ASCII bodies skip the UTF-8 state machine entirely.
-            let s = if is_ascii_fast(body) {
+            // Single-pass ASCII flag skips the UTF-8 state machine without re-scanning `body`.
+            let s = if all_ascii {
                 // SAFETY: every byte < 0x80, which is valid single-byte UTF-8 by construction.
                 unsafe { std::str::from_utf8_unchecked(body) }
             } else {
@@ -238,12 +238,8 @@ impl<'a> Scanner<'a> {
             }
             // Beyond i64 magnitude: QuickJS keeps such numbers as floats.
         }
-        let text = if is_ascii_fast(tok) {
-            // SAFETY: JSON number grammar tokens are pure ASCII (`-`, digits, `.`, `e`, `+`).
-            unsafe { std::str::from_utf8_unchecked(tok) }
-        } else {
-            std::str::from_utf8(tok).map_err(|_| ParseErr::new(start, "Invalid number"))?
-        };
+        // SAFETY: JSON number grammar above only accepts ASCII bytes ('-', '+', '.', 'e', 'E', '0'..'9').
+        let text = unsafe { std::str::from_utf8_unchecked(tok) };
         let f = match text.parse::<f64>() {
             Ok(f) => f,
             // Grammar already validated, so a parse failure can only be magnitude overflow.
@@ -339,10 +335,10 @@ pub fn decode_string_content(content: &[u8]) -> Result<String, ParseErr> {
     let mut out = String::with_capacity(content.len());
     let mut i = 0usize;
     while i < content.len() {
-        let r = scan_unescaped_run(content, i);
+        let (r, all_ascii) = scan_unescaped_run_ascii(content, i);
         if r > i {
             let run = &content[i..r];
-            if crate::simd::is_ascii_fast(run) {
+            if all_ascii {
                 // SAFETY: pure ASCII is valid UTF-8 by construction.
                 out.push_str(unsafe { std::str::from_utf8_unchecked(run) });
             } else {

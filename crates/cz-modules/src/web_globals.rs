@@ -12,11 +12,12 @@
 //! * Every shim below stays `'static` and QuickJS-safe (no optional chaining / nullish
 //!   coalescing), and registers idempotently behind `globalThis.__czWebGlobalsInstalled`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
-use rquickjs::{Ctx, Function, Result};
+use rquickjs::{qjs, Ctx, Error, Function, Result, Value};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
@@ -44,6 +45,217 @@ fn now_ms() -> f64 {
     Instant::now().duration_since(*process_start()).as_secs_f64() * 1000.0
 }
 
+const MAX_CLONE_DEPTH: usize = 200;
+
+struct PropEnumGuard {
+    q: *mut qjs::JSContext,
+    tab: *mut qjs::JSPropertyEnum,
+    len: u32,
+}
+
+impl Drop for PropEnumGuard {
+    fn drop(&mut self) {
+        if !self.tab.is_null() {
+            unsafe {
+                qjs::JS_FreePropertyEnum(self.q, self.tab, self.len);
+            }
+        }
+    }
+}
+
+enum FastClone<'js> {
+    Done(Value<'js>),
+    Fallback,
+}
+
+fn clone_fast_rec<'js>(
+    ctx: &Ctx<'js>,
+    val: &Value<'js>,
+    seen: &mut HashMap<usize, Value<'js>>,
+    obj_proto_ptr: usize,
+    arr_proto_ptr: usize,
+    depth: usize,
+) -> Result<FastClone<'js>> {
+    if depth > MAX_CLONE_DEPTH {
+        return Ok(FastClone::Fallback);
+    }
+    if val.is_function() || val.is_symbol() {
+        let mk: Function<'js> = ctx.globals().get("__czDataCloneErr")?;
+        let err: Value<'js> = mk.call((if val.is_function() { "function" } else { "symbol" },))?;
+        return Err(ctx.throw(err));
+    }
+    if !val.is_object() {
+        // Primitives (null, undefined, bool, number, string, bigint) are immutable & shared.
+        return Ok(FastClone::Done(val.clone()));
+    }
+
+    let q = ctx.as_raw().as_ptr();
+    let raw = val.as_raw();
+    let ptr_key = unsafe { raw.u.ptr as usize };
+    if let Some(existing) = seen.get(&ptr_key) {
+        return Ok(FastClone::Done(existing.clone()));
+    }
+
+    unsafe {
+        let is_arr = qjs::JS_IsArray(raw);
+        let proto_raw = qjs::JS_GetPrototype(q, raw);
+        if qjs::JS_IsException(proto_raw) {
+            return Err(Error::Exception);
+        }
+        let proto_val = Value::from_raw(ctx.clone(), proto_raw);
+        let proto_is_null = proto_val.is_null();
+        let proto_ptr = if proto_val.is_object() {
+            proto_val.as_raw().u.ptr as usize
+        } else {
+            0
+        };
+
+        if is_arr && proto_ptr == arr_proto_ptr {
+            let mut len_i64: i64 = 0;
+            if qjs::JS_GetLength(q, raw, &mut len_i64) < 0 {
+                return Err(Error::Exception);
+            }
+            let len = if len_i64 < 0 { 0usize } else { len_i64 as usize };
+            // Check if array has extra non-index enumerable properties (rare).
+            let mut tab: *mut qjs::JSPropertyEnum = std::ptr::null_mut();
+            let mut prop_cnt: u32 = 0;
+            if qjs::JS_GetOwnPropertyNames(
+                q,
+                &mut tab,
+                &mut prop_cnt,
+                raw,
+                (qjs::JS_GPN_STRING_MASK | qjs::JS_GPN_ENUM_ONLY) as i32,
+            ) < 0
+            {
+                return Err(Error::Exception);
+            }
+            let _guard = PropEnumGuard { q, tab, len: prop_cnt };
+            if (prop_cnt as usize) > len {
+                // Extra named properties on array: delegate to JS fallback for full fidelity.
+                return Ok(FastClone::Fallback);
+            }
+            drop(_guard);
+
+            let out_raw = qjs::JS_NewArray(q);
+            if qjs::JS_IsException(out_raw) {
+                return Err(Error::Exception);
+            }
+            let out_val = Value::from_raw(ctx.clone(), out_raw);
+            seen.insert(ptr_key, out_val.clone());
+
+            for i in 0..len {
+                let elem_raw = qjs::JS_GetPropertyUint32(q, raw, i as u32);
+                if qjs::JS_IsException(elem_raw) {
+                    return Err(Error::Exception);
+                }
+                let elem_val = Value::from_raw(ctx.clone(), elem_raw);
+                let cloned = match clone_fast_rec(
+                    ctx,
+                    &elem_val,
+                    seen,
+                    obj_proto_ptr,
+                    arr_proto_ptr,
+                    depth + 1,
+                )? {
+                    FastClone::Done(c) => c,
+                    FastClone::Fallback => return Ok(FastClone::Fallback),
+                };
+                let dup = qjs::JS_DupValue(q, cloned.as_raw());
+                if qjs::JS_DefinePropertyValueUint32(
+                    q,
+                    out_val.as_raw(),
+                    i as u32,
+                    dup,
+                    qjs::JS_PROP_C_W_E as i32,
+                ) < 0
+                {
+                    return Err(Error::Exception);
+                }
+            }
+            return Ok(FastClone::Done(out_val));
+        }
+
+        if !is_arr && (proto_ptr == obj_proto_ptr || proto_is_null) {
+            let out_raw = if proto_is_null {
+                qjs::JS_NewObjectProto(q, qjs::JS_NULL)
+            } else {
+                qjs::JS_NewObject(q)
+            };
+            if qjs::JS_IsException(out_raw) {
+                return Err(Error::Exception);
+            }
+            let out_val = Value::from_raw(ctx.clone(), out_raw);
+            seen.insert(ptr_key, out_val.clone());
+
+            let mut tab: *mut qjs::JSPropertyEnum = std::ptr::null_mut();
+            let mut len: u32 = 0;
+            if qjs::JS_GetOwnPropertyNames(
+                q,
+                &mut tab,
+                &mut len,
+                raw,
+                (qjs::JS_GPN_STRING_MASK | qjs::JS_GPN_ENUM_ONLY) as i32,
+            ) < 0
+            {
+                return Err(Error::Exception);
+            }
+            let _guard = PropEnumGuard { q, tab, len };
+            for i in 0..len {
+                let atom = (*tab.add(i as usize)).atom;
+                let prop_raw = qjs::JS_GetProperty(q, raw, atom);
+                if qjs::JS_IsException(prop_raw) {
+                    return Err(Error::Exception);
+                }
+                let prop_val = Value::from_raw(ctx.clone(), prop_raw);
+                let cloned = match clone_fast_rec(
+                    ctx,
+                    &prop_val,
+                    seen,
+                    obj_proto_ptr,
+                    arr_proto_ptr,
+                    depth + 1,
+                )? {
+                    FastClone::Done(c) => c,
+                    FastClone::Fallback => return Ok(FastClone::Fallback),
+                };
+                let dup = qjs::JS_DupValue(q, cloned.as_raw());
+                if qjs::JS_DefinePropertyValue(
+                    q,
+                    out_val.as_raw(),
+                    atom,
+                    dup,
+                    qjs::JS_PROP_C_W_E as i32,
+                ) < 0
+                {
+                    return Err(Error::Exception);
+                }
+            }
+            return Ok(FastClone::Done(out_val));
+        }
+    }
+
+    Ok(FastClone::Fallback)
+}
+
+fn structured_clone_fast<'js>(ctx: Ctx<'js>, val: Value<'js>) -> Result<Value<'js>> {
+    // Cache Object.prototype and Array.prototype pointers once per call (2 cheap lookups).
+    let obj_ctor: rquickjs::Object<'js> = ctx.globals().get("Object")?;
+    let obj_proto: Value<'js> = obj_ctor.get("prototype")?;
+    let arr_ctor: rquickjs::Object<'js> = ctx.globals().get("Array")?;
+    let arr_proto: Value<'js> = arr_ctor.get("prototype")?;
+    let obj_proto_ptr = unsafe { obj_proto.as_raw().u.ptr as usize };
+    let arr_proto_ptr = unsafe { arr_proto.as_raw().u.ptr as usize };
+
+    let mut seen: HashMap<usize, Value<'js>> = HashMap::new();
+    match clone_fast_rec(&ctx, &val, &mut seen, obj_proto_ptr, arr_proto_ptr, 0)? {
+        FastClone::Done(v) => Ok(v),
+        FastClone::Fallback => {
+            let fb: Function<'js> = ctx.globals().get("__czCloneFallback")?;
+            fb.call((val,))
+        }
+    }
+}
+
 /// Install `Event`, `CustomEvent`, `EventTarget`, `structuredClone`, `performance` and
 /// `queueMicrotask` on this context (idempotent). `install_fetch` / `install_ws` call this first
 /// so `AbortSignal` and `WebSocket` can inherit from `EventTarget` in any context shape.
@@ -55,6 +267,7 @@ pub fn install_web_globals<'js>(ctx: &Ctx<'js>) -> Result<()> {
     // Monotonic clock natives: closures capture nothing (OnceLock lookups only).
     ctx.globals().set("__czTimeOrigin", time_origin_ms())?;
     ctx.globals().set("__czPerformanceNow", Function::new(ctx.clone(), || -> f64 { now_ms() }))?;
+    ctx.globals().set("__czStructuredCloneFast", Function::new(ctx.clone(), structured_clone_fast)?)?;
 
     ctx.eval::<(), _>(WEB_GLOBALS_SHIM)?;
     INSTALLED.store(true, Ordering::SeqCst);
@@ -241,7 +454,11 @@ const WEB_GLOBALS_SHIM: &str = r#"
         return out;
     }
 
-    globalThis.structuredClone = function (value) { return cloneValue(value, new Map()); };
+    globalThis.__czDataCloneErr = function (kind) {
+        return dataCloneError("could not clone " + kind + " values");
+    };
+    globalThis.__czCloneFallback = function (value) { return cloneValue(value, new Map()); };
+    globalThis.structuredClone = function (value) { return __czStructuredCloneFast(value); };
 
     // ---- queueMicrotask --------------------------------------------------------------------
     // Schedules on the QuickJS promise-job queue (`Promise.resolve().then`); the runner drains
