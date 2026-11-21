@@ -13,8 +13,9 @@ Tailscale from a phone/laptop, serving static HTML through minimal `node:fs`.
 | --- | --- |
 | `cz-gfx` | RGB565 canvas, 8x8 bitmap font, TTF rendering (swash/zeno) |
 | `cz-hal` | Backlight/framebuffer/input sysfs + evdev, BQ27220 gauge, HTTP/1.1 parser, TCP server engine |
-| `cz-modules` | JS module bindings: `cardputer:display`, `cardputer:input`, `cardputer:app`, `cardputer:power`, `node:http`, `node:fs` |
-| `cz-runner` | `cz-js` CLI: resolver, Node-compatible timers, event loop |
+| `cz-modules` | JS module bindings: `cardputer:display`, `cardputer:input`, `cardputer:app`, `cardputer:power`, `node:http`, `node:fs`, global `fetch()` (Phase 8A) |
+| `cz-net` | Shared TLS foundation (`rustls` + `ring`, system roots via `rustls-native-certs`) and the sync-threaded HTTP/1.1 `fetch` engine on `ureq` v3 |
+| `cz-runner` | `cz-js` CLI: resolver, Node-compatible timers, event loop (top-level await pumps fetch safely) |
 
 ```bash
 cargo build --release                 # target/release/cz-js
@@ -41,6 +42,17 @@ cargo build --release                 # target/release/cz-js
 - `node:fs` (alias `fs`) — minimal static-asset surface: `readFileSync(path, encoding?)` (`string` for
   `"utf8"`/`"utf-8"`, otherwise `Uint8Array`, throws on missing paths), `existsSync(path)`,
   `statSync(path)` → `{ size, isFile(), isDirectory() }`.
+- `fetch()` (global, Phase 8A) — WHATWG surface: `fetch(input, init)` resolves **header-first** once status
+  and headers arrive; `Response.status/statusText/ok/headers/url/redirected/type`, `text()/json()/bytes()/
+  arrayBuffer()/clone()`, `Request`, `Headers`, `AbortController`/`AbortSignal` (+ `AbortSignal.timeout(ms)`),
+  `ReadableStream` with `getReader()`, `read()`/`releaseLock()`/`cancel()` and `[Symbol.asyncIterator]`,
+  plus `URLSearchParams` when absent. Redirect modes `follow`/`manual`/`error`, gzip/chunked decoding, a
+  16 MiB buffered-body cap (`BodyTooLarge`), streaming mode with prefix replay, and abort that tears the
+  socket down immediately (~10 ms observed).
+- Per-request TLS extension `init.tls` — `{ ca, cert, key, rejectUnauthorized }` (PEM string or bytes) on real
+  rustls/ring TLS 1.2/1.3: system CA roots (honoring `SSL_CERT_FILE`/`SSL_CERT_DIR` and `NODE_EXTRA_CA_CERTS`)
+  cached lazily, a Node-compatible self-signed-leaf-as-CA acceptance path, mTLS client auth, and verified
+  rejection of untrusted/mismatched certificates.
 - Globals — `setTimeout/clearTimeout/setInterval/clearInterval` (Node-compatible ids and extra args).
 
 ## HTTP robustness (Phase 2 hardening)
@@ -63,11 +75,12 @@ uses a poll-based accept loop plus one reader thread per connection:
 ## Verification
 
 ```bash
-cargo test --workspace          # 111 Rust unit/integration tests (13 gfx + 72 hal + 17 modules + 9 runner)
+cargo test --workspace          # 262 Rust unit/integration tests (13 gfx + 126 hal + 29 json + 48 modules + 2 net + 24 net-engine + 10 runner + 28 zpm)
 RUSTFLAGS="-D warnings" cargo check --workspace --all-targets   # zero-warning gate
 bash /refs/verify/check_integrity.sh    # anti-cheat / Phase 1 file integrity
 bash /refs/verify/check_rust_p2.sh      # >=75 tests, -D warnings
 bash /refs/verify/check_e2e_p2.sh       # Phase 1 E2E regression + 10 reference Node-style web-server cases
+node /refs/phase8a/verify_phase8a.mjs    # Phase 8A fetch/TLS E2E (HTTPS, SSE streaming, abort, redirect, types)
 bash /refs/verify/check_types_p2.sh     # all six module declarations present & balanced
 npx --yes -p typescript tsc --noEmit --strict --target es2022 types/cardputer.d.ts  # real typecheck
 ```

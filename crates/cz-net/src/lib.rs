@@ -311,6 +311,39 @@ mod tests {
         assert_eq!(&echoed[..], b"cz-ping", "encrypted roundtrip must echo exactly");
     }
 
+    /// Node-compatible `ca:` semantics: a self-signed leaf handed over as its own CA must verify
+    /// (rustls' stock webpki verifier rejects that shape with `CaUsedAsEndEntity`), while an
+    /// unrelated CA still fails closed.
+    #[test]
+    fn tls_self_signed_leaf_as_ca_is_accepted_and_unrelated_ca_rejects() {
+        let server = build_server_config(&TlsServerOptions {
+            cert_pem: fixture("self-cert.pem"),
+            key_pem: fixture("self-key.pem"),
+            ca_pem: None,
+            require_client_auth: false,
+        })
+        .expect("self signed server cfg");
+
+        let tolerant = build_client_config(&TlsClientOptions {
+            ca_pem: Some(fixture("self-cert.pem")),
+            ..Default::default()
+        })
+        .expect("tolerant client cfg");
+        let echoed = tls_handshake(tolerant, server.clone()).expect("self-signed leaf as CA must verify");
+        assert_eq!(&echoed[..], b"cz-ping", "encrypted roundtrip must echo exactly");
+
+        let unrelated = build_client_config(&TlsClientOptions {
+            ca_pem: Some(fixture("ca.pem")),
+            ..Default::default()
+        })
+        .expect("unrelated ca cfg");
+        let err = tls_handshake(unrelated, server).expect_err("unrelated CA MUST reject");
+        assert!(
+            err.contains("certificate") || err.contains("Issuer") || err.contains("invalid"),
+            "rejection text was: {err}"
+        );
+    }
+
     #[test]
     fn tls_handshake_rejects_wrong_ca_but_passes_when_unverified() {
         let server = build_server_config(&TlsServerOptions {

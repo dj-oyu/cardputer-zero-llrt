@@ -130,6 +130,88 @@ pub fn system_root_store() -> Result<Arc<RootCertStore>, String> {
     }
 }
 
+/// Verifier for explicit `ca_pem` overrides that mirrors Node's `tls.connect({ ca })` semantics:
+/// webpki chain verification first, and when the end-entity certificate IS one of the provided
+/// anchors (a self-signed leaf handed to the caller as its own CA), accept it directly. rustls'
+/// stock webpki verifier rejects such anchors with `CertificateError::CaUsedAsEndEntity`, which
+/// would break every self-signed loopback TLS case.
+#[derive(Debug)]
+struct SelfSignedTolerantVerifier {
+    delegate: Arc<rustls::client::WebPkiServerVerifier>,
+    anchors: Vec<CertificateDer<'static>>,
+}
+
+impl SelfSignedTolerantVerifier {
+    fn new(
+        delegate: Arc<rustls::client::WebPkiServerVerifier>,
+        anchors: Vec<CertificateDer<'static>>,
+    ) -> Self {
+        Self { delegate, anchors }
+    }
+
+    /// webpki surfaces `CaUsedAsEndEntity` as `CertificateError::Other(OtherError(..))` whose
+    /// `PartialEq` is always false (rustls error.rs line 1051), so identify it via its Debug text.
+    fn is_ca_as_end_entity(err: &rustls::Error) -> bool {
+        match err {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)) => {
+                other.to_string().contains("CaUsedAsEndEntity")
+                    || format!("{other:?}").contains("CaUsedAsEndEntity")
+            }
+            _ => false,
+        }
+    }
+
+    fn anchor_matches(&self, end_entity: &CertificateDer<'_>) -> bool {
+        self.anchors.iter().any(|a| a.as_ref() == end_entity.as_ref())
+    }
+}
+
+impl ServerCertVerifier for SelfSignedTolerantVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self.delegate.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // A self-signed leaf presented as its own trust anchor is the intentional Node
+                // `ca:` pattern; everything else still fails closed.
+                if Self::is_ca_as_end_entity(&e) && self.anchor_matches(end_entity) {
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.delegate.supported_verify_schemes()
+    }
+}
+
 /// Verifier used when `reject_unauthorized: false`: accepts any chain but still performs a real
 /// TLS 1.2/1.3 handshake (encryption remains genuine; only certificate trust is bypassed).
 #[derive(Debug)]
@@ -186,32 +268,45 @@ impl ServerCertVerifier for AcceptAnyVerifier {
 /// Build a `rustls::ClientConfig` from [`TlsClientOptions`], always using the `ring` provider.
 pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider)
+    // Clone cheaply: the CA-verifier branch also needs the same ring provider.
+    let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| format!("TLS error: unsupported protocol versions: {e}"))?;
 
     let builder = if !opts.reject_unauthorized {
         builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
     } else {
-        let store = match &opts.ca_pem {
+        match &opts.ca_pem {
             Some(pem) => {
+                // Explicit CA override: webpki verifier over the provided anchors, wrapped so a
+                // self-signed end-entity that equals an anchor is accepted (Node `ca:` semantics).
                 let certs = parse_certificates(pem)?;
                 let mut store = RootCertStore::empty();
-                let (added, ignored) = store.add_parsable_certificates(certs);
+                let (added, ignored) = store.add_parsable_certificates(certs.clone());
                 if added == 0 {
                     return Err(format!(
                         "TLS error: ca_pem contained no trusted certificate ({ignored} ignored)"
                     ));
                 }
-                store
+                let delegate = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(store),
+                    provider.clone(),
+                )
+                .build()
+                .map_err(|e| format!("TLS error: cannot build CA verifier: {e}"))?;
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(SelfSignedTolerantVerifier::new(
+                        delegate,
+                        certs,
+                    )))
             }
             None => {
                 // Clone the cached system roots into a fresh store (RootCertStore::roots is public).
                 let cached = system_root_store()?;
-                RootCertStore { roots: cached.roots.clone() }
+                builder.with_root_certificates(RootCertStore { roots: cached.roots.clone() })
             }
-        };
-        builder.with_root_certificates(store)
+        }
     };
 
     let config = match (&opts.cert_pem, &opts.key_pem) {
@@ -224,6 +319,7 @@ pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>,
         }
         _ => builder.with_no_client_auth(),
     };
+
 
     // SNI on by default so virtual-hosted servers route correctly.
     Ok(Arc::new(config))
