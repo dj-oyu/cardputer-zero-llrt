@@ -52,7 +52,7 @@ jobs:
 
       - name: Checkout awslabs/llrt v0.10.0-beta
         run: |
-          git clone --depth 1 --branch v0.10.0-beta https://github.com/awslabs/llrt.git /tmp/llrt-src
+          git clone --depth 1 --recurse-submodules --shallow-submodules --branch v0.10.0-beta https://github.com/awslabs/llrt.git /tmp/llrt-src
 
       - name: Resolve package version
         id: ver
