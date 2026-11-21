@@ -23,8 +23,8 @@ pub mod ws;
 
 pub use fetch::{
     active_fetch_count, cancel_fetch, fetch_has_pending, is_redirect_status, live_ids, next_event,
-    parse_redirect_mode, release_slot, start_fetch, switch_buffered, switch_streaming, AbortHandle,
-    EngineEvent, FailKind, FetchSpec, RedirectMode, CHUNK_QUEUE_DEPTH, CHUNK_SIZE,
+    parse_redirect_mode, release_slot, start_fetch, switch_buffered, switch_streaming, sync_agent,
+    AbortHandle, EngineEvent, FailKind, FetchSpec, RedirectMode, CHUNK_QUEUE_DEPTH, CHUNK_SIZE,
     DEFAULT_CONNECT_TIMEOUT, MAX_BUFFERED_BODY, MAX_CONCURRENT_FETCHES, WORKER_STACK_BYTES,
 };
 pub use https::{make_tls_acceptor, TlsConnStream, HANDSHAKE_TIMEOUT};

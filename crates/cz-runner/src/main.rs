@@ -510,6 +510,13 @@ fn render_caught(ctx: &Ctx<'_>, caught: &CaughtError<'_>) -> String {
 }
 
 fn main() {
+    // Phase 14: unified multicall `cz-js` binary. When invoked via a `zpm`/`npm` symlink or as
+    // `cz-js zpm <cmd>` (and plain `node <script|‑e>` still flows to the JS runtime below), the
+    // native package manager takes over IMMEDIATELY — before any QuickJS `Runtime` is created,
+    // so `zpm` pays ZERO runtime startup overhead.
+    if let Some(code) = cz_zpm::maybe_run_multicall() {
+        std::process::exit(code as i32);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--version" {
         println!("{VERSION}");

@@ -114,3 +114,76 @@ fn shim_wires_native_codecs_direct_json_byte_entry_and_clone_aware_body_moves() 
         "NATIVES_OK"
     );
 }
+
+/// Phase 14 guard: manually constructed `Response`/`Request` bodies must flow through the same
+/// native consumers as engine responses. Setup kicks off async consumption, QuickJS jobs drain
+/// OUTSIDE the context scope (RefCell rule), then a second script asserts every result.
+fn run_manual(setup: &str, check: &str) -> String {
+    let rt = Runtime::new().unwrap();
+    let ctx = Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        install_fetch(&ctx).unwrap();
+        if let Err(err) = ctx.eval::<(), _>(setup).catch(&ctx) {
+            panic!("setup failed: {err}");
+        }
+    });
+    while let Ok(true) = rt.execute_pending_job() {}
+    ctx.with(|ctx| -> String {
+        match ctx.eval::<String, _>(check).catch(&ctx) {
+            Ok(text) => text,
+            Err(err) => {
+                let msg = match &err {
+                    CaughtError::Exception(ex) => ex.message().unwrap_or_else(|| "unknown exception".to_string()),
+                    other => format!("{other}"),
+                };
+                panic!("manual consumer check failed: {msg}");
+            }
+        }
+    })
+}
+
+#[test]
+fn manual_response_and_request_consumers_match_web_semantics() {
+    let setup = r#"
+        (async () => {
+            // Hono-style manual Response: string body + init status/statusText/headers.
+            const r = new Response('{"ok":true,"runtime":"cardputer-zero-llrt"}',
+                { status: 201, statusText: 'Created', headers: { 'content-type': 'application/json' } });
+            globalThis.__shape = [r.status, String(r.ok), r.statusText, r.headers.get('content-type')].join('|');
+            const j = await r.json();
+            globalThis.__json = j.ok === true && j.runtime === 'cardputer-zero-llrt';
+            // WinterTC defaults: a no-arg manual Response is status 200 with an empty body.
+            const e = new Response();
+            globalThis.__empty = [e.status, await e.text(), e.headers.get('content-type') === null].join('|');
+            // Bytes bodies keep flowing untouched, and clone() shares the buffered view.
+            const b = new Response(new Uint8Array([104, 105, 33]));
+            globalThis.__bytesText = await b.clone().text();
+            globalThis.__bytesShared = b._shared === true;
+            // Manual Request consumers (`c.req.json()`/`text()`/`arrayBuffer()` reach raw).
+            const reqS = new Request('http://x/y', { method: 'POST', body: '{"b":8}' });
+            globalThis.__reqJson = (await reqS.json()).b;
+            globalThis.__reqText = await reqS.text();
+            const reqB = new Request('http://x/z', { method: 'POST', body: new Uint8Array([123, 34, 97, 34, 58, 55, 125]) });
+            globalThis.__reqBytesJson = (await reqB.json()).a;
+            globalThis.__reqAb = (await reqB.arrayBuffer()).byteLength;
+            globalThis.__noBodyText = await new Request('http://x/n').text();
+            globalThis.__done = true;
+        })().catch((err) => { globalThis.__err = String((err && err.message) || err); globalThis.__done = true; });
+    "#;
+    let check = r#"
+        if (globalThis.__err !== undefined) throw new Error('async: ' + globalThis.__err + ' steps='+[globalThis.__s1,globalThis.__s2,globalThis.__s3,globalThis.__s4,globalThis.__s5,globalThis.__s6].join(';'));
+        if (globalThis.__done !== true) throw new Error('consumers hung');
+        if (globalThis.__shape !== '201|true|Created|application/json') throw new Error('shape ' + globalThis.__shape);
+        if (globalThis.__json !== true) throw new Error('manual json');
+        if (globalThis.__empty !== '200||true') throw new Error('empty shape ' + globalThis.__empty);
+        if (globalThis.__bytesText !== 'hi!') throw new Error('clone text ' + globalThis.__bytesText);
+        if (globalThis.__bytesShared !== true) throw new Error('clone must mark both sides');
+        if (globalThis.__reqJson !== 8) throw new Error('request json');
+        if (globalThis.__reqText !== '{"b":8}') throw new Error('request text');
+        if (globalThis.__reqBytesJson !== 7) throw new Error('request bytes json');
+        if (globalThis.__reqAb !== 7) throw new Error('request arrayBuffer ' + globalThis.__reqAb);
+        if (globalThis.__noBodyText !== '') throw new Error('no-body text');
+        'MANUAL_CONSUMERS_OK'
+    "#;
+    assert_eq!(run_manual(setup, check), "MANUAL_CONSUMERS_OK");
+}

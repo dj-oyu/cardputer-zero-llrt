@@ -6,8 +6,13 @@ license.workspace = true
 
 [dependencies]
 cz-hal = { path = "../cz-hal" }
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "gzip"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Phase 14: ureq's plain `rustls` feature bundles Mozilla roots (`webpki-roots`) into
+# Cargo.lock. This workspace must stay 100% free of `tokio`, `hyper`, `hyper-util`,
+# `hyper-rustls` and `webpki-roots`, so we take `rustls-no-provider` instead: every TLS
+# connection flows through `cz_net::tls::build_client_config` (system CA + ring) over the
+# custom `CzConnector`, which never consults ureq's bundled root store.
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 http = "1"

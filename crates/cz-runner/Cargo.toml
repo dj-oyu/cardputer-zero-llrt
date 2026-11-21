@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 cz-modules = { path = "../cz-modules" }
+# Phase 14: unified multicall `cz-js` binary (cz-js / node / zpm / npm). The native zpm CLI is
+# dispatched at the very start of main(), BEFORE any QuickJS `Runtime` exists.
+cz-zpm = { path = "../cz-zpm" }
 rquickjs.workspace = true
 
 [dev-dependencies]

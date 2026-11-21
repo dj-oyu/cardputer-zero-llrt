@@ -710,6 +710,39 @@ pub(crate) const FETCH_SHIM: &str = r#"
         this.body = init.body === undefined ? null : init.body;
     }
 
+    // Phase 14: Web-standard body consumers for manually constructed Requests (node:http
+    // adapters and Hono's `app.request()` hand Request instances to handlers; `c.req.json()`
+    // lands on `raw.json()`). Bytes flow through the SAME native entry points Response uses:
+    // `__czJsonParseBytes` keeps >= 4 KiB documents Lazy with zero intermediate JS strings.
+    function requestBodyBytes(req) {
+        const b = req.body;
+        if (b === null || b === undefined) return new Uint8Array(0);
+        if (typeof b === "string") return __czUtf8Encode(b);
+        const v = byteSource(b);
+        return v === null ? __czUtf8Encode(String(b)) : v;
+    }
+    Request.prototype.text = async function () {
+        const b = this.body;
+        if (typeof b === "string") return b;
+        if (b === null || b === undefined) return "";
+        return decodeText(requestBodyBytes(this));
+    };
+    Request.prototype.json = async function () {
+        const b = this.body;
+        if (typeof globalThis.__czJsonParseBytes === "function") {
+            return globalThis.__czJsonParseBytes(b === undefined ? "" : b);
+        }
+        return globalThis.JSON.parse(await this.text());
+    };
+    Request.prototype.arrayBuffer = async function () {
+        const bytes = requestBodyBytes(this);
+        // Move the engine's exact-sized ArrayBuffer out when the view covers all of it.
+        if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer;
+        const ab = new ArrayBuffer(bytes.length);
+        new Uint8Array(ab).set(bytes, 0);
+        return ab;
+    };
+
     function ReadableStream(state) {
         this._state = state;
         this.locked = false;
@@ -762,16 +795,40 @@ pub(crate) const FETCH_SHIM: &str = r#"
         return it;
     };
 
-    function Response(state) {
-        this._state = state;
+    function Response(stateOrBody, init) {
+        // Engine responses carry the FetchState record built by newState(). Web-style MANUAL
+        // construction (new Response(body, init)) — used by Hono and node:http adapters — gets a
+        // fully buffered, slot-less state (`released: true`) so every prototype consumer
+        // (text/json/bytes/arrayBuffer/blob/formData/clone) flows through the exact same code with
+        // ZERO native slot calls (`__czFetchBuffered`/`__czFetchRelease` never see id -1).
+        const internal = stateOrBody && typeof stateOrBody === "object"
+            && typeof stateOrBody.id === "number" && stateOrBody.bodyPromise;
+        if (internal) {
+            this._state = stateOrBody;
+        } else {
+            const i = init || {};
+            const headers = new Headers(i.headers);
+            const bytes = normalizeBody(stateOrBody === undefined || stateOrBody === null ? null : stateOrBody, headers);
+            const s = {
+                id: -1, headersResolved: true, headerResolve: null, headerReject: null,
+                chunks: [], waitingReads: [], closed: true, failure: null, mode: "buffered",
+                consumedChunks: 0,
+                bufferedBytes: bytes === null ? new Uint8Array(0) : bytes,
+                signal: null, response: this, released: true,
+            };
+            s.bodyPromise = Promise.resolve(s.bufferedBytes);
+            this._state = s;
+            const st = Number(i.status);
+            this.status = Number.isFinite(st) && st >= 200 && st <= 599 ? Math.trunc(st) : 200;
+            // WinterTC/Web: a manually constructed Response reports 200 unless init.status is valid.
+            this.ok = this.status >= 200 && this.status < 300;
+            this.statusText = i.statusText === undefined ? "" : String(i.statusText);
+            this.url = "";
+            this.redirected = false;
+            this.headers = headers;
+        }
         this._stream = null;
         this.bodyUsed = false;
-        this.status = 0;
-        this.ok = false;
-        this.headers = new Headers();
-        this.url = "";
-        this.redirected = false;
-        this.statusText = "";
         // Phase 10C: cloned Responses share one buffered body, so each consumer needs its own
         // defensive copy. An uncloned single-use Response can hand out the received view directly.
         this._shared = false;

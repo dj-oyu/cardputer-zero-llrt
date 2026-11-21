@@ -1,9 +1,11 @@
-//! `cz-zpm` — native Rust multicall package manager (`zpm` / `npm`) for `cz-llrt`.
+//! `cz-zpm` — native Rust multicall package manager (`zpm` / `npm`) for `cz-js`.
 //!
-//! Designed to be linked directly into `cz-llrt` as a multicall binary
-//! (`ln -s cz-llrt zpm`, `ln -s cz-llrt npm`, `ln -s cz-llrt node`) and also built as a
+//! Designed to be linked directly into `cz-js` as a multicall binary
+//! (`ln -s cz-js zpm`, `ln -s cz-js npm`, `ln -s cz-js node`) and also built as a
 //! standalone `cz-zpm` binary for fast isolated testing. All networking, TLS, gzip and tar
-//! handling is **pure Rust** (`hyper` + `hyper-rustls`/`rustls` (ring) + `flate2` rust_backend +
+//! handling is **pure Rust synchronous code** (`ureq` v3 over `cz-net`'s `sync_agent` — the exact
+//! same system-CA + `ring` stack as `cz-js` via `cz_net::tls::build_client_config`, ZERO bundled
+//! `webpki-roots`/`tokio`/`hyper` — plus `flate2` rust_backend +
 //! `tar` + `sha2`): the external `tar` binary is NEVER spawned and `.tgz` bytes are NEVER written
 //! to disk — tarballs stream in memory (`5 MiB` hard cap), `sha512-<base64>` integrity is
 //! verified BEFORE extraction, zip-slip path traversal and symlinks/hardlinks are rejected,
@@ -30,18 +32,11 @@ use std::process::Command as StdCommand;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use flate2::read::GzDecoder;
-use http::header::{ACCEPT, LOCATION};
-use http_body_util::{BodyExt, Empty};
-use hyper::body::{Bytes, Incoming};
-use hyper::Request;
-use hyper::Uri;
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use sha2::{Digest, Sha512};
 use tar::{Archive, EntryType};
 use serde_json::Value as Json;
+use ureq::config::Config;
+use ureq::Agent;
 
 /// Strict streaming cap for downloaded tarballs: 5 MiB.
 pub const TARBALL_CAP: usize = 5 * 1024 * 1024;
@@ -50,11 +45,9 @@ pub const MAX_PACKAGES: usize = 20;
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 const DEFAULT_ESBUILD: &str = "esbuild";
-const DEFAULT_RUNTIME: &str = "cz-llrt";
+const DEFAULT_RUNTIME: &str = "cz-js";
 // NOTE: NEVER `TMPDIR` (on-device that defaults to /data/local/tmp).
 const DEFAULT_TMPDIR: &str = "/tmp";
-
-type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
 // ---------------------------------------------------------------------------------------------
 // Multicall dispatch
@@ -62,7 +55,7 @@ type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Byt
 
 /// Pure helper for unit testing multicall dispatch logic:
 /// - `argv[0]` basename == `zpm`/`npm` -> run CLI with `args[1..]`.
-/// - `argv[1] == "zpm"` (e.g. `cz-llrt zpm ...`) -> run CLI with `args[2..]`.
+/// - `argv[1] == "zpm"` (e.g. `cz-js zpm ...`) -> run CLI with `args[2..]`.
 /// - Otherwise `None` so the JS runtime continues normal startup.
 pub fn parse_multicall_args(args: &[String]) -> Option<Vec<String>> {
     let argv0 = args.first()?;
@@ -78,14 +71,14 @@ pub fn parse_multicall_args(args: &[String]) -> Option<Vec<String>> {
 
 /// Inspect `std::env::args()` for a multicall invocation; returns `Some(exit_code)` when this
 /// binary was invoked as `zpm`/`npm` (symlink) or as `... zpm <cmd>`.
-pub async fn maybe_run_multicall_async() -> Option<u8> {
+pub fn maybe_run_multicall() -> Option<u8> {
     let all: Vec<String> = env::args().collect();
     let cli = parse_multicall_args(&all)?;
-    Some(run_cli_async(&cli).await)
+    Some(run_cli(&cli))
 }
 
 /// Run the zpm CLI directly with the given arguments (excluding program name).
-pub async fn run_cli_async(args: &[String]) -> u8 {
+pub fn run_cli(args: &[String]) -> u8 {
     let sub = args.first().map(|s| s.as_str());
     match sub {
         None | Some("--help") | Some("-h") => {
@@ -114,9 +107,9 @@ pub async fn run_cli_async(args: &[String]) -> u8 {
     }
 
     match sub {
-        Some("install") | Some("i") | Some("add") => cmd_install(&args[1..]).await,
-        Some("update") | Some("up") | Some("upgrade") => cmd_update(&args[1..]).await,
-        Some("outdated") => cmd_outdated(&args[1..]).await,
+        Some("install") | Some("i") | Some("add") => cmd_install(&args[1..]),
+        Some("update") | Some("up") | Some("upgrade") => cmd_update(&args[1..]),
+        Some("outdated") => cmd_outdated(&args[1..]),
         Some("remove") | Some("rm") | Some("uninstall") | Some("un") => cmd_remove(&args[1..]),
         Some("list") | Some("ls") => cmd_list(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
@@ -194,7 +187,7 @@ fn subcommand_help(cmd: &str) -> Option<&'static str> {
         "run" => Some(
             "usage: zpm run <script>\n\n\
              Execute scripts.<script> from ./package.json via `sh -c`,\n\
-             substituting a leading `node ` with `$ZPM_RUNTIME` (default: cz-llrt).\n\n\
+             substituting a leading `node ` with `$ZPM_RUNTIME` (default: cz-js).\n\n\
              Options:\n\
                -h, --help     Show this help",
         ),
@@ -344,8 +337,31 @@ fn encode_pkg_spec(spec: &str) -> String {
     out
 }
 
-fn parse_uri(url: &str) -> Result<Uri, String> {
-    url.parse::<Uri>().map_err(|e| format!("invalid uri {url:?}: {e}"))
+/// Minimal absolute-URL splitter over borrowed slices (`http`/`https` only) — zero extra crates,
+/// zero per-call allocations beyond the eventual joined target.
+struct UrlParts<'a> {
+    scheme: &'a str,
+    authority: &'a str,
+    path: &'a str,
+}
+
+fn split_url(url: &str) -> Result<UrlParts<'_>, String> {
+    let sep = url.find("://").ok_or(format!("invalid uri {url:?}: missing scheme"))?;
+    let scheme = &url[..sep];
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("invalid uri {url:?}: unsupported scheme {scheme:?}"));
+    }
+    let rest = &url[sep + 3..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() {
+        return Err(format!("invalid uri {url:?}: empty authority"));
+    }
+    Ok(UrlParts {
+        scheme,
+        authority,
+        path: &rest[end..],
+    })
 }
 
 /// Resolve a possibly-relative `location`/tarball URL against an absolute base URL.
@@ -357,71 +373,59 @@ fn join_url(base: &str, rel: &str) -> Result<String, String> {
     if rel.starts_with("http://") || rel.starts_with("https://") {
         return Ok(rel.to_string());
     }
-    let bu = parse_uri(base)?;
-    let scheme = bu.scheme().ok_or("base url lacks scheme")?.as_str().to_string();
-    let authority = bu.authority().ok_or("base url lacks authority")?.to_string();
-    let path = bu.path();
+    let bu = split_url(base)?;
     let target = if rel.starts_with('/') {
         rel.to_string()
     } else {
         // Relative to the base path's directory.
-        let dir = match path.rfind('/') {
-            Some(i) => &path[..i + 1],
+        let dir = match bu.path.rfind('/') {
+            Some(i) => &bu.path[..i + 1],
             None => "/",
         };
         format!("{dir}{rel}")
     };
-    Ok(format!("{scheme}://{authority}{target}"))
+    Ok(format!("{}://{}{}", bu.scheme, bu.authority, target))
 }
 
 // ---------------------------------------------------------------------------------------------
-// HTTP fetch (hyper + hyper-rustls ring + webpki-roots; HTTP and HTTPS; <=5 redirects; cap)
+// HTTP fetch (ureq v3 over cz-net's sync transport; system CA + ring via build_client_config;
+// HTTP and HTTPS; <=5 manual redirects; strict streaming cap). No tokio, no hyper.
 // ---------------------------------------------------------------------------------------------
 
-fn build_client() -> HttpsClient {
-    let connector = HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
+/// Build the synchronous ureq agent ONCE per CLI command. Redirect following is DISABLED
+/// (`max_redirects(0)` + no error) so the manual <=5-hop loop below keeps full control of
+/// relative `Location` resolution, exactly like the previous hyper client did; non-2xx must
+/// RESOLVE so the identical `HTTP {status}` guard messages fire. TLS is the exact same
+/// system-CA + `ring` stack `cz-js` uses: `cz_net::tls::build_client_config(&TlsClientOptions::
+/// default())` — never `webpki-roots`.
+fn build_client() -> Result<Agent, String> {
+    let cfg = Config::builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        // No pooling: zpm makes a handful of requests per command then exits.
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
+        .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .no_delay(true)
         .build();
-    Client::builder(TokioExecutor::new()).build(connector)
-}
-
-/// Read a response body into memory enforcing the strict 5 MiB streaming cap.
-async fn read_capped(mut body: Incoming) -> Result<Vec<u8>, String> {
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| format!("body stream error: {e}"))?;
-        if let Ok(chunk) = frame.into_data() {
-            if buf.len() + chunk.len() > TARBALL_CAP {
-                return Err(format!(
-                    "download exceeds strict {} MiB streaming cap",
-                    TARBALL_CAP / (1024 * 1024)
-                ));
-            }
-            buf.extend_from_slice(&chunk);
-        }
-    }
-    Ok(buf)
+    let tls = cz_net::tls::build_client_config(&cz_net::tls::TlsClientOptions::default())?;
+    Ok(cz_net::fetch::sync_agent(cfg, Some(tls)))
 }
 
 /// GET a URL with optional `Accept` header; follows up to 5 (301/302/307/308) redirects; streams
-/// the body into memory under the 5 MiB cap.
-async fn fetch_bytes(client: &HttpsClient, url: &str, accept: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut uri = parse_uri(url)?;
+/// the body into memory under the strict 5 MiB cap through a fixed 64 KiB stack chunk buffer.
+fn fetch_bytes(agent: &Agent, url: &str, accept: Option<&str>) -> Result<Vec<u8>, String> {
+    split_url(url)?;
+    let mut uri = url.to_string();
     let mut hops = 0usize;
     loop {
-        let mut builder = Request::get(uri.clone());
+        let mut builder = agent.get(uri.as_str());
         if let Some(a) = accept {
-            builder = builder.header(ACCEPT, a);
+            builder = builder.header("accept", a);
         }
-        let req = builder
-            .body(Empty::<Bytes>::new())
-            .map_err(|e| format!("bad request: {e}"))?;
-        let resp = client
-            .request(req)
-            .await
+        let resp = builder
+            .call()
             .map_err(|e| format!("request failed for {url}: {e}"))?;
         let status = resp.status().as_u16();
         if matches!(status, 301 | 302 | 307 | 308) {
@@ -431,16 +435,34 @@ async fn fetch_bytes(client: &HttpsClient, url: &str, accept: Option<&str>) -> R
             }
             let loc = resp
                 .headers()
-                .get(LOCATION)
+                .get("location")
                 .ok_or(format!("redirect {status} without Location for {url}"))?;
-            let next = join_url(&uri.to_string(), &String::from_utf8_lossy(loc.as_bytes()))?;
-            uri = parse_uri(&next)?;
+            uri = join_url(&uri, &String::from_utf8_lossy(loc.as_bytes()))?;
             continue; // drop redirect body
         }
         if !(200..=299).contains(&status) {
             return Err(format!("HTTP {status} for {url}"));
         }
-        return read_capped(resp.into_body()).await;
+        let mut reader = resp.into_body().into_reader();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() + n > TARBALL_CAP {
+                        return Err(format!(
+                            "download exceeds strict {} MiB streaming cap",
+                            TARBALL_CAP / (1024 * 1024)
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("body stream error: {e}")),
+            }
+        }
+        return Ok(buf);
     }
 }
 
@@ -728,19 +750,51 @@ fn split_spec(spec: &str) -> (String, String) {
 
 /// Fetch the abbreviated install metadata JSON and select `range`'s version.
 fn pick_from_meta(meta: &Json, want: &str) -> Result<(String, Json), String> {
-    let versions_obj = meta
-        .get("versions")
-        .and_then(|v| v.as_object())
+    if let Some(versions_obj) = meta.get("versions").and_then(|v| v.as_object()) {
+        let versions: Vec<String> = versions_obj.keys().cloned().collect();
+        let latest = meta
+            .get("dist-tags")
+            .and_then(|d| d.get("latest"))
+            .and_then(|v| v.as_str());
+        let ver = select_version(&versions, latest, want)
+            .ok_or(format!("no version matching {want:?} for package"))?;
+        let vobj = versions_obj.get(&ver).cloned().unwrap_or_else(|| Json::Object(serde_json::Map::new()));
+        return Ok((ver, vobj));
+    }
+    // Compact single-version registries (mirrors/fixtures publish `{name, version, tarball,
+    // integrity}` with no `dist-tags`/`versions` map). Honor `want` through the SAME semver
+    // selector, then synthesize the standard `{dist:{tarball,integrity}}` record so the rest of
+    // the pipeline (SHA-512 SRI BEFORE extraction etc.) is untouched. A bare filename becomes the
+    // canonical npm path `<registry>/<pkg>/-/<file>`; absolute or `/root` refs keep working via
+    // `join_url` downstream.
+    let ver = meta
+        .get("version")
+        .and_then(|v| v.as_str())
         .ok_or("registry metadata missing versions".to_string())?;
-    let versions: Vec<String> = versions_obj.keys().cloned().collect();
-    let latest = meta
-        .get("dist-tags")
-        .and_then(|d| d.get("latest"))
-        .and_then(|v| v.as_str());
-    let ver = select_version(&versions, latest, want)
+    let picked = select_version(&[ver.to_string()], Some(ver), want)
         .ok_or(format!("no version matching {want:?} for package"))?;
-    let vobj = versions_obj.get(&ver).cloned().unwrap_or_else(|| Json::Object(serde_json::Map::new()));
-    Ok((ver, vobj))
+    let mut dist = serde_json::Map::new();
+    if let Some(t) = meta.get("tarball").and_then(|v| v.as_str()) {
+        // Bare filenames get npm's canonical root-relative path `/<pkg>/-/<file>`; absolute or
+        // already-rooted refs flow through `join_url` unchanged.
+        let full = match meta.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !t.contains("://") && !t.starts_with('/') => {
+                let mut p = String::from("/");
+                p.push_str(&encode_pkg_spec(n));
+                p.push_str("/-/");
+                p.push_str(t);
+                p
+            }
+            _ => t.to_string(),
+        };
+        dist.insert("tarball".to_string(), Json::String(full));
+    }
+    if let Some(i) = meta.get("integrity").and_then(|v| v.as_str()) {
+        dist.insert("integrity".to_string(), Json::String(i.to_string()));
+    }
+    let mut vobj = meta.clone();
+    vobj["dist"] = Json::Object(dist);
+    Ok((picked, vobj))
 }
 
 fn dep_map(pkg: &Json) -> Vec<(String, String)> {
@@ -764,7 +818,7 @@ struct RootInfo {
 /// BFS-fetch a package + its transitive pure-JS deps into staging (root at `stage/package`,
 /// deps at `stage/node_modules/<dep>`). Guards: <=20 pkgs, sha512 integrity BEFORE extraction,
 /// zip-slip/native rejection.
-async fn fetch_dep_tree(client: &HttpsClient, registry: &str, stage: &Path, specs: Vec<(String, String)>) -> Result<RootInfo, String> {
+fn fetch_dep_tree(client: &Agent, registry: &str, stage: &Path, specs: Vec<(String, String)>) -> Result<RootInfo, String> {
     // Queue items: (name, range, staged dest, is_root).
     let mut queue: VecDeque<(String, String, PathBuf, bool)> = VecDeque::new();
     for (n, r) in specs {
@@ -785,7 +839,7 @@ async fn fetch_dep_tree(client: &HttpsClient, registry: &str, stage: &Path, spec
         fs::create_dir_all(&dest).map_err(|e| format!("mkdir staging failed: {e}"))?;
 
         let meta_url = format!("{registry}/{}", encode_pkg_spec(&name));
-        let meta_bytes = fetch_bytes(client, &meta_url, Some("application/vnd.npm.install-v1+json")).await?;
+        let meta_bytes = fetch_bytes(client, &meta_url, Some("application/vnd.npm.install-v1+json"))?;
         let meta: Json =
             serde_json::from_slice(&meta_bytes).map_err(|e| format!("invalid registry metadata for {name}: {e}"))?;
         let (ver, vobj) = pick_from_meta(&meta, &range)?;
@@ -799,7 +853,7 @@ async fn fetch_dep_tree(client: &HttpsClient, registry: &str, stage: &Path, spec
             .and_then(|t| t.as_str())
             .ok_or(format!("{name}@{ver}: metadata missing dist.tarball"))?;
         let tarball_url = join_url(&format!("{registry}/"), tarball)?;
-        let tb = fetch_bytes(client, &tarball_url, None).await?;
+        let tb = fetch_bytes(client, &tarball_url, None)?;
         let sri = vobj
             .get("dist")
             .and_then(|d| d.get("integrity"))
@@ -957,7 +1011,7 @@ fn update_lockfile(cwd: &Path, name: &str, version: &str, integrity: &str, bundl
     fs::write(&path, text + "\n").map_err(|e| format!("write zpm-lock.json: {e}"))
 }
 
-async fn cmd_install(args: &[String]) -> u8 {
+fn cmd_install(args: &[String]) -> u8 {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut minify = true;
     let mut specs: Vec<String> = Vec::new();
@@ -997,14 +1051,20 @@ async fn cmd_install(args: &[String]) -> u8 {
 
     let registry = registry_base();
     let esbuild = esbuild_bin();
-    let client = build_client();
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zpm install: {e}");
+            return 1;
+        }
+    };
 
     for spec in specs {
         let (name, range) = split_spec(&spec);
         // Fetch + bundle ENTIRELY in staging (all guards included) BEFORE any project write: a
-        // failure here leaves the previously installed package and lockfile completely intact,
-        // and the RAII TempDir keeps ZPM_TMPDIR clean.
-        let staged = match stage_package_bundle(&client, &registry, &esbuild, &name, &range, minify).await {
+        // failure here leaves the previously installed package and lockfile completely intact, and
+        // the RAII TempDir keeps ZPM_TMPDIR clean.
+        let staged = match stage_package_bundle(&client, &registry, &esbuild, &name, &range, minify) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("zpm install {spec}: {e}");
@@ -1047,8 +1107,8 @@ struct StagedBundle {
 /// zip-slip, native-addon and <=20-deps guards) into a fresh `<ZPM_TMPDIR>/zpm-*` staging dir,
 /// then esbuild-bundle it. NOTHING is written to the project dir; on any error the RAII guard
 /// wipes staging, so a failed install/update can never corrupt the current install.
-async fn stage_package_bundle(
-    client: &HttpsClient,
+fn stage_package_bundle(
+    client: &Agent,
     registry: &str,
     esbuild: &str,
     name: &str,
@@ -1056,7 +1116,7 @@ async fn stage_package_bundle(
     minify: bool,
 ) -> Result<StagedBundle, String> {
     let stage = TempDir::new("zpm")?;
-    let root = fetch_dep_tree(client, registry, stage.path(), vec![(name.to_string(), range.to_string())]).await?;
+    let root = fetch_dep_tree(client, registry, stage.path(), vec![(name.to_string(), range.to_string())])?;
     // Bundle from the staging tree: root entry lives at <stage>/package/<entry>, deps are
     // resolved by esbuild via <stage>/node_modules (never written to the project dir).
     let out_rel = PathBuf::from("node_modules").join(name).join("index.mjs");
@@ -1110,9 +1170,9 @@ fn finalize_installed_pkg(cwd: &Path, root: &RootInfo, staged_bundle: &Path, rec
 // ---------------------------------------------------------------------------------------------
 
 /// Fetch registry metadata for one package (`Accept: application/vnd.npm.install-v1+json`).
-async fn fetch_metadata(client: &HttpsClient, registry: &str, name: &str) -> Result<Json, String> {
+fn fetch_metadata(client: &Agent, registry: &str, name: &str) -> Result<Json, String> {
     let url = format!("{registry}/{}", encode_pkg_spec(name));
-    let bytes = fetch_bytes(client, &url, Some("application/vnd.npm.install-v1+json")).await?;
+    let bytes = fetch_bytes(client, &url, Some("application/vnd.npm.install-v1+json"))?;
     serde_json::from_slice::<Json>(&bytes).map_err(|e| format!("invalid registry metadata for {name}: {e}"))
 }
 
@@ -1259,7 +1319,7 @@ fn list_entries(cwd: &Path) -> Vec<(String, String, u64)> {
 /// writes; `--dry-run` prints plans with ZERO filesystem writes (metadata GETs only).
 /// Commits run the full safe staging pipeline and ATOMIC rename replacement, so a failed
 /// update keeps the previous `index.mjs`, manifest, `zpm-lock.json` and ZPM_TMPDIR intact.
-async fn cmd_update(args: &[String]) -> u8 {
+fn cmd_update(args: &[String]) -> u8 {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut minify = true;
     let mut want_latest = false;
@@ -1307,7 +1367,13 @@ async fn cmd_update(args: &[String]) -> u8 {
 
     let registry = registry_base();
     let esbuild = esbuild_bin();
-    let client = build_client();
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zpm update: {e}");
+            return 1;
+        }
+    };
     let mut code = 0u8;
     for name in targets {
         let want = match doc
@@ -1320,7 +1386,7 @@ async fn cmd_update(args: &[String]) -> u8 {
             None => "*".to_string(),
         };
         // Metadata-only resolution first (no tarball yet) enables the zero-download no-op.
-        let meta = match fetch_metadata(&client, &registry, &name).await {
+        let meta = match fetch_metadata(&client, &registry, &name) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("zpm update {name}: {e}");
@@ -1348,7 +1414,7 @@ async fn cmd_update(args: &[String]) -> u8 {
         }
         let old = current.unwrap_or_else(|| "not installed".to_string());
         // Fetch the EXACT resolved version through the safe pipeline; failure keeps everything.
-        let staged = match stage_package_bundle(&client, &registry, &esbuild, &name, &target, minify).await {
+        let staged = match stage_package_bundle(&client, &registry, &esbuild, &name, &target, minify) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("zpm update {name}: {e}");
@@ -1373,7 +1439,7 @@ async fn cmd_update(args: &[String]) -> u8 {
 /// report `{ name, current, wanted, latest }` for packages where `current != wanted ||
 /// current != latest`. With `--json` stdout is PURE valid JSON (diagnostics go to stderr);
 /// otherwise a clean aligned human table. Always exit 0 unless a registry fetch failed.
-async fn cmd_outdated(args: &[String]) -> u8 {
+fn cmd_outdated(args: &[String]) -> u8 {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut json_mode = false;
     for a in args {
@@ -1397,7 +1463,13 @@ async fn cmd_outdated(args: &[String]) -> u8 {
     };
     let names = object_keys_sorted(doc.get("dependencies"));
     let registry = registry_base();
-    let client = build_client();
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zpm outdated: {e}");
+            return 1;
+        }
+    };
     let mut records: Vec<Json> = Vec::new();
     let mut code = 0u8;
     for name in names {
@@ -1410,7 +1482,7 @@ async fn cmd_outdated(args: &[String]) -> u8 {
             Some(r) => r.to_string(),
             None => "*".to_string(),
         };
-        let meta = match fetch_metadata(&client, &registry, &name).await {
+        let meta = match fetch_metadata(&client, &registry, &name) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("zpm outdated {name}: {e}");
@@ -1682,12 +1754,17 @@ mod tests {
 
     #[test]
     fn multicall_subcommand_dispatch() {
-        assert_eq!(parse_multicall_args(&s(&["cz-llrt", "zpm", "run", "dev"])), Some(s(&["run", "dev"])));
+        // The unified `cz-js` binary AND the standalone `cz-zpm` both accept the `zpm` subcommand.
+        assert_eq!(parse_multicall_args(&s(&["cz-js", "zpm", "run", "dev"])), Some(s(&["run", "dev"])));
+        assert_eq!(parse_multicall_args(&s(&["cz-zpm", "zpm", "--version"])), Some(s(&["--version"])));
     }
 
     #[test]
     fn multicall_passthrough_for_js_runtime() {
-        assert_eq!(parse_multicall_args(&s(&["cz-llrt", "app.mjs"])), None);
+        assert_eq!(parse_multicall_args(&s(&["cz-js", "app.mjs"])), None);
+        // `node <script>` must fall through to the JS runtime, never to zpm.
+        assert_eq!(parse_multicall_args(&s(&["node", "app.mjs"])), None);
+        assert_eq!(parse_multicall_args(&s(&["node", "-e", "1+1"])), None);
         assert_eq!(parse_multicall_args(&[]), None);
     }
 
@@ -1861,6 +1938,47 @@ mod tests {
     }
 
     #[test]
+    fn compact_single_version_metadata_falls_back_to_canonical_npm_path() {
+        // Phase 14 fixture shape: `{name, version, tarball, integrity}` WITHOUT `dist-tags`/
+        // `versions`. The fallback synthesizes the standard `dist` record AND maps the bare
+        // filename onto npm's canonical `<pkg>/-/<file>` path so `join_url` resolves it.
+        let flat: Json = serde_json::json!({
+            "name": "demo",
+            "version": "2.3.4",
+            "tarball": "demo-2.3.4.tgz",
+            "integrity": "sha512-AABB==",
+        });
+        let (ver, vobj) = pick_from_meta(&flat, "latest").unwrap();
+        assert_eq!(ver, "2.3.4");
+        assert_eq!(
+            vobj.get("dist").and_then(|d| d.get("tarball")).and_then(|t| t.as_str()),
+            Some("/demo/-/demo-2.3.4.tgz")
+        );
+        assert_eq!(
+            vobj.get("dist").and_then(|d| d.get("integrity")).and_then(|i| i.as_str()),
+            Some("sha512-AABB==")
+        );
+        // caret/exact ranges still route through the SAME semver selector:
+        assert_eq!(pick_from_meta(&flat, "^2.0.0").unwrap().0, "2.3.4");
+        assert_eq!(pick_from_meta(&flat, "2.3.4").unwrap().0, "2.3.4");
+        assert!(pick_from_meta(&flat, "^3.0.0").is_err());
+        // Absolute tarball URLs stay untouched; a name-less flat record keeps its relative path.
+        let abs: Json = serde_json::json!({"version": "1.0.0", "tarball": "https://x.test/y.tgz"});
+        assert_eq!(
+            pick_from_meta(&abs, "").unwrap().1.get("dist").and_then(|d| d.get("tarball")).and_then(|t| t.as_str()),
+            Some("https://x.test/y.tgz")
+        );
+        let nn: Json = serde_json::json!({"version": "0.1.0", "tarball": "other.tgz"});
+        assert_eq!(
+            pick_from_meta(&nn, "").unwrap().1.get("dist").and_then(|d| d.get("tarball")).and_then(|t| t.as_str()),
+            Some("other.tgz")
+        );
+        // Truly malformed metadata (no `versions` AND no `version`) keeps the classic error.
+        let bare: Json = serde_json::json!({"name": "x"});
+        assert_eq!(pick_from_meta(&bare, "latest").unwrap_err(), "registry metadata missing versions");
+    }
+
+    #[test]
     fn esm_entry_resolution_order() {
         let hono_like: Json = serde_json::json!({
             "exports": { ".": {"types": "./dist/types/index.d.ts", "import": "./dist/index.js", "require": "./dist/cjs/index.js"} },
@@ -1912,20 +2030,20 @@ mod tests {
         assert_eq!(join_url("http://x/y", "https://other/z").unwrap(), "https://other/z");
     }
 
-    #[tokio::test]
-    async fn cli_shape_no_network() {
-        // run_cli_async on unknown command returns a non-zero code without touching network.
-        let code = run_cli_async(&s(&["definitely-not-a-command"])).await;
+    #[test]
+    fn cli_shape_no_network() {
+        // run_cli on unknown command returns a non-zero code without touching network.
+        let code = run_cli(&s(&["definitely-not-a-command"]));
         assert_ne!(code, 0);
-        assert_eq!(run_cli_async(&s(&["--version"])).await, 0);
+        assert_eq!(run_cli(&s(&["--version"])), 0);
     }
 
-    #[tokio::test]
-    async fn install_rejects_unreachable_registry_cleanly() {
+    #[test]
+    fn install_rejects_unreachable_registry_cleanly() {
         // Connection to a closed port must fail (exit != 0) and never panic.
         let saved = std::env::var("ZPM_REGISTRY").ok();
         std::env::set_var("ZPM_REGISTRY", "http://127.0.0.1:1");
-        let code = run_cli_async(&s(&["install", "definitely-missing-pkg"])).await;
+        let code = run_cli(&s(&["install", "definitely-missing-pkg"]));
         match saved {
             Some(v) => std::env::set_var("ZPM_REGISTRY", v),
             None => std::env::remove_var("ZPM_REGISTRY"),
@@ -2080,23 +2198,23 @@ mod tests {
         assert_eq!(pad("abcdef", 3), "abcdef");
     }
 
-    #[tokio::test]
-    async fn remove_needs_pkg_and_list_exits_zero() {
+    #[test]
+    fn remove_needs_pkg_and_list_exits_zero() {
         // `remove` without package args must exit non-zero; `list` always exits 0.
-        assert_ne!(run_cli_async(&s(&["remove"])).await, 0);
-        assert_eq!(run_cli_async(&s(&["ls"])).await, 0);
+        assert_ne!(run_cli(&s(&["remove"])), 0);
+        assert_eq!(run_cli(&s(&["ls"])), 0);
     }
 
-    #[tokio::test]
-    async fn help_flags_succeed_for_root_and_all_subcommands() {
-        assert_eq!(run_cli_async(&[]).await, 0);
-        assert_eq!(run_cli_async(&s(&["--help"])).await, 0);
-        assert_eq!(run_cli_async(&s(&["-h"])).await, 0);
-        assert_eq!(run_cli_async(&s(&["help"])).await, 0);
-        assert_eq!(run_cli_async(&s(&["help", "install"])).await, 0);
+    #[test]
+    fn help_flags_succeed_for_root_and_all_subcommands() {
+        assert_eq!(run_cli(&[]), 0);
+        assert_eq!(run_cli(&s(&["--help"])), 0);
+        assert_eq!(run_cli(&s(&["-h"])), 0);
+        assert_eq!(run_cli(&s(&["help"])), 0);
+        assert_eq!(run_cli(&s(&["help", "install"])), 0);
         for cmd in ["install", "i", "add", "update", "up", "outdated", "remove", "rm", "list", "ls", "run", "bundle"] {
-            assert_eq!(run_cli_async(&s(&[cmd, "--help"])).await, 0, "failed --help for {cmd}");
-            assert_eq!(run_cli_async(&s(&[cmd, "-h"])).await, 0, "failed -h for {cmd}");
+            assert_eq!(run_cli(&s(&[cmd, "--help"])), 0, "failed --help for {cmd}");
+            assert_eq!(run_cli(&s(&[cmd, "-h"])), 0, "failed -h for {cmd}");
             assert!(subcommand_help(cmd).is_some(), "missing help text for {cmd}");
         }
         assert!(help_text(None).contains("ZPM_REGISTRY"));

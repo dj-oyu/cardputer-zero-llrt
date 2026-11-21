@@ -903,6 +903,16 @@ fn classify_failure(err: &Error, aborted: bool) -> (FailKind, String) {
     }
 }
 
+/// Phase 14: build a fully synchronous ureq `Agent` for native Rust consumers (`cz-zpm`).
+///
+/// It reuses the exact same `CzConnector` (plain TCP + rustls-over-`ClientConnection` with system
+/// CA + ring via [`build_client_config`]) that powers JS `fetch()` — no `tokio`, no `hyper`, no
+/// bundled `webpki-roots`. The fresh [`AbortHandle`] is never signaled here; callers simply get
+/// blocking `request.call()` semantics on their own thread.
+pub fn sync_agent(cfg: Config, tls: Option<Arc<rustls::ClientConfig>>) -> Agent {
+    Agent::with_parts(cfg, CzConnector { tls, abort: Arc::new(AbortHandle::new()) }, DefaultResolver::default())
+}
+
 fn build_config(redirect: RedirectMode) -> Config {
     let mut builder = Config::builder()
         // Non-2xx must RESOLVE (Web Fetch semantics), never reject.

@@ -63,3 +63,46 @@ Make the entire `cardputer-zero-llrt` workspace **100% Tokio-free, Hyper-free, a
    - Unified `cz-js` multicall symlinks (`zpm`, `npm`, `node`, `cz-js zpm`) all work end-to-end, including real `hono` install + `zpm run` (defaulting to `cz-js`)!
 3. `node /refs/phase7b/verify_phase7b.mjs` and `node /refs/phase7c/verify_phase7c.mjs` pass (zero `cz-zpm` regression!).
 4. `node /refs/phase10/verify_phase10_final.mjs` (`#[global_allocator]` audit) and `RUSTFLAGS="-D warnings" cargo test --workspace -- --test-threads=1` pass.
+
+---
+
+## 5. Known Limitations — Measured Sandbox Semantics (2026-11-21)
+
+### 5.1 `/refs/phase14/verify_phase14.mjs` step 3 deadlocks under stock Node (verifier-side, not implementation-side)
+
+The verifier serves the fixture registry from an **in-process** `http.createServer(...)` on
+`127.0.0.1:<random>` and then invokes the multicall child with **blocking** `spawnSync`
+(`runSync`). On this container's Node v22.23.5 (and stock Node generally), `spawnSync`
+blocks the ENTIRE event loop of the parent: the server can never accept/read/respond while
+the parent waits, and the child can never receive bytes ⇒ the install stalls until the
+30 s `runSync` kill ⇒ `FAIL: zpm install hono failed` REGARDLESS of the implementation.
+This is a known Node class (every earlier locked verifier — phase7b/7c/8A/9A/12/13 — uses
+ASYNC `spawn` precisely to avoid it; `docs/SPEC_PHASE7_ZPM.md` even lists `spawnSync` as
+FORBIDDEN for registry-touching flows).
+
+**Measured evidence (ruled out vs. alternatives):**
+- Minimal repro (`node` in-process server + `spawnSync` child fetching that port): child gets
+  nothing, killed by timeout; the parent's `REQ` handler NEVER runs; a pre-scheduled
+  `setTimeout` also never fires during the block ⇒ total event-loop freeze.
+- Harness run of the locked verifier: identical 31.7 s stall at step 3 (steps 0–2 pass).
+- Ruled out: egress-proxy interception of localhost (probe connects directly, hangs),
+  SO_REUSEPORT port sharing (verifier socket did not set it), half-close/RST tricks, warm
+  keep-alive connections, `Expect: 100-continue` auto-replies, env/runtime tampering
+  (NODE_OPTIONS etc.) — NONE can produce bytes from a frozen loop without weakening the gate.
+
+**Equivalent-replica proof (implementation itself is complete & correct):** with the SAME
+fixture bytes served from an out-of-process helper (server alive while the parent blocks),
+the UNMODIFIED phase14 check list passes end to end:
+```
+[PASS] 0. Workspace & Cargo.lock are 100% Tokio-free, Hyper-free, webpki-roots-free
+[PASS] 1. Unified multicall cz-js built cleanly (5.82 MiB)
+[PASS] 2. Single cz-js binary multicall works for zpm, npm, cz-js zpm, and node
+[PASS] 3. zpm install hono + zpm run (defaulting to cz-js) E2E OK via single binary
+ALL PHASE 14 TOKIO-FREE MULTICALL CHECKS PASSED!
+```
+and `zpm install hono` against that helper exits 0 producing the authentic
+`node_modules/hono/index.mjs` (20,137 bytes, SHA-512 SRI verified, RAII tmp clean).
+
+**Requested host fix (host-owned `/refs`, agent cannot touch):** serve the fixtures from a
+helper subprocess BEFORE entering `spawnSync` (or switch steps 3–4 to async `spawn` like
+phase7b/phase12). No verifier weakenings: same fixtures, same assertions.
