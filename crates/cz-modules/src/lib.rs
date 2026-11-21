@@ -20,6 +20,7 @@ use cz_hal::input::{InputState, KeyEvent as HalKeyEvent, Mods};
 use cz_hal::power::PowerStatus;
 
 pub mod audio_module;
+pub mod crypto_module;
 pub mod fetch_module;
 pub mod fs_module;
 pub mod http_module;
@@ -29,6 +30,7 @@ pub mod io_module;
 pub mod ir_module;
 pub mod json_module;
 pub mod kv_module;
+pub mod process_module;
 pub mod tls_module;
 
 // ---------------------------------------------------------------------------
@@ -39,6 +41,7 @@ pub mod tls_module;
 // fork (`llrt_modules`) can register them directly via `llrt_utils::module::ModuleInfo` without
 // reaching into submodules.
 pub use audio_module::AudioModule;
+pub use crypto_module::CryptoModule;
 pub use fs_module::FsModule;
 pub use http_module::HttpModule;
 pub use https_module::HttpsModule;
@@ -48,6 +51,7 @@ pub use ir_module::IrModule;
 pub use json_module::{install_json, JsonModule};
 pub use fetch_module::{fetch_active_count, fetch_has_pending, install_fetch};
 pub use kv_module::KvModule;
+pub use process_module::{install_process, ProcessModule};
 pub use tls_module::TlsModule;
 
 /// Live raw TLS sockets + listening TLS servers (`node:tls` liveness for `cz-runner`).
@@ -136,6 +140,10 @@ pub const MODULE_NAMES: &[&str] = &[
     "tls",
     "node:fs",
     "fs",
+    "node:process",
+    "process",
+    "node:crypto",
+    "crypto",
 ];
 
 /// Which builtin implementation answers a resolved specifier.
@@ -155,6 +163,8 @@ pub enum ModuleKind {
     Audio,
     Ir,
     Io,
+    Process,
+    Crypto,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -175,6 +185,8 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "cardputer:audio" => Some(ModuleKind::Audio),
         "cardputer:ir" => Some(ModuleKind::Ir),
         "cardputer:io" => Some(ModuleKind::Io),
+        "node:process" | "process" => Some(ModuleKind::Process),
+        "node:crypto" | "crypto" => Some(ModuleKind::Crypto),
         _ => None,
     }
 }
@@ -200,6 +212,8 @@ pub fn declare_builtin<'js>(
         ModuleKind::Audio => rquickjs::Module::declare_def::<audio_module::AudioModule, _>(ctx.clone(), name),
         ModuleKind::Ir => rquickjs::Module::declare_def::<ir_module::IrModule, _>(ctx.clone(), name),
         ModuleKind::Io => rquickjs::Module::declare_def::<io_module::IoModule, _>(ctx.clone(), name),
+        ModuleKind::Process => rquickjs::Module::declare_def::<process_module::ProcessModule, _>(ctx.clone(), name),
+        ModuleKind::Crypto => rquickjs::Module::declare_def::<crypto_module::CryptoModule, _>(ctx.clone(), name),
     }
 }
 

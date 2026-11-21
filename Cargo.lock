@@ -161,6 +161,7 @@ dependencies = [
  "cz-json",
  "cz-net",
  "libc",
+ "ring",
  "rquickjs",
 ]
 

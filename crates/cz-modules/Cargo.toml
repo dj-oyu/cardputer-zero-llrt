@@ -11,6 +11,8 @@ cz-json = { path = "../cz-json" }
 cz-net = { path = "../cz-net" }
 rquickjs.workspace = true
 libc.workspace = true
+# Phase 9A: pure-Rust crypto for node:crypto (already resolved in Cargo.lock via rustls).
+ring = "0.17"
 
 [dev-dependencies]
 # Integration tests exercise the public LLRT bridge surface against rquickjs directly.

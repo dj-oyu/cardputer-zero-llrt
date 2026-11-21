@@ -67,6 +67,22 @@ impl Resolver for CzResolver {
             }
             return Err(Error::new_resolving(base, name));
         }
+        if name.starts_with('/') {
+            // Absolute specifiers resolve straight from disk (Node ESM-style). The Phase 9A
+            // suite imports `examples/aws-edge/*.mjs` from temp-dir scripts by absolute path,
+            // mirroring how Node resolves file-URL-like module specifiers.
+            let abs = std::path::Path::new(name);
+            if abs.is_file() {
+                return Ok(name.to_string());
+            }
+            for ext in ["mjs", "js"] {
+                let with_ext = abs.with_extension(ext);
+                if with_ext.is_file() {
+                    return Ok(with_ext.display().to_string());
+                }
+            }
+            return Err(Error::new_resolving(base, name));
+        }
         // Bare specifiers: delegate to the file resolver search paths.
         self.file.resolve(_ctx, base, name, _attributes)
     }
@@ -512,6 +528,9 @@ fn main() {
         // Phase 8A: global fetch()/Headers/Request/Response/AbortController/AbortSignal/
         // ReadableStream (+ URLSearchParams when absent) built on cz-net's sync worker engine.
         cz_modules::install_fetch(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 9A: globalThis.process (env/argv/cwd/exit/platform/arch) so cloud REST clients
+        // can read AWS_ENDPOINT_URL & friends; full std::env::args() keeps script CLI args live.
+        cz_modules::install_process(&ctx, &args).map_err(|e| format!("{e}"))?;
         // Phase 8A: top-level `await fetch(...)` must not deadlock — evaluate the module without
         // blocking on its promise (JS glue records settlement), then pump the loop outside scopes.
         ctx.eval::<(), _>(MODULE_GLUE).map_err(|e| format!("module glue: {e}"))?;

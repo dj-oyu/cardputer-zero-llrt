@@ -924,3 +924,87 @@ declare global {
   const RequestCtor: typeof Request;
   const ResponseCtor: typeof Response;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9A: process + ring-backed node:crypto
+// ---------------------------------------------------------------------------
+
+/** Node-compatible process surface installed by `cz-js` on `globalThis`. */
+interface CzProcess {
+  /** Plain string-keyed/string-valued object populated from the OS environment. */
+  env: Record<string, string>;
+  /** `[exe, scriptPath, ...scriptArgs]` as launched. */
+  argv: string[];
+  /** Current working directory as a UTF-8 string. */
+  cwd(): string;
+  /** Flushes stdout/stderr then terminates with integer `code` (default 0). */
+  exit(code?: number): never;
+  /** `std::env::consts::OS` — "linux" on CardputerZero/Debian trixie. */
+  readonly platform: string;
+  /** "arm64" on aarch64, "x64" on x86_64, else raw target arch. */
+  readonly arch: string;
+}
+
+declare global {
+  const process: CzProcess;
+}
+
+declare module "node:process" {
+  export const env: Record<string, string>;
+  export const argv: string[];
+  export function cwd(): string;
+  export function exit(code?: number): never;
+  export const platform: string;
+  export const arch: string;
+
+  const procMod: CzProcess;
+  export default procMod;
+}
+
+declare module "process" {
+  import procMod from "node:process";
+  export * from "node:process";
+  export { procMod as default };
+}
+
+/** Chainable digest object from `createHash()` (SHA-256 / SHA-512). */
+interface CzHash {
+  /** Feed `string | Uint8Array | ArrayBuffer`; chainable (returns this). */
+  update(data: string | Uint8Array | ArrayBuffer): CzHash;
+  /** hex/base64 string when `encoding` given; raw `Uint8Array` when omitted. */
+  digest(encoding?: "hex" | "base64"): string | Uint8Array;
+}
+
+/** Chainable HMAC object from `createHmac()` (ring-backed constant-safe verify pairings). */
+interface CzHmac {
+  update(data: string | Uint8Array | ArrayBuffer): CzHmac;
+  digest(encoding?: "hex" | "base64"): string | Uint8Array;
+}
+
+declare module "node:crypto" {
+  /** Case-insensitive "sha256"/"sha512" (also accepts "sha-256"/"sha-512"). */
+  export function createHash(algorithm: string): CzHash;
+  /** HMAC-SHA256/SHA512 with a `string | Uint8Array | ArrayBuffer` key. */
+  export function createHmac(algorithm: string, key: string | Uint8Array | ArrayBuffer): CzHmac;
+  /** SystemRandom bytes; RangeError for negative or > 65536 sizes. */
+  export function randomBytes(size: number): Uint8Array;
+  /** RFC 4122 v4 lowercase UUID. */
+  export function randomUUID(): string;
+  /** Constant-time compare (ring::constant_time); RangeError on length mismatch. */
+  export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean;
+
+  const cryptoMod: {
+    createHash: typeof createHash;
+    createHmac: typeof createHmac;
+    randomBytes: typeof randomBytes;
+    randomUUID: typeof randomUUID;
+    timingSafeEqual: typeof timingSafeEqual;
+  };
+  export default cryptoMod;
+}
+
+declare module "crypto" {
+  import cryptoMod from "node:crypto";
+  export * from "node:crypto";
+  export { cryptoMod as default };
+}
