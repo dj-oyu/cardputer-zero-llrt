@@ -42,7 +42,7 @@ fn homedir() -> String {
 /// `libc::gethostname` into a stack buffer; NUL-terminated, lossy, with `"localhost"` as the
 /// documented fallback if the syscall refuses or answers empty.
 fn hostname() -> String {
-    let mut buf = [0i8; 256];
+    let mut buf = [0 as libc::c_char; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
     if rc != 0 {
         return "localhost".to_string();
