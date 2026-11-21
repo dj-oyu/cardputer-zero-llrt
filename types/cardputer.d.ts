@@ -903,13 +903,12 @@ declare class AbortController {
   abort(reason?: unknown): void;
 }
 
-/** AbortSignal with `reason`, `onabort` handling and the Phase 8A `AbortSignal.timeout(ms)` helper. */
-interface AbortSignal {
+/** AbortSignal with `reason`, `onabort` handling and the Phase 8A `AbortSignal.timeout(ms)` helper;
+ * it IS an `EventTarget` (Phase 13), so the generic listener methods come from the base class. */
+interface AbortSignal extends EventTarget {
   readonly aborted: boolean;
   readonly reason: unknown;
   onabort: ((ev?: unknown) => void) | null;
-  addEventListener(type: "abort", listener: (ev?: unknown) => void): void;
-  removeEventListener(type: "abort", listener: (ev?: unknown) => void): void;
   throwIfAborted(): void;
 }
 
@@ -1120,8 +1119,9 @@ interface WebSocketErrorEvent {
   error?: unknown;
 }
 
-/** Global RFC 6455 client over `ws://` and `wss://` (rustls + ring, masked frames, auto-Pong). */
-declare class WebSocket {
+/** Global RFC 6455 client over `ws://` and `wss://` (rustls + ring, masked frames, auto-Pong).
+ * Phase 13: inherits the generic `EventTarget` listener machinery (`once`, dispatch). */
+declare class WebSocket extends EventTarget {
   static readonly CONNECTING: 0;
   static readonly OPEN: 1;
   static readonly CLOSING: 2;
@@ -1140,9 +1140,6 @@ declare class WebSocket {
   onclose: ((ev: WebSocketCloseEvent) => void) | null;
   send(data: string | Uint8Array | ArrayBuffer): void;
   close(code?: number, reason?: string): void;
-  addEventListener(type: "open" | "close" | "error", listener: (ev: WebSocketCloseEvent | WebSocketErrorEvent | { type: string }) => void): void;
-  addEventListener(type: "message", listener: (ev: WebSocketMessageEvent) => void): void;
-  removeEventListener(type: string, listener: (ev: { type: string }) => void): void;
 }
 
 /** Per-socket WebSocket options mirror fetch's `tls` bag (`ca`, `cert`, `key`, `rejectUnauthorized`). */
@@ -1349,4 +1346,158 @@ declare module "path" {
   import pathMod from "node:path";
   export * from "node:path";
   export { pathMod as default };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: WinterTC completion globals — EventTarget / Event / CustomEvent,
+// structuredClone, monotonic performance.now(), queueMicrotask — plus `node:os`
+// and the minimal native-backed `Buffer` (`extends Uint8Array`).
+// ---------------------------------------------------------------------------
+
+/** Listener accepted by `EventTarget`: a callback or a `{ handleEvent }` object. */
+type EventListener = ((event: any) => void) | { handleEvent(event: any): void };
+
+interface EventInit {
+  bubbles?: boolean;
+  cancelable?: boolean;
+  composed?: boolean;
+}
+
+/** Only `once` is behavioural here; other flags are accepted for Web-shape compatibility. */
+type AddEventListenerOptions = { once?: boolean; capture?: boolean; passive?: boolean };
+
+declare class Event {
+  constructor(type: string, init?: EventInit);
+  readonly type: string;
+  readonly target: EventTarget | null;
+  currentTarget: EventTarget | null;
+  readonly eventPhase: number;
+  /** Milliseconds since process start from the monotonic `performance.now()` clock. */
+  readonly timeStamp: number;
+  readonly bubbles: boolean;
+  readonly cancelable: boolean;
+  readonly composed: boolean;
+  defaultPrevented: boolean;
+  preventDefault(): void;
+  stopPropagation(): void;
+  stopImmediatePropagation(): void;
+  composedPath(): EventTarget[];
+}
+
+interface CustomEventInit<T = unknown> extends EventInit {
+  detail?: T;
+}
+
+declare class CustomEvent<T = unknown> extends Event {
+  constructor(type: string, init?: CustomEventInit<T>);
+  readonly detail: T;
+}
+
+/**
+ * WinterTC `EventTarget`: one listener registry per target, `{ once: true }` support,
+ * `dispatchEvent()` returns `!event.defaultPrevented`. `AbortSignal` and `WebSocket`
+ * inherit this class (`signal instanceof EventTarget === true`).
+ */
+declare class EventTarget {
+  constructor();
+  addEventListener(type: string, listener: EventListener | null, options?: boolean | AddEventListenerOptions): void;
+  removeEventListener(type: string, listener: EventListener | null, options?: boolean | { capture?: boolean }): void;
+  dispatchEvent(event: Event | { type: string }): boolean;
+}
+
+/**
+ * Deep structural clone: primitives, plain objects (prototype preserved), Arrays, `Date`,
+ * `RegExp` (source/flags/lastIndex), `Map`, `Set`, `ArrayBuffer` (bytes copied) and typed
+ * arrays. Circular graphs terminate via a seen-`Map`; functions/symbols throw a
+ * `DataCloneError` (`error.name === "DataCloneError"`).
+ */
+declare function structuredClone<T>(value: T): T;
+
+interface CzPerformance {
+  /** Milliseconds since process start from a monotonic `std::time::Instant` (never wall clock). */
+  now(): number;
+  /** Wall-clock origin in ms since the Unix epoch captured once at startup. */
+  readonly timeOrigin: number;
+}
+
+declare const performance: CzPerformance;
+
+/** Schedules a callback on the QuickJS microtask queue; runs before any `setTimeout`. */
+declare function queueMicrotask(callback: () => void): void;
+
+type BufferEncoding = "utf8" | "utf-8" | "base64" | "base64url" | "hex" | "latin1" | "binary";
+
+/**
+ * Minimal Node-compatible `Buffer`: a real `Uint8Array` subclass whose UTF-8 / Base64 /
+ * Base64URL / Hex / Latin-1 conversions run as single native Rust passes over borrowed bytes.
+ * `"node:buffer"` exports THE SAME class object by reference.
+ */
+declare class Buffer extends Uint8Array {
+  static from(input: string | Uint8Array | ArrayBuffer | number[], encoding?: BufferEncoding): Buffer;
+  static alloc(size: number, fill?: number | string | Uint8Array): Buffer;
+  static allocUnsafe(size: number): Buffer;
+  static allocUnsafeSlow(size: number): Buffer;
+  static concat(list: readonly Uint8Array[], totalLength?: number): Buffer;
+  static isBuffer(value: unknown): value is Buffer;
+  static byteLength(input: string | Uint8Array | ArrayBuffer, encoding?: BufferEncoding): number;
+  toString(encoding?: BufferEncoding | string, start?: number, end?: number): string;
+  equals(other: Uint8Array | Buffer): boolean;
+  subarray(start?: number, end?: number): Buffer;
+  slice(start?: number, end?: number): Buffer;
+  copy(target: Uint8Array, targetStart?: number, sourceStart?: number, sourceEnd?: number): number;
+}
+
+declare const BufferClassAlias: typeof Buffer;
+
+declare module "node:buffer" {
+  export const Buffer: typeof BufferClassAlias;
+  const bufferMod: { Buffer: typeof BufferClassAlias };
+  export default bufferMod;
+}
+
+declare module "buffer" {
+  import bufferMod from "node:buffer";
+  export * from "node:buffer";
+  export { bufferMod as default };
+}
+
+/** One `os.cpus()` record (`{ model, speed }`; CardputerZero nominal 1 GHz Cortex-A53). */
+interface OsCpuInfo {
+  readonly model: string;
+  readonly speed: number;
+}
+
+interface CzOs {
+  /** Node spelling: `linux` / `darwin` / `win32`. */
+  platform(): string;
+  /** Node spelling: `arm64` (CardputerZero) or `x64`. */
+  arch(): string;
+  readonly EOL: "\n";
+  tmpdir(): string;
+  homedir(): string;
+  hostname(): string;
+  cpus(): OsCpuInfo[];
+  /** Whole seconds of uptime from `/proc/uptime`. */
+  uptime(): number;
+}
+
+declare const OsImpl: CzOs;
+
+declare module "node:os" {
+  export function platform(): string;
+  export function arch(): string;
+  export const EOL: "\n";
+  export function tmpdir(): string;
+  export function homedir(): string;
+  export function hostname(): string;
+  export function cpus(): OsCpuInfo[];
+  export function uptime(): number;
+  const osMod: CzOs;
+  export default osMod;
+}
+
+declare module "os" {
+  import osMod from "node:os";
+  export * from "node:os";
+  export { osMod as default };
 }

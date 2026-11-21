@@ -20,6 +20,7 @@ use rquickjs::{
     Result, String as JsString, Value,
 };
 
+use crate::web_globals::install_web_globals;
 use crate::{json_module::json_parse_bytes_native, vec_to_uint8array};
 
 use cz_net::fetch::{
@@ -97,6 +98,9 @@ fn parse_tls_object<'js>(ctx: &Ctx<'js>, tls: &Object<'js>) -> Result<TlsClientO
 /// Register the Rust primitives + JS shim on this context (idempotent). The named `'js` lifetime
 /// is required so native closures can receive context values (rquickjs lifetime rule).
 pub fn install_fetch<'js>(ctx: &Ctx<'js>) -> Result<()> {
+    // Phase 13: `AbortSignal` inherits `EventTarget`, so the WinterTC globals land FIRST
+    // (idempotent: an already-populated context pays only a flag check).
+    install_web_globals(ctx)?;
     // Natives first, then the shim that wraps them into Web-compatible classes.
     ctx.globals().set(
         "__czFetchStart",
@@ -360,27 +364,22 @@ pub(crate) const FETCH_SHIM: &str = r#"
         return e;
     }
     function AbortSignal() {
+        EventTarget.call(this); // Phase 13: share the generic listener registry (`_et`)
         this.aborted = false;
         this.reason = undefined;
         this.onabort = null;
-        this._listeners = [];
     }
-    AbortSignal.prototype.addEventListener = function (type, fn) {
-        if (type === "abort" && typeof fn === "function") this._listeners.push(fn);
-    };
-    AbortSignal.prototype.removeEventListener = function (type, fn) {
-        if (type !== "abort") return;
-        for (let i = 0; i < this._listeners.length; i++) {
-            if (this._listeners[i] === fn) { this._listeners.splice(i, 1); break; }
-        }
-    };
+    // WinterTC: `AbortSignal` IS an `EventTarget` (`signal instanceof EventTarget === true`);
+    // addEventListener / removeEventListener / dispatchEvent come from the shared prototype.
+    AbortSignal.prototype = Object.create(EventTarget.prototype);
+    AbortSignal.prototype.constructor = AbortSignal;
     AbortSignal.prototype.throwIfAborted = function () {
         if (this.aborted) throw this.reason === undefined ? makeAbortError(undefined) : this.reason;
     };
     AbortSignal.prototype._fire = function () {
         if (this.onabort) { try { this.onabort({ type: "abort", target: this }); } catch (_e) {} }
-        const snapshot = this._listeners.slice();
-        for (const fn of snapshot) { try { fn({ type: "abort", target: this }); } catch (_e) {} }
+        // One Web-shaped abort Event through dispatchEvent (listener errors never leak, §2.6).
+        try { this.dispatchEvent(new Event("abort")); } catch (_e) {}
     };
     AbortSignal.abort = function (reason) {
         const s = new AbortSignal();

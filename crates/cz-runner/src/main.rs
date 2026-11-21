@@ -557,6 +557,10 @@ fn main() {
         // Phase 5: swap globalThis.JSON.parse / JSON.stringify for the cz-json NEON engine
         // (fast < 4 KiB path, transparent Lazy handles for larger documents, kv-row shortcut).
         cz_modules::install_json(&ctx).map_err(|e| format!("{e}"))?;
+        // Phase 13: WinterTC completion globals (EventTarget/Event/CustomEvent, structuredClone,
+        // monotonic performance.now(), queueMicrotask) BEFORE fetch/ws so AbortSignal and
+        // WebSocket can inherit EventTarget (`instanceof EventTarget === true`).
+        cz_modules::install_web_globals(&ctx).map_err(|e| format!("{e}"))?;
         // Phase 8A: global fetch()/Headers/Request/Response/AbortController/AbortSignal/
         // ReadableStream (+ URLSearchParams when absent) built on cz-net's sync worker engine.
         cz_modules::install_fetch(&ctx).map_err(|e| format!("{e}"))?;
@@ -573,6 +577,9 @@ fn main() {
         // Phase 9A: globalThis.process (env/argv/cwd/exit/platform/arch) so cloud REST clients
         // can read AWS_ENDPOINT_URL & friends; full std::env::args() keeps script CLI args live.
         cz_modules::install_process(&ctx, &args).map_err(|e| format!("{e}"))?;
+        // Phase 13: minimal `Buffer extends Uint8Array` global; "node:buffer"/"buffer" export the
+        // SAME class object by reference (native UTF-8/base64/base64url/hex codecs).
+        cz_modules::install_buffer(&ctx).map_err(|e| format!("{e}"))?;
         // Phase 8A: top-level `await fetch(...)` must not deadlock — evaluate the module without
         // blocking on its promise (JS glue records settlement), then pump the loop outside scopes.
         ctx.eval::<(), _>(MODULE_GLUE).map_err(|e| format!("module glue: {e}"))?;

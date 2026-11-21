@@ -20,6 +20,7 @@ use cz_hal::input::{InputState, KeyEvent as HalKeyEvent, Mods};
 use cz_hal::power::PowerStatus;
 
 pub mod audio_module;
+pub mod buffer_module;
 pub mod crypto_module;
 pub mod fetch_module;
 pub mod fs_module;
@@ -30,11 +31,13 @@ pub mod io_module;
 pub mod ir_module;
 pub mod json_module;
 pub mod kv_module;
+pub mod os_module;
 pub mod path_module;
 pub mod process_module;
 pub mod tls_module;
 pub mod url_module;
 pub mod web_crypto;
+pub mod web_globals;
 pub mod web_module;
 pub mod ws_module;
 
@@ -46,6 +49,7 @@ pub mod ws_module;
 // fork (`llrt_modules`) can register them directly via `llrt_utils::module::ModuleInfo` without
 // reaching into submodules.
 pub use audio_module::AudioModule;
+pub use buffer_module::{install_buffer, BufferModule};
 pub use crypto_module::CryptoModule;
 pub use fs_module::{FsModule, FsPromisesModule};
 pub use http_module::HttpModule;
@@ -56,11 +60,13 @@ pub use ir_module::IrModule;
 pub use json_module::{install_json, JsonModule};
 pub use fetch_module::{fetch_active_count, fetch_has_pending, install_fetch};
 pub use kv_module::KvModule;
+pub use os_module::OsModule;
 pub use path_module::PathModule;
 pub use process_module::{install_process, ProcessModule};
 pub use tls_module::TlsModule;
 pub use url_module::{install_url, UrlModule};
 pub use web_crypto::install_web_crypto;
+pub use web_globals::install_web_globals;
 pub use web_module::install_web;
 pub use ws_module::{install_ws, ws_active_count, ws_has_pending, WsModule};
 
@@ -162,6 +168,10 @@ pub const MODULE_NAMES: &[&str] = &[
     "ws",
     "node:path",
     "path",
+    "node:buffer",
+    "buffer",
+    "node:os",
+    "os",
 ];
 
 /// Which builtin implementation answers a resolved specifier.
@@ -187,6 +197,8 @@ pub enum ModuleKind {
     Url,
     Ws,
     Path,
+    Buffer,
+    Os,
 }
 
 /// Map a bare/aliased specifier to its builtin kind (`None` means: use the file loader).
@@ -213,6 +225,8 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "node:url" | "url" => Some(ModuleKind::Url),
         "node:ws" | "ws" => Some(ModuleKind::Ws),
         "node:path" | "path" => Some(ModuleKind::Path),
+        "node:buffer" | "buffer" => Some(ModuleKind::Buffer),
+        "node:os" | "os" => Some(ModuleKind::Os),
         _ => None,
     }
 }
@@ -244,6 +258,8 @@ pub fn declare_builtin<'js>(
         ModuleKind::Url => rquickjs::Module::declare_def::<url_module::UrlModule, _>(ctx.clone(), name),
         ModuleKind::Ws => rquickjs::Module::declare_def::<ws_module::WsModule, _>(ctx.clone(), name),
         ModuleKind::Path => rquickjs::Module::declare_def::<path_module::PathModule, _>(ctx.clone(), name),
+        ModuleKind::Buffer => rquickjs::Module::declare_def::<buffer_module::BufferModule, _>(ctx.clone(), name),
+        ModuleKind::Os => rquickjs::Module::declare_def::<os_module::OsModule, _>(ctx.clone(), name),
     }
 }
 

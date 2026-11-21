@@ -3,7 +3,8 @@
 //! The engine lives in `cz_net::ws` (std sockets + rustls/ring, 256 KiB worker stacks, stack frame
 //! headers, in-place masking, zero-copy binary moves). This module only bridges native calls and a
 //! small JavaScript class that carries browser-shaped state (`readyState`, `protocol`,
-//! `binaryType`, `bufferedAmount`, `on*` handlers, `addEventListener`).
+//! `binaryType`, `bufferedAmount`, on* handlers) while inheriting Phase 13's generic
+//! `EventTarget` (`addEventListener`/`removeEventListener`/`once`, `instanceof EventTarget`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,6 +14,7 @@ use rquickjs::{Array, Ctx, Exception, Function, Object, Result, Value};
 use cz_net::{close_ws, next_ws_event, send_ws, terminate_ws, ws_buffered_amount, ws_connect, WsEngineEvent};
 
 use crate::tls_module::tls_client_opts_from_js;
+use crate::web_globals::install_web_globals;
 use crate::{bytes_from_value, vec_to_uint8array};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -22,6 +24,8 @@ pub fn install_ws<'js>(ctx: &Ctx<'js>) -> Result<()> {
     if INSTALLED.load(Ordering::SeqCst) && ctx.globals().get::<_, bool>("__czWsInstalled").unwrap_or(false) {
         return Ok(());
     }
+    // Phase 13: WebSocket inherits EventTarget — WinterTC globals must exist before the shim.
+    install_web_globals(ctx)?;
 
     ctx.globals().set(
         "__czWsConnect",
@@ -188,7 +192,7 @@ const WS_SHIM: &str = r#"
         this.onmessage = null;
         this.onerror = null;
         this.onclose = null;
-        this._listeners = {};
+        EventTarget.call(this); // generic listener registry (`_et`) for inherited EventTarget methods
         this._id = __czWsConnect(href, protocols, tls ? tls : {});
         // Register BEFORE the event loop can pump: the Open event must find this JS object.
         globalThis.__czWsById.set(this._id, this);
@@ -226,24 +230,15 @@ const WS_SHIM: &str = r#"
         __czWsClose(this._id, code, r);
     };
 
-    WebSocket.prototype.addEventListener = function (type, fn) {
-        if (typeof fn !== "function") return;
-        const k = String(type);
-        (this._listeners[k] = this._listeners[k] || []).push(fn);
-    };
-    WebSocket.prototype.removeEventListener = function (type, fn) {
-        const k = String(type);
-        const list = this._listeners[k];
-        if (!list) return;
-        const i = list.indexOf(fn);
-        if (i >= 0) list.splice(i, 1);
-    };
     WebSocket.prototype._dispatch = function (type, event) {
         event.type = type;
+        event.target = this;
+        event.currentTarget = this;
         const handler = this["on" + type];
         if (typeof handler === "function") handler.call(this, event);
-        const list = this._listeners[type];
-        if (list) for (const fn of list.slice()) fn.call(this, event);
+        // Shared EventTarget fire core: `once` honoured, stopImmediatePropagation respected.
+        // Errors propagate like the historical pump (swallowErrors = false).
+        this.__czFire(type, event, false);
     };
 
     function InvalidStateError(msg) {
@@ -304,6 +299,10 @@ const WS_SHIM: &str = r#"
 
     // Live-socket registry so engine events locate their JS objects; entries die with the socket.
     globalThis.__czWsById = new Map();
+
+    // Phase 13: `WebSocket` IS an EventTarget (`WebSocket.prototype instanceof EventTarget`):
+    // the generic listener methods come from the shared prototype chain.
+    Object.setPrototypeOf(WebSocket.prototype, EventTarget.prototype);
 
     globalThis.WebSocket = WebSocket;
     globalThis.__czWsClass = WebSocket;

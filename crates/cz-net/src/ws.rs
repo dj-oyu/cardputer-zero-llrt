@@ -669,7 +669,7 @@ fn ws_worker(
 
     // 5. Steady-state frame loop.
     session.set_timeouts(Some(IO_SLICE), None);
-    run_frames(ws_id, &ctrl_rx, &destroyed, &mut session, &rng);
+    run_frames(ws_id, &ctrl_rx, &destroyed, &mut session, &rng, (resp, head_end));
 }
 
 fn flush(session: &mut Session) -> std::io::Result<()> {
@@ -866,13 +866,38 @@ impl InFrame {
     }
 }
 
+/// Steady-state byte source: drain the handshake leftovers FIRST, then fall back to socket reads.
+/// Never over-reads: `dst` is sized by the caller to EXACTLY the remaining header or payload bytes
+/// of the current frame, so the next frame's bytes stay at the cursor.
+fn read_prefetched_or_socket(
+    pre: &mut Vec<u8>,
+    pre_off: &mut usize,
+    session: &mut Session,
+    dst: &mut [u8],
+) -> std::io::Result<usize> {
+    if *pre_off < pre.len() {
+        let take = dst.len().min(pre.len() - *pre_off);
+        dst[..take].copy_from_slice(&pre[*pre_off..*pre_off + take]);
+        *pre_off += take;
+        return Ok(take);
+    }
+    session.read_into(dst)
+}
+
 fn run_frames(
     ws_id: u64,
     ctrl_rx: &Receiver<Control>,
     destroyed: &DestroyFlag,
     session: &mut Session,
     rng: &SystemRandom,
+    // Handshake leftovers: bytes that arrived COALESCED with the upgrade response (head + first
+    // frames in one segment) were read into the head buffer. They MOVE here (ownership transfer,
+    // zero copies) so steady-state parsing never loses a frame — a swallowed Ping once broke the
+    // §5.5 auto-Pong handshake end-to-end.
+    prefetch: (Vec<u8>, usize),
 ) {
+    let mut pre = prefetch.0;
+    let mut pre_off = prefetch.1;
     let mut frame = InFrame::new();
     // ONE reused scratch buffer for continuation/control payloads (guidelines §4 buffer reuse).
     let mut scratch: Vec<u8> = Vec::new();
@@ -944,7 +969,7 @@ fn run_frames(
             // The header accumulates in the caller-stack `[u8; 14]`, asking for EXACTLY the bytes
             // still needed: over-reading would swallow payload bytes that belong in their own
             // final owner (a dropped tail once broke Ping handling end-to-end).
-            match session.read_into(&mut frame.raw[frame.got..frame.need]) {
+            match read_prefetched_or_socket(&mut pre, &mut pre_off, session, &mut frame.raw[frame.got..frame.need]) {
                 Ok(n) if n > 0 => {
                     frame.got += n;
                     if frame.got >= frame.need {
@@ -1020,8 +1045,8 @@ fn run_frames(
             let want = frame.len - frame.filled;
             let off = frame.filled;
             let read = match frame.owned_slot.as_mut() {
-                Some(buf) => session.read_into(&mut buf[off..off + want]),
-                None => session.read_into(&mut scratch[off..off + want]),
+                Some(buf) => read_prefetched_or_socket(&mut pre, &mut pre_off, session, &mut buf[off..off + want]),
+                None => read_prefetched_or_socket(&mut pre, &mut pre_off, session, &mut scratch[off..off + want]),
             };
             match read {
                 Ok(n) if n > 0 => frame.filled += n,
