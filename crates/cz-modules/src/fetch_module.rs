@@ -88,6 +88,7 @@ fn parse_tls_object<'js>(ctx: &Ctx<'js>, tls: &Object<'js>) -> Result<TlsClientO
         key_pem: opt_bytes(&key)?,
         // Web-compatible default: verify server certificates unless explicitly disabled.
         reject_unauthorized: reject.unwrap_or(true),
+        alpn_protocols: Vec::new(),
     })
 }
 

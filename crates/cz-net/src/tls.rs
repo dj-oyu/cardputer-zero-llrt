@@ -31,6 +31,9 @@ pub struct TlsClientOptions {
     pub key_pem: Option<Vec<u8>>,
     /// When `false`, skip server certificate verification (real TLS is still negotiated).
     pub reject_unauthorized: bool,
+    /// ALPN protocol identifiers offered in the ClientHello (Node `ALPNProtocols`).
+    /// Empty (the default) offers no protocol.
+    pub alpn_protocols: Vec<Vec<u8>>,
 }
 
 impl Default for TlsClientOptions {
@@ -41,6 +44,7 @@ impl Default for TlsClientOptions {
             key_pem: None,
             // Web-compatible default: verify server certificates.
             reject_unauthorized: true,
+            alpn_protocols: Vec::new(),
         }
     }
 }
@@ -57,6 +61,21 @@ pub struct TlsServerOptions {
     pub ca_pem: Option<Vec<u8>>,
     /// Require and verify client certificates (requires `ca_pem`).
     pub require_client_auth: bool,
+    /// ALPN protocol identifiers the server advertises (Node server `ALPNProtocols`).
+    /// Empty (the default) advertises no protocol.
+    pub alpn_protocols: Vec<Vec<u8>>,
+}
+
+impl Default for TlsServerOptions {
+    fn default() -> Self {
+        TlsServerOptions {
+            cert_pem: Vec::new(),
+            key_pem: Vec::new(),
+            ca_pem: None,
+            require_client_auth: false,
+            alpn_protocols: Vec::new(),
+        }
+    }
 }
 
 /// Parse PEM certificates into DER form; errors when the blob contains no certificate.
@@ -309,7 +328,7 @@ pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>,
         }
     };
 
-    let config = match (&opts.cert_pem, &opts.key_pem) {
+    let mut config = match (&opts.cert_pem, &opts.key_pem) {
         (Some(cert_pem), Some(key_pem)) => {
             let chain: Vec<CertificateDer<'static>> = parse_certificates(cert_pem)?;
             let key = parse_private_key(key_pem)?;
@@ -322,6 +341,9 @@ pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>,
 
 
     // SNI on by default so virtual-hosted servers route correctly.
+    if !opts.alpn_protocols.is_empty() {
+        config.alpn_protocols = opts.alpn_protocols.clone();
+    }
     Ok(Arc::new(config))
 }
 
@@ -335,7 +357,7 @@ pub fn build_server_config(opts: &TlsServerOptions) -> Result<Arc<ServerConfig>,
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| format!("TLS error: unsupported protocol versions: {e}"))?;
 
-    let config = if opts.require_client_auth {
+    let mut config = if opts.require_client_auth {
         let ca_pem = opts
             .ca_pem
             .as_ref()
@@ -359,6 +381,9 @@ pub fn build_server_config(opts: &TlsServerOptions) -> Result<Arc<ServerConfig>,
             .with_single_cert(certs, key)
             .map_err(|e| format!("TLS error: invalid server certificate/key: {e}"))?
     };
+    if !opts.alpn_protocols.is_empty() {
+        config.alpn_protocols = opts.alpn_protocols.clone();
+    }
     Ok(Arc::new(config))
 }
 

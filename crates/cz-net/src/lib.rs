@@ -12,6 +12,7 @@
 pub mod fetch;
 pub mod https;
 pub mod tls;
+pub mod tls_socket;
 
 pub use fetch::{
     active_fetch_count, cancel_fetch, fetch_has_pending, is_redirect_status, live_ids, next_event,
@@ -24,6 +25,11 @@ pub use tls::{
     build_client_config, build_server_config, load_system_roots_uncached, parse_certificates,
     parse_private_key, status_text, system_root_store, TlsClientOptions, TlsServerOptions,
     NO_ROOTS_ERROR,
+};
+pub use tls_socket::{
+    close_tls_server, connect_tls, create_tls_server, next_tls_event, tls_active_count,
+    tls_destroy, tls_end, tls_has_pending, tls_write, TlsEngineEvent, SERVER_HANDSHAKE_TIMEOUT,
+    TLS_WORKER_STACK_BYTES,
 };
 
 #[cfg(test)]
@@ -130,6 +136,7 @@ mod tests {
             cert_pem: Some(fixture("client-cert.pem")),
             key_pem: Some(fixture("client-key.pem")),
             reject_unauthorized: true,
+            alpn_protocols: Vec::new(),
         };
         let cfg = build_client_config(&opts).expect("mtls client config");
         // mTLS is exercised end-to-end by mtls_server_requires_and_accepts_client_certificate.
@@ -315,6 +322,7 @@ mod tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         })
         .expect("server cfg");
         let client = build_client_config(&TlsClientOptions {
@@ -336,6 +344,7 @@ mod tests {
             key_pem: fixture("self-key.pem"),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         })
         .expect("self signed server cfg");
 
@@ -366,6 +375,7 @@ mod tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         })
         .expect("server cfg");
 
@@ -385,6 +395,7 @@ mod tests {
         let unchecked = build_client_config(&TlsClientOptions {
             ca_pem: Some(fixture("wrong-ca.pem")),
             reject_unauthorized: false,
+            alpn_protocols: Vec::new(),
             ..Default::default()
         })
         .expect("danger cfg builds");
@@ -399,6 +410,7 @@ mod tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: Some(fixture("ca.pem")),
             require_client_auth: true,
+            alpn_protocols: Vec::new(),
         })
         .expect("mtls server cfg");
 
@@ -407,6 +419,7 @@ mod tests {
             cert_pem: Some(fixture("client-cert.pem")),
             key_pem: Some(fixture("client-key.pem")),
             reject_unauthorized: true,
+            alpn_protocols: Vec::new(),
         })
         .expect("mtls client");
         let echoed = tls_handshake(with_client, server.clone())
@@ -428,6 +441,7 @@ mod tests {
             key_pem: b"nope".to_vec(),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         })
         .expect_err("bad key rejected");
         assert!(err.contains("private key") || err.contains("PEM"), "was: {err}");

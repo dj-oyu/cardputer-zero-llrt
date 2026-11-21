@@ -139,6 +139,7 @@ mod https_tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         }
     }
 
@@ -247,6 +248,7 @@ mod https_tests {
             key_pem: fixture("client-key.pem"),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         };
         let err = expect_tls_error(make_tls_acceptor(&opts), "mismatched cert/key");
         assert!(err.contains("TLS error"), "descriptive TLS error expected: {err}");
@@ -259,6 +261,7 @@ mod https_tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: None,
             require_client_auth: false,
+            alpn_protocols: Vec::new(),
         };
         let err = expect_tls_error(make_tls_acceptor(&garbage), "garbage PEM cert");
         assert!(err.contains("TLS error"), "garbage PEM error expected: {err}");
@@ -269,6 +272,7 @@ mod https_tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: None,
             require_client_auth: true,
+            alpn_protocols: Vec::new(),
         };
         let err = expect_tls_error(make_tls_acceptor(&mtls_no_ca), "mTLS without client CA");
         assert!(err.contains("client CA"), "CA-missing config error expected: {err}");
@@ -432,6 +436,7 @@ mod https_tests {
             key_pem: fixture("server-key.pem"),
             ca_pem: Some(fixture("ca.pem")),
             require_client_auth: true,
+            alpn_protocols: Vec::new(),
         };
         let acceptor = make_tls_acceptor(&opts).expect("mTLS acceptor");
         let (tx, rx) = channel::<ConnectionEvent>();

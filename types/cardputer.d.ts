@@ -644,6 +644,114 @@ declare module "https" {
   export { httpsMod as default };
 }
 
+/** Options accepted by `tls.connect()` (Phase 8C raw TLS client sockets, Node-compatible). */
+interface CzTlsConnectOptions {
+  /** Remote host (default "localhost"). */
+  host?: string;
+  /** Remote port (required; numeric). */
+  port?: number;
+  /** SNI name sent in the ClientHello (defaults to `host`; null disables SNI). */
+  servername?: string | null;
+  /** CA PEM(s) replacing system roots: a string, byte value, or array of either. */
+  ca?: string | Uint8Array | Array<string | Uint8Array>;
+  /** Client certificate chain PEM for mutual TLS. */
+  cert?: string | Uint8Array;
+  /** Client private key PEM for mutual TLS. */
+  key?: string | Uint8Array;
+  /** Skip server certificate verification (default true). Real TLS still negotiates. */
+  rejectUnauthorized?: boolean;
+  /** ALPN protocol identifiers offered to the server (e.g. ["h2", "http/1.1"]). */
+  ALPNProtocols?: string[];
+}
+
+/** Options accepted by `tls.createServer()` (PEM material required, validated eagerly). */
+interface CzTlsServerOptions {
+  /** PEM private key (string or Uint8Array) — REQUIRED. */
+  key: string | Uint8Array;
+  /** PEM certificate chain, leaf first — REQUIRED. */
+  cert: string | Uint8Array;
+  /** Optional client CA PEM used to verify client certificates (mutual TLS). */
+  ca?: string | Uint8Array;
+  /** Mandate client certificates (default false). */
+  requestCert?: boolean;
+  /** Reject clients lacking a valid certificate (default true when requestCert is true). */
+  rejectUnauthorized?: boolean;
+  /** ALPN protocol identifiers advertised by this server. */
+  ALPNProtocols?: string[];
+}
+
+/** Bidirectional TLS socket over the cz-net rustls worker engine (Phase 8C). */
+interface CzTlsSocket {
+  /** Always true once constructed (the session is TLS). */
+  encrypted: boolean;
+  /** True when the peer certificate verified (client side); reflects client-cert validity on servers. */
+  authorized: boolean;
+  /** Negotiated ALPN protocol string, or false when none was negotiated. */
+  alpnProtocol: string | false;
+  remoteAddress: string;
+  remotePort: number;
+  /** True after `destroy()` or the engine's terminal `close` event. */
+  destroyed: boolean;
+  readable: boolean;
+  writable: boolean;
+  /** Switch `data` payloads to strings (only utf-8 is supported). */
+  setEncoding(enc: string): CzTlsSocket;
+  /** Queue plaintext (`string | Uint8Array`); returns false once gone. Optional flush callback. */
+  write(chunk?: string | Uint8Array, cb?: (err?: Error) => void): boolean;
+  /** Flush optional tail bytes, send TLS close_notify, half-close; `end`/`close` follow. */
+  end(chunk?: string | Uint8Array | (() => void), cb?: () => void): CzTlsSocket;
+  /** Abrupt teardown (best-effort close_notify + TCP shutdown); only `close` follows. */
+  destroy(): CzTlsSocket;
+  on(event: "secureConnect" | "data" | "end" | "close" | "error", fn: (arg?: unknown) => void): CzTlsSocket;
+  once(event: string, fn: (arg?: unknown) => void): CzTlsSocket;
+  off(event: string, fn: (arg?: unknown) => void): CzTlsSocket;
+  removeListener(event: string, fn: (arg?: unknown) => void): CzTlsSocket;
+}
+
+/** Listening TLS server: accepted sockets arrive via the `secureConnection` event. */
+interface CzTlsServer {
+  listen(port: number, host?: string, cb?: () => void): CzTlsServer;
+  /** Bound address snapshot (`null` before listen / after close). */
+  address(): { address: string; family: string; port: number } | null;
+  /** Stop accepting and close currently-open connections (Node >= 18 semantics). */
+  close(cb?: () => void): CzTlsServer;
+  on(event: "secureConnection" | "listening" | "close" | "error", fn: (arg?: unknown) => void): CzTlsServer;
+  once(event: string, fn: (arg?: unknown) => void): CzTlsServer;
+  off(event: string, fn: (arg?: unknown) => void): CzTlsServer;
+  removeListener(event: string, fn: (arg?: unknown) => void): CzTlsServer;
+  emit(event: string, arg?: unknown): boolean;
+}
+
+/** Node-compatible `node:tls` raw client & server TLS sockets (Phase 8C, cz-net rustls engine). */
+declare module "node:tls" {
+  /** Connect a client TLS socket; overloads mirror Node (`connect(options[, cb])`, `connect(port[, host][, options][, cb])`). */
+  export function connect(options: CzTlsConnectOptions, secureConnectListener?: () => void): CzTlsSocket;
+  export function connect(port: number, secureConnectListener?: () => void): CzTlsSocket;
+  export function connect(port: number, host: string, secureConnectListener?: () => void): CzTlsSocket;
+  export function connect(port: number, host: string, options?: CzTlsConnectOptions, secureConnectListener?: () => void): CzTlsSocket;
+
+  /** Create a TLS server; key/cert are validated eagerly with a descriptive Error. */
+  export function createServer(options: CzTlsServerOptions, secureConnectionListener?: (socket: CzTlsSocket) => void): CzTlsServer;
+
+  export const TLSSocket: { new (info?: unknown): CzTlsSocket; prototype: CzTlsSocket };
+  export const Server: { new (options?: CzTlsServerOptions): CzTlsServer; prototype: CzTlsServer };
+
+  const tls: {
+    connect: typeof connect;
+    createServer: typeof createServer;
+    TLSSocket: typeof TLSSocket;
+    Server: typeof Server;
+  };
+  export default tls;
+}
+
+/** Node.js-style alias of the `node:tls` module (named exports plus default object). */
+declare module "tls" {
+  import tlsMod from "node:tls";
+  export * from "node:tls";
+  export { tlsMod as default };
+}
+
 /** Result shape of `statSync()`. */
 interface CzStats {
   /** Size in bytes. */

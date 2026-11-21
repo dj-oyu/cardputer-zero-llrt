@@ -94,6 +94,7 @@ fn tls_opts_from_js<'js>(ctx: &Ctx<'js>, opts: &Object<'js>) -> Result<TlsServer
         key_pem: key,
         ca_pem: ca,
         require_client_auth,
+        alpn_protocols: Vec::new(),
     })
 }
 

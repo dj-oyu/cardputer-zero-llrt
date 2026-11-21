@@ -29,6 +29,7 @@ pub mod io_module;
 pub mod ir_module;
 pub mod json_module;
 pub mod kv_module;
+pub mod tls_module;
 
 // ---------------------------------------------------------------------------
 // Clean `awslabs/llrt` v0.10.0-beta integration surface
@@ -47,6 +48,17 @@ pub use ir_module::IrModule;
 pub use json_module::{install_json, JsonModule};
 pub use fetch_module::{fetch_active_count, fetch_has_pending, install_fetch};
 pub use kv_module::KvModule;
+pub use tls_module::TlsModule;
+
+/// Live raw TLS sockets + listening TLS servers (`node:tls` liveness for `cz-runner`).
+pub fn tls_active_count() -> usize {
+    tls_module::tls_active_count_js()
+}
+
+/// True while TLS engine events await the JavaScript drain.
+pub fn tls_has_pending() -> bool {
+    tls_module::tls_has_pending_js()
+}
 
 /// Every Cardputer module specifier the LLRT bridge exposes (display, input, app, power, kv,
 /// json plus the Phase 6A peripherals: imu, audio, ir, io). HTTP/FS ride the Node-style
@@ -120,6 +132,8 @@ pub const MODULE_NAMES: &[&str] = &[
     "http",
     "node:https",
     "https",
+    "node:tls",
+    "tls",
     "node:fs",
     "fs",
 ];
@@ -133,6 +147,7 @@ pub enum ModuleKind {
     Power,
     Http,
     Https,
+    Tls,
     Fs,
     Kv,
     Json,
@@ -152,6 +167,7 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "cardputer:power" => Some(ModuleKind::Power),
         "node:http" | "http" => Some(ModuleKind::Http),
         "node:https" | "https" => Some(ModuleKind::Https),
+        "node:tls" | "tls" => Some(ModuleKind::Tls),
         "node:fs" | "fs" => Some(ModuleKind::Fs),
         "cardputer:kv" => Some(ModuleKind::Kv),
         "cardputer:json" => Some(ModuleKind::Json),
@@ -176,6 +192,7 @@ pub fn declare_builtin<'js>(
         ModuleKind::Power => rquickjs::Module::declare_def::<PowerModule, _>(ctx.clone(), name),
         ModuleKind::Http => rquickjs::Module::declare_def::<http_module::HttpModule, _>(ctx.clone(), name),
         ModuleKind::Https => rquickjs::Module::declare_def::<https_module::HttpsModule, _>(ctx.clone(), name),
+        ModuleKind::Tls => rquickjs::Module::declare_def::<tls_module::TlsModule, _>(ctx.clone(), name),
         ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
         ModuleKind::Kv => rquickjs::Module::declare_def::<kv_module::KvModule, _>(ctx.clone(), name),
         ModuleKind::Json => rquickjs::Module::declare_def::<json_module::JsonModule, _>(ctx.clone(), name),

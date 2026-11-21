@@ -256,8 +256,10 @@ fn settle_module(rt: &Runtime, ctx: &Context) -> Result<bool, String> {
         if module_settled(ctx) {
             return Ok(true);
         }
-        let (_, timers, extra_work, fetch_active) = loop_liveness(rt, ctx);
-        if !extra_work && timers <= 0 && fetch_active == 0 && cz_modules::http_listening_count() == 0 {
+        let (_, timers, extra_work, fetch_active, tls_active) = loop_liveness(rt, ctx);
+        if !extra_work && timers <= 0 && fetch_active == 0 && tls_active == 0
+            && cz_modules::http_listening_count() == 0
+        {
             idle_passes += 1;
             // Brief grace window: a worker thread may be between notify and dispatch.
             if idle_passes > 60 {
@@ -363,6 +365,11 @@ fn loop_pass(rt: &Runtime, ctx: &Context) {
     ctx.with(|c| call_js_i64(&c, "__czFetchDrainLoop", 0));
     drain_jobs(rt);
 
+    // 0b. Deliver arrived raw TLS socket events (secureConnect/secureConnection/data/end/close/
+    //     error) into the node:tls shim. Engine threads call notify_event_loop() on arrival.
+    ctx.with(|c| call_js_i64(&c, "__czTlsDrainLoop", 0));
+    drain_jobs(rt);
+
     // 0. Fire HTTP "close" notifications (Phase 2.5): client disconnects or server-forced
     //    stream ends queue conn ids in the engine; JS clears intervals / releases streams here.
     ctx.with(|c| call_js_i64(&c, "__czHttpCheckCloses", 0));
@@ -377,24 +384,33 @@ fn loop_pass(rt: &Runtime, ctx: &Context) {
     drain_jobs(rt);
 
     // 3. Give promise jobs created by timers one more dispatch pass in this iteration.
-    if rt.is_job_pending() || cz_modules::http_has_pending() || cz_modules::fetch_has_pending() {
+    if rt.is_job_pending() || cz_modules::http_has_pending() || cz_modules::fetch_has_pending()
+        || cz_modules::tls_has_pending()
+    {
         ctx.with(|c| call_js_i64(&c, "__czHttpDrainLoop", 0));
         drain_jobs(rt);
         ctx.with(|c| call_js_i64(&c, "__czFetchDrainLoop", 0));
         drain_jobs(rt);
+        ctx.with(|c| call_js_i64(&c, "__czTlsDrainLoop", 0));
+        drain_jobs(rt);
     }
 }
 
-/// Liveness snapshot: listening servers, pending JS timers, plus queued engine requests or
-/// pending QuickJS jobs. Runtime queries run outside any context scope.
-fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool, usize) {
+/// Liveness snapshot: listening servers, pending JS timers, plus queued engine requests, pending
+/// QuickJS jobs, queued TLS events and live TLS sockets/servers. Runtime queries run outside any
+/// context scope (rquickjs RefCell rule).
+fn loop_liveness(rt: &Runtime, ctx: &Context) -> (usize, i64, bool, usize, usize) {
     let listening = cz_modules::http_listening_count();
-    let queued = cz_modules::http_has_pending() || cz_modules::fetch_has_pending();
+    let queued = cz_modules::http_has_pending()
+        || cz_modules::fetch_has_pending()
+        || cz_modules::tls_has_pending();
     let job_pending = rt.is_job_pending();
     let timers = ctx.with(|c| call_js_i64(&c, "__czTimerCount", 0));
     // Live fetch slots keep the process alive even when no node:http server exists.
     let fetch_active = cz_modules::fetch_active_count();
-    (listening, timers, queued || job_pending, fetch_active)
+    // Phase 8C: open raw TLS sockets + listening TLS servers keep the loop alive too.
+    let tls_active = cz_modules::tls_active_count();
+    (listening, timers, queued || job_pending, fetch_active, tls_active)
 }
 
 /// Keep the process alive while any HTTP server listens or any timer is pending. The idle pause
@@ -414,11 +430,11 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
             break;
         }
         loop_pass(rt, ctx);
-        let (listening, timers, extra_work, fetch_active) = loop_liveness(rt, ctx);
-        if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 {
+        let (listening, timers, extra_work, fetch_active, tls_active) = loop_liveness(rt, ctx);
+        if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 && tls_active == 0 {
             break;
         }
-        if !has_http && listening == 0 && timers <= 0 && fetch_active == 0 {
+        if !has_http && listening == 0 && timers <= 0 && fetch_active == 0 && tls_active == 0 {
             break;
         }
         if started.elapsed().as_secs() > 3600 {
