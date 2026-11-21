@@ -10,6 +10,7 @@
 //! `webpki-roots`.
 
 pub mod fetch;
+pub mod https;
 pub mod tls;
 
 pub use fetch::{
@@ -18,6 +19,7 @@ pub use fetch::{
     EngineEvent, FailKind, FetchSpec, RedirectMode, CHUNK_QUEUE_DEPTH, CHUNK_SIZE,
     DEFAULT_CONNECT_TIMEOUT, MAX_BUFFERED_BODY, MAX_CONCURRENT_FETCHES, WORKER_STACK_BYTES,
 };
+pub use https::{make_tls_acceptor, TlsConnStream, HANDSHAKE_TIMEOUT};
 pub use tls::{
     build_client_config, build_server_config, load_system_roots_uncached, parse_certificates,
     parse_private_key, status_text, system_root_store, TlsClientOptions, TlsServerOptions,

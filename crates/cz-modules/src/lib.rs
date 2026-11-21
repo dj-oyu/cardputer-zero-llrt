@@ -23,6 +23,7 @@ pub mod audio_module;
 pub mod fetch_module;
 pub mod fs_module;
 pub mod http_module;
+pub mod https_module;
 pub mod imu_module;
 pub mod io_module;
 pub mod ir_module;
@@ -39,6 +40,7 @@ pub mod kv_module;
 pub use audio_module::AudioModule;
 pub use fs_module::FsModule;
 pub use http_module::HttpModule;
+pub use https_module::HttpsModule;
 pub use imu_module::ImuModule;
 pub use io_module::IoModule;
 pub use ir_module::IrModule;
@@ -116,6 +118,8 @@ pub const MODULE_NAMES: &[&str] = &[
     "cardputer:io",
     "node:http",
     "http",
+    "node:https",
+    "https",
     "node:fs",
     "fs",
 ];
@@ -128,6 +132,7 @@ pub enum ModuleKind {
     App,
     Power,
     Http,
+    Https,
     Fs,
     Kv,
     Json,
@@ -146,6 +151,7 @@ pub fn resolve_builtin(name: &str) -> Option<ModuleKind> {
         "cardputer:app" => Some(ModuleKind::App),
         "cardputer:power" => Some(ModuleKind::Power),
         "node:http" | "http" => Some(ModuleKind::Http),
+        "node:https" | "https" => Some(ModuleKind::Https),
         "node:fs" | "fs" => Some(ModuleKind::Fs),
         "cardputer:kv" => Some(ModuleKind::Kv),
         "cardputer:json" => Some(ModuleKind::Json),
@@ -169,6 +175,7 @@ pub fn declare_builtin<'js>(
         ModuleKind::App => rquickjs::Module::declare_def::<AppModule, _>(ctx.clone(), name),
         ModuleKind::Power => rquickjs::Module::declare_def::<PowerModule, _>(ctx.clone(), name),
         ModuleKind::Http => rquickjs::Module::declare_def::<http_module::HttpModule, _>(ctx.clone(), name),
+        ModuleKind::Https => rquickjs::Module::declare_def::<https_module::HttpsModule, _>(ctx.clone(), name),
         ModuleKind::Fs => rquickjs::Module::declare_def::<fs_module::FsModule, _>(ctx.clone(), name),
         ModuleKind::Kv => rquickjs::Module::declare_def::<kv_module::KvModule, _>(ctx.clone(), name),
         ModuleKind::Json => rquickjs::Module::declare_def::<json_module::JsonModule, _>(ctx.clone(), name),

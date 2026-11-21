@@ -480,6 +480,8 @@ interface CzSocketInfo {
   remotePort: number;
   localAddress: string;
   localPort: number;
+  /** Phase 8B: true only when the connection was upgraded to TLS (HTTPS); plain HTTP reports false. */
+  encrypted: boolean;
 }
 
 /** Incoming request object passed to a `"request"` listener (`node:http`). */
@@ -583,6 +585,63 @@ declare module "http" {
   import httpMod from "node:http";
   export * from "node:http";
   export { httpMod as default };
+}
+
+/** Options accepted by `https.createServer()` (Phase 8B TLS server, Node-compatible shape). */
+interface CzHttpsServerOptions {
+  /** PEM private key (string or Uint8Array) — REQUIRED; invalid/missing throws a descriptive Error. */
+  key: string | Uint8Array;
+  /** PEM certificate chain, leaf first (string or Uint8Array) — REQUIRED. */
+  cert: string | Uint8Array;
+  /** Optional client CA PEM used to verify client certificates (mutual TLS). */
+  ca?: string | Uint8Array;
+  /** Ask for / mandate client certificates (default false). */
+  requestCert?: boolean;
+  /** Reject clients lacking a valid certificate (default true when requestCert is true). */
+  rejectUnauthorized?: boolean;
+}
+
+/** HTTPS server reuses the exact node:http semantics plus `req.socket.encrypted === true`. */
+declare module "node:https" {
+  /** Standard reason phrases keyed by numeric status code. */
+  export const STATUS_CODES: Record<string, string>;
+  /** Supported method tokens: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS. */
+  export const METHODS: string[];
+
+  /** Create a TLS server; options are validated immediately (descriptive Error, never a panic). */
+  export function createServer(
+    options: CzHttpsServerOptions,
+    requestListener?: (req: IncomingMessage, res: ServerResponse) => void
+  ): CzHttpServer;
+
+  /** The exported `Server` constructor (same shape `createServer` builds). */
+  export const Server: {
+    new (
+      options?: CzHttpsServerOptions,
+      requestListener?: (req: IncomingMessage, res: ServerResponse) => void
+    ): CzHttpServer;
+    prototype: CzHttpServer;
+  };
+
+  export const IncomingMessage: { prototype: IncomingMessage };
+  export const ServerResponse: { prototype: ServerResponse };
+
+  const https: {
+    STATUS_CODES: typeof STATUS_CODES;
+    METHODS: typeof METHODS;
+    createServer: typeof createServer;
+    Server: typeof Server;
+    IncomingMessage: typeof IncomingMessage;
+    ServerResponse: typeof ServerResponse;
+  };
+  export default https;
+}
+
+/** Node.js-style alias of the `node:https` module (named exports plus default object). */
+declare module "https" {
+  import httpsMod from "node:https";
+  export * from "node:https";
+  export { httpsMod as default };
 }
 
 /** Result shape of `statSync()`. */

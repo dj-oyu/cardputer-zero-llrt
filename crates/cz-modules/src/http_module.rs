@@ -465,7 +465,9 @@ const HTTP_SHIM: &str = r#"
             const p = Number(port) || 0;
             let info;
             try {
-                info = __czListen(p, host);
+                info = this._tlsOpts
+                    ? globalThis.__czListenTls(p, host, this._tlsOpts)
+                    : __czListen(p, host);
             } catch (e) {
                 this.emit("error", e);
                 czReportError(e);
@@ -559,28 +561,42 @@ const HTTP_SHIM: &str = r#"
 
 /// Register the Rust primitives + JS shim on this context (idempotent). The named `'js` lifetime
 /// is required so native closures can both capture and receive context values (rquickjs rule).
+// Shared bind path used by BOTH plain `__czListen` (`node:http`) and the Phase 8B HTTPS variant
+// (`__czListenTls` in `https_module`): identical registry accounting, address snapshot and
+// liveness semantics; only the optional per-connection `StreamAcceptor` differs.
+pub(crate) fn listen_impl<'js>(
+    ctx: &Ctx<'js>,
+    port: f64,
+    host: &str,
+    acceptor: Option<cz_hal::http_server::StreamAcceptor>,
+) -> Result<Object<'js>> {
+    let id = NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst);
+    let p = if port.is_finite() && port >= 0.0 && port <= 65535.0 { port as u16 } else { 0 };
+    let listener =
+        match cz_hal::http_server::start_listener_with_acceptor(host, p, id, registry().tx.clone(), acceptor)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                return Err(Exception::throw_message(ctx, &format!("listen {host}:{p} failed: {e}")));
+            }
+        };
+    // Snapshot the bound address BEFORE moving the listener into the registry map.
+    let address = listener.address.clone();
+    let bound_port = listener.port;
+    registry().servers.lock().expect("servers lock").insert(id, listener);
+    let obj = Object::new(ctx.clone())?;
+    obj.set("id", id as f64)?;
+    obj.set("address", address.as_str())?;
+    obj.set("family", "IPv4")?;
+    obj.set("port", bound_port as f64)?;
+    Ok(obj)
+}
+
 fn install_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
     ctx.globals().set(
         "__czListen",
         Function::new(ctx.clone(), |ctx: Ctx<'js>, port: f64, host: String| -> Result<Object<'js>> {
-            let id = NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst);
-            let p = if port.is_finite() && port >= 0.0 && port <= 65535.0 { port as u16 } else { 0 };
-            let listener = match cz_hal::http_server::spawn_listener(&host, p, id, registry().tx.clone()) {
-                Ok(l) => l,
-                Err(e) => {
-                    return Err(Exception::throw_message(&ctx, &format!("listen {host}:{p} failed: {e}")));
-                }
-            };
-            // Snapshot the bound address BEFORE moving the listener into the registry map.
-            let address = listener.address.clone();
-            let bound_port = listener.port;
-            registry().servers.lock().expect("servers lock").insert(id, listener);
-            let obj = Object::new(ctx.clone())?;
-            obj.set("id", id as f64)?;
-            obj.set("address", address.as_str())?;
-            obj.set("family", "IPv4")?;
-            obj.set("port", bound_port as f64)?;
-            Ok(obj)
+            listen_impl(&ctx, port, &host, None)
         })?,
     )?;
 
@@ -716,7 +732,7 @@ fn collect_header_pairs(pairs: &Array<'_>) -> Result<Vec<(String, String)>> {
 
 /// Append one JS body part (string / Uint8Array / ArrayBuffer) as bytes. No JS execution runs
 /// while the typed-array slice is borrowed.
-fn push_value_bytes<'js>(ctx: &Ctx<'js>, v: Value<'js>, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn push_value_bytes<'js>(ctx: &Ctx<'js>, v: Value<'js>, out: &mut Vec<u8>) -> Result<()> {
     if let Some(s) = v.as_string() {
         out.extend_from_slice(s.to_string()?.as_bytes());
     } else if let Ok(ta) = TypedArray::<u8>::from_value(v.clone()) {
@@ -768,6 +784,8 @@ fn build_descriptor<'js>(ctx: &Ctx<'js>, ev: ConnectionEvent) -> Result<Value<'j
     socket.set("remotePort", ev.remote_port as f64)?;
     socket.set("localAddress", ev.local_address.as_str())?;
     socket.set("localPort", ev.local_port as f64)?;
+    // Phase 8B: `req.socket.encrypted` — true only for TLS-upgraded connections.
+    socket.set("encrypted", ev.encrypted)?;
     obj.set("socket", socket)?;
 
     obj.set("keepAlive", ev.keep_alive)?;

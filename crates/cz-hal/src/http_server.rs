@@ -28,6 +28,96 @@ use crate::http::{
     ParsedRequest, RequestParser, ResponseFrame,
 };
 
+/// Abstract per-connection byte stream: a plain TCP socket OR a TLS-wrapped one.
+///
+/// The engine drives every request/response over this trait, so an external `StreamAcceptor`
+/// (e.g. `cz-net`'s rustls adapter) can transparently upgrade accepted connections while
+/// `cz-hal` itself stays strictly `libc`-only and knows nothing about TLS.
+pub trait ConnStream: Read + Write + Send {
+    /// Enable `TCP_NODELAY` on the underlying socket.
+    fn set_nodelay(&self) -> std::io::Result<()>;
+    /// Bounded read timeout (`None` clears it). Used to bound TLS handshakes.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    /// Bounded write timeout (`None` clears it).
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    /// Best-effort full close of both directions. TLS implementations should emit their
+    /// `close_notify` alert through the session BEFORE shutting the raw socket down.
+    fn shutdown_both(&mut self);
+    /// Peer address as a plain string ("127.0.0.1").
+    fn peer_addr_str(&self) -> String;
+    /// Raw OS socket fd for the non-blocking liveness probe. `POLLHUP`/`MSG_PEEK` observe
+    /// TCP-level FIN/RST regardless of TLS framing, so the probe stays valid on TLS streams.
+    fn raw_fd(&self) -> std::os::fd::RawFd;
+    /// Local socket address when the OS can report it.
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr>;
+    /// `true` when bytes travel through a TLS session (surfaces as `req.socket.encrypted`).
+    fn is_encrypted(&self) -> bool;
+}
+
+impl ConnStream for TcpStream {
+    fn set_nodelay(&self) -> std::io::Result<()> {
+        TcpStream::set_nodelay(self, true)
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+    fn shutdown_both(&mut self) {
+        self.shutdown(std::net::Shutdown::Both).ok();
+    }
+    fn peer_addr_str(&self) -> String {
+        self.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default()
+    }
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        AsRawFd::as_raw_fd(self)
+    }
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        TcpStream::local_addr(self)
+    }
+    fn is_encrypted(&self) -> bool {
+        false
+    }
+}
+
+/// Phase 8B: hook that upgrades a freshly accepted `TcpStream` into a [`ConnStream`] (TLS or otherwise).
+/// It runs on the per-connection WORKER thread — never inside `accept_loop` — so a client that
+/// stalls mid-handshake can not block other incoming connections.
+pub type StreamAcceptor =
+    Arc<dyn Fn(TcpStream) -> std::io::Result<Box<dyn ConnStream>> + Send + Sync>;
+
+// Delegating impl so a `Box<dyn ConnStream>` itself acts as a `ConnStream`: the boxed object's
+// vtable dispatches to the concrete inner stream (plain TCP or TLS), so `&mut Box<dyn ConnStream>`
+// coerces cleanly to `&mut dyn ConnStream`. `Read`/`Write` on the Box come from `alloc`'s own
+// blanket impls over the trait's supertraits — declaring them here would conflict (E0119).
+impl ConnStream for Box<dyn ConnStream> {
+    fn set_nodelay(&self) -> std::io::Result<()> {
+        (**self).set_nodelay()
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_read_timeout(timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_write_timeout(timeout)
+    }
+    fn shutdown_both(&mut self) {
+        (**self).shutdown_both()
+    }
+    fn peer_addr_str(&self) -> String {
+        (**self).peer_addr_str()
+    }
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        (**self).raw_fd()
+    }
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        (**self).local_addr()
+    }
+    fn is_encrypted(&self) -> bool {
+        (**self).is_encrypted()
+    }
+}
+
 /// Read size used while pulling bytes off a connection.
 const READ_CHUNK: usize = 8 * 1024;
 /// Poll slice used by the accept loop (bounded stop latency, low idle CPU).
@@ -293,6 +383,9 @@ pub struct ConnectionEvent {
     pub remote_port: u16,
     pub local_address: String,
     pub local_port: u16,
+    /// Phase 8B: `true` when this connection was upgraded by a TLS `StreamAcceptor`; the JS glue
+    /// surfaces it as `req.socket.encrypted`.
+    pub encrypted: bool,
     /// Reply channel for THIS request. Phase 2 delivered one buffered frame; Phase 2.5 lets the
     /// channel carry a *sequence*: `StreamHead` -> many `StreamChunk`s -> `StreamEnd`, each chunk
     /// written and flushed onto the socket immediately, or a single `Buffered` frame (Phase 2).
@@ -379,14 +472,49 @@ pub fn spawn_listener_with_timeout(
     tx: Sender<ConnectionEvent>,
     reply_timeout: Duration,
 ) -> std::io::Result<Listener> {
+    spawn_listener_impl(host, port, server_id, tx, reply_timeout, None)
+}
+
+/// Node-compatible alias of [`spawn_listener`] (plain TCP, default reply timeout).
+pub fn start_listener(
+    host: &str,
+    port: u16,
+    server_id: u64,
+    tx: Sender<ConnectionEvent>,
+) -> std::io::Result<Listener> {
+    start_listener_with_acceptor(host, port, server_id, tx, None)
+}
+
+/// Phase 8B: bind + accept thread with an optional per-connection [`StreamAcceptor`]. The
+/// acceptor (e.g. a rustls TLS handshake) executes on the spawned per-connection worker thread,
+/// never in `accept_loop`, so a stalled client handshake cannot block other connections.
+pub fn start_listener_with_acceptor(
+    host: &str,
+    port: u16,
+    server_id: u64,
+    tx: Sender<ConnectionEvent>,
+    acceptor: Option<StreamAcceptor>,
+) -> std::io::Result<Listener> {
+    spawn_listener_impl(host, port, server_id, tx, DEFAULT_REPLY_TIMEOUT, acceptor)
+}
+
+fn spawn_listener_impl(
+    host: &str,
+    port: u16,
+    server_id: u64,
+    tx: Sender<ConnectionEvent>,
+    reply_timeout: Duration,
+    acceptor: Option<StreamAcceptor>,
+) -> std::io::Result<Listener> {
     let listener = bind_socket(host, port)?;
     let bound = listener.local_addr()?;
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let acceptor_thread = acceptor.clone();
     let handle = std::thread::Builder::new()
         .name(format!("cz-http-accept-{server_id}"))
-        .spawn(move || accept_loop(listener, stop_thread, tx, server_id, reply_timeout))?;
+        .spawn(move || accept_loop(listener, stop_thread, tx, server_id, reply_timeout, acceptor_thread))?;
     Ok(Listener {
         id: server_id,
         address: bound.ip().to_string(),
@@ -439,6 +567,7 @@ fn accept_loop(
     tx: Sender<ConnectionEvent>,
     server_id: u64,
     reply_timeout: Duration,
+    acceptor: Option<StreamAcceptor>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         let mut pfd = libc::pollfd {
@@ -458,7 +587,15 @@ fn accept_loop(
                         return;
                     }
                     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
-                    spawn_connection(stream, peer, server_id, conn_id, tx.clone(), reply_timeout);
+                    spawn_connection(
+                        stream,
+                        peer,
+                        server_id,
+                        conn_id,
+                        tx.clone(),
+                        reply_timeout,
+                        acceptor.clone(),
+                    );
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => break,
                 Err(_) => return,
@@ -469,16 +606,15 @@ fn accept_loop(
 
 /// Detached per-connection reader thread: parse -> (error answer | forward + await reply).
 fn spawn_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: std::net::SocketAddr,
     server_id: u64,
     conn_id: u64,
     tx: Sender<ConnectionEvent>,
     reply_timeout: Duration,
+    acceptor: Option<StreamAcceptor>,
 ) {
     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
-    stream.set_nodelay(true).ok();
-    let local = stream.local_addr().unwrap_or(peer);
     std::thread::Builder::new()
         .name(format!("cz-http-conn-{conn_id}"))
         // Intentionally detached: `server.close()` may leave clients mid-flight, and the process
@@ -486,6 +622,17 @@ fn spawn_connection(
         .spawn(move || {
             // Decrement ACTIVE_CONNECTIONS when this thread ends (also on early `return`s).
             let _guard = ConnectionGuard;
+            // Phase 8B: materialize the (possibly TLS-wrapped) stream HERE, inside the worker
+            // thread. A stalled or hostile handshake only ever affects this one connection.
+            let mut conn: Box<dyn ConnStream> = match &acceptor {
+                Some(make_stream) => match make_stream(stream) {
+                    Ok(conn) => conn,
+                    Err(_) => return, // handshake failed: drop THIS socket only, no crash
+                },
+                None => Box::new(stream),
+            };
+            conn.set_nodelay().ok();
+            let local = conn.local_addr().unwrap_or(peer);
             let remote_ip = peer.ip().to_string();
             let local_ip = local.ip().to_string();
             let mut parser = RequestParser::new();
@@ -496,12 +643,12 @@ fn spawn_connection(
                     match parser.step() {
                         Ok(crate::http::ParseStep::Request(r)) => break r,
                         Ok(crate::http::ParseStep::InterimContinue) => {
-                            if write_all_eof_free(&mut stream, crate::http::continue_frame()).is_err() {
+                            if write_all_eof_free(&mut conn, crate::http::continue_frame()).is_err() {
                                 return;
                             }
                         }
                         Ok(crate::http::ParseStep::NeedMore) => {
-                            match stream.read(&mut buf) {
+                            match conn.read(&mut buf) {
                                 Ok(0) => return, // client closed the connection
                                 Ok(n) => parser.push(&buf[..n]),
                                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -510,8 +657,8 @@ fn spawn_connection(
                         }
                         Err(err) => {
                             // Malformed (400) / oversized (413): answer, then drop only THIS socket.
-                            let _ = write_all_eof_free(&mut stream, error_response(&err));
-                            shutdown(&mut stream);
+                            let _ = write_all_eof_free(&mut conn, error_response(&err));
+                            conn.shutdown_both();
                             return;
                         }
                     }
@@ -531,12 +678,13 @@ fn spawn_connection(
                         remote_port: peer.port(),
                         local_address: local_ip.clone(),
                         local_port: local.port(),
+                        encrypted: conn.is_encrypted(),
                         reply: reply_tx,
                     })
                     .is_err()
                 {
                     // Consumer gone (event loop exited): close quietly.
-                    shutdown(&mut stream);
+                    conn.shutdown_both();
                     return;
                 }
 
@@ -555,13 +703,13 @@ fn spawn_connection(
                             match action {
                                 ResponseAction::Buffered(frame) => {
                                     let bytes = frame.encode();
-                                    if write_all_eof_free(&mut stream, bytes).is_err() {
+                                    if write_all_eof_free(&mut conn, bytes).is_err() {
                                         mark_client_closed(conn_id);
-                                        shutdown(&mut stream);
+                                        conn.shutdown_both();
                                         return;
                                     }
                                     if !frame.keep_alive {
-                                        shutdown(&mut stream);
+                                        conn.shutdown_both();
                                         return;
                                     }
                                     break 'reply;
@@ -574,9 +722,9 @@ fn spawn_connection(
                                 } => {
                                     let bytes =
                                         serialize_stream_head(status, reason.as_deref(), &headers, keep_alive);
-                                    if write_all_eof_free(&mut stream, bytes).is_err() {
+                                    if write_all_eof_free(&mut conn, bytes).is_err() {
                                         mark_client_closed(conn_id);
-                                        shutdown(&mut stream);
+                                        conn.shutdown_both();
                                         return;
                                     }
                                     streaming = true;
@@ -585,32 +733,32 @@ fn spawn_connection(
                                     if !streaming || data.is_empty() {
                                         continue 'reply; // nothing to frame
                                     }
-                                    if write_all_eof_free(&mut stream, chunk_frame(&data)).is_err() {
+                                    if write_all_eof_free(&mut conn, chunk_frame(&data)).is_err() {
                                         mark_client_closed(conn_id);
-                                        shutdown(&mut stream);
+                                        conn.shutdown_both();
                                         return;
                                     }
                                     // Rapid pushes must not starve EOF detection: probe the peer
                                     // after each flush (non-blocking), so a hung-up client fires
                                     // "close" within milliseconds even while data keeps flowing.
-                                    if peer_closed(&stream) {
+                                    if peer_closed(conn.raw_fd()) {
                                         mark_client_closed(conn_id);
-                                        shutdown(&mut stream);
+                                        conn.shutdown_both();
                                         return;
                                     }
                                 }
                                 ResponseAction::StreamEnd { keep_alive } => {
                                     if streaming {
-                                        if write_all_eof_free(&mut stream, LAST_CHUNK_FRAME.to_vec()).is_err() {
+                                        if write_all_eof_free(&mut conn, LAST_CHUNK_FRAME.to_vec()).is_err() {
                                             mark_client_closed(conn_id);
-                                            shutdown(&mut stream);
+                                            conn.shutdown_both();
                                             return;
                                         }
                                         // `streaming` ends with this request; the per-request
                                         // loop below re-initializes it for the next one.
                                     }
                                     if !keep_alive {
-                                        shutdown(&mut stream);
+                                        conn.shutdown_both();
                                         return;
                                     }
                                     break 'reply;
@@ -622,17 +770,17 @@ fn spawn_connection(
                             // JS dropped the response object without finalizing it.
                             if !streaming {
                                 let body = ResponseFrame::error(500, "request handler did not respond", false);
-                                let _ = write_all_eof_free(&mut stream, body.encode());
+                                let _ = write_all_eof_free(&mut conn, body.encode());
                             }
                             // Headers already went out mid-stream: just close that socket.
-                            shutdown(&mut stream);
+                            conn.shutdown_both();
                             return;
                         }
                         ReplyOutcome::Timeout => {
                             // Peer gone (FIN/RST)? Notify so JS can clear intervals right away.
-                            if peer_closed(&stream) {
+                            if peer_closed(conn.raw_fd()) {
                                 mark_client_closed(conn_id);
-                                shutdown(&mut stream);
+                                conn.shutdown_both();
                                 return;
                             }
                             if Instant::now() >= deadline {
@@ -643,9 +791,9 @@ fn spawn_connection(
                                 } else {
                                     let body =
                                         ResponseFrame::error(500, "request handler did not respond", false);
-                                    let _ = write_all_eof_free(&mut stream, body.encode());
+                                    let _ = write_all_eof_free(&mut conn, body.encode());
                                 }
-                                shutdown(&mut stream);
+                                conn.shutdown_both();
                                 return;
                             }
                         }
@@ -664,7 +812,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn write_all_eof_free(stream: &mut TcpStream, bytes: Vec<u8>) -> std::io::Result<()> {
+fn write_all_eof_free(stream: &mut dyn ConnStream, bytes: Vec<u8>) -> std::io::Result<()> {
     // H27: offset advance instead of drain(..n) — drain memmoves the shrinking tail on every
     // partial write (O(remaining)); an index is O(1). Byte-for-byte identical wire semantics.
     let len = bytes.len();
@@ -683,15 +831,10 @@ fn write_all_eof_free(stream: &mut TcpStream, bytes: Vec<u8>) -> std::io::Result
     stream.flush()
 }
 
-fn shutdown(stream: &mut TcpStream) {
-    stream.shutdown(std::net::Shutdown::Both).ok();
-}
-
 /// Non-blocking liveness probe: POLLHUP/POLLERR, or a readable socket whose `MSG_PEEK` returns
 /// 0 bytes, means the peer closed. Incoming request bytes (keep-alive pipelining) are NOT a
 /// close signal, so a waiting connection never mistakes them for a disconnect.
-fn peer_closed(stream: &TcpStream) -> bool {
-    let fd = stream.as_raw_fd();
+fn peer_closed(fd: std::os::fd::RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
