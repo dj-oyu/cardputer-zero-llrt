@@ -2,14 +2,24 @@
   "targetScore": 100,
   "checks": [
     {
-      "name": "phase7-zpm-and-hono-e2e",
-      "command": "node /refs/phase7/verify_phase7.mjs",
-      "weight": 70
+      "name": "integrity-and-lock",
+      "command": "bash /refs/verify/check_integrity.sh",
+      "weight": 10
     },
     {
-      "name": "rust-unit-tests-no-regression",
-      "command": "cargo test --workspace -- --test-threads=1",
-      "weight": 30
+      "name": "phase8a-fetch-tls-e2e",
+      "command": "node /refs/phase8a/verify_phase8a.mjs",
+      "weight": 50
+    },
+    {
+      "name": "rust-workspace-tests-no-regression",
+      "command": "RUSTFLAGS=\"-D warnings\" cargo test --workspace -- --test-threads=1",
+      "weight": 25
+    },
+    {
+      "name": "phase2-http-e2e-regression",
+      "command": "bash /refs/verify/check_e2e_p2.sh",
+      "weight": 15
     }
   ]
 }
