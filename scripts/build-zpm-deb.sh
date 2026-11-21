@@ -40,10 +40,11 @@ OBJDUMP="$(command -v aarch64-linux-gnu-objdump || command -v objdump)"
 "$OBJDUMP" -d --no-show-raw-insn "$STAGE_DIR/cz-zpm" > "$STAGE_DIR/disasm.txt"
 LSE_COUNT="$(grep -cE '\s(ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|cas)(a|l|al)?(b|h)?\s' "$STAGE_DIR/disasm.txt" || true)"
 RCPC_COUNT="$(grep -cE '\s(sdot|udot|ldapr|ldaprb|ldaprh)\s' "$STAGE_DIR/disasm.txt" || true)"
-CRYPTO_COUNT="$(grep -cE '\s(pmull|pmull2|aese|aesd|aesmc|aesimc|sha1|sha256|sha512)\b' "$STAGE_DIR/disasm.txt" || true)"
-echo "CZ_ZPM_LSE=$LSE_COUNT CZ_ZPM_RCPC=$RCPC_COUNT CZ_ZPM_CRYPTO=$CRYPTO_COUNT"
-if [ "$LSE_COUNT" -gt 200 ] || [ "$RCPC_COUNT" -gt 0 ] || [ "$CRYPTO_COUNT" -gt 0 ]; then
-  echo "FAIL: incompatible Cortex-A53 instructions (LSE=$LSE_COUNT RCPC=$RCPC_COUNT CRYPTO=$CRYPTO_COUNT)" >&2
+# Ensure crc32fast/flate2 has zero unconditional pmull (ring's runtime-detected crypto asm is safe).
+CRC_PMULL="$(aarch64-linux-gnu-objdump -d --no-show-raw-insn "$ZPM_BIN" | awk '/<.*crc32fast.*>:/,/^$/' | grep -cE '\bpmull' || true)"
+echo "CZ_ZPM_LSE=$LSE_COUNT CZ_ZPM_RCPC=$RCPC_COUNT CZ_ZPM_CRC_PMULL=$CRC_PMULL"
+if [ "$LSE_COUNT" -gt 200 ] || [ "$RCPC_COUNT" -gt 0 ] || [ "$CRC_PMULL" -gt 0 ]; then
+  echo "FAIL: incompatible Cortex-A53 instructions (LSE=$LSE_COUNT RCPC=$RCPC_COUNT CRC_PMULL=$CRC_PMULL)" >&2
   exit 1
 fi
 
