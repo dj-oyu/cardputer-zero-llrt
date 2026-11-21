@@ -41,49 +41,60 @@ const JSON_SHIM: &str = r#"
     globalThis.__czOrigParse = JSON.parse;           // reviver fallback
     globalThis.__czOrigStringify = JSON.stringify;   // replacer / space fallback
 
+    // ONE shared LAZY_HANDLER for every Lazy handle in the process (mirroring ROW_HANDLER in the
+    // KV shim): instead of allocating 6 fresh JS closures per handle, traps read (id, node)
+    // straight from the handle's own hidden target tag. The empty/array extensible target keeps
+    // all Proxy invariants and `Array.isArray` stays true for array documents.
     globalThis.__czLazyMake = function (id, node) {
         const isArray = __czLazyIsArray(id, node);
         const t = isArray ? [] : {};                 // Proxy over [] keeps Array.isArray true
         Reflect.set(t, LAZY, { id: id, node: node });
-        const handler = {
-            get: function (t, k) {
-                if (typeof k !== "string") return Reflect.get(t, k);
-                const v = __czLazyGet(id, node, k);
-                if (v === globalThis.__czMiss) return Reflect.get(t, k); // prototype members
-                return v;
-            },
-            set: function (t, k, v) {
-                if (typeof k !== "string") return Reflect.set(t, k, v);
-                __czLazySet(id, node, k, v);
-                return true;
-            },
-            deleteProperty: function (t, k) {
-                if (typeof k !== "string") return Reflect.deleteProperty(t, k);
-                __czLazyDel(id, node, k);
-                return true;
-            },
-            has: function (t, k) {
-                if (typeof k !== "string") return Reflect.has(t, k);
-                if (__czLazyHas(id, node, k)) return true;
-                return Reflect.has(t, k);
-            },
-            ownKeys: function (t) {
-                const keys = __czLazyOwnKeys(id, node);
-                for (const tk of Reflect.ownKeys(t)) {
-                    let seen = false;
-                    for (const x of keys) { if (x === tk) { seen = true; break; } }
-                    if (!seen) keys.push(tk);
-                }
-                return keys;
-            },
-            getOwnPropertyDescriptor: function (t, k) {
-                if (typeof k !== "string") return Reflect.getOwnPropertyDescriptor(t, k);
-                const d = __czLazyDesc(id, node, k);
-                if (d !== undefined) return d;
-                return Reflect.getOwnPropertyDescriptor(t, k);
-            },
-        };
-        return new Proxy(t, handler);
+        return new Proxy(t, LAZY_HANDLER);
+    };
+
+    const LAZY_HANDLER = {
+        get: function (t, k) {
+            if (typeof k !== "string") return Reflect.get(t, k);
+            const tg = Reflect.get(t, LAZY);
+            const v = __czLazyGet(tg.id, tg.node, k);
+            if (v === globalThis.__czMiss) return Reflect.get(t, k); // prototype members
+            return v;
+        },
+        set: function (t, k, v) {
+            if (typeof k !== "string") return Reflect.set(t, k, v);
+            const tg = Reflect.get(t, LAZY);
+            __czLazySet(tg.id, tg.node, k, v);
+            return true;
+        },
+        deleteProperty: function (t, k) {
+            if (typeof k !== "string") return Reflect.deleteProperty(t, k);
+            const tg = Reflect.get(t, LAZY);
+            __czLazyDel(tg.id, tg.node, k);
+            return true;
+        },
+        has: function (t, k) {
+            if (typeof k !== "string") return Reflect.has(t, k);
+            const tg = Reflect.get(t, LAZY);
+            if (__czLazyHas(tg.id, tg.node, k)) return true;
+            return Reflect.has(t, k);
+        },
+        ownKeys: function (t) {
+            const tg = Reflect.get(t, LAZY);
+            const keys = __czLazyOwnKeys(tg.id, tg.node);
+            for (const tk of Reflect.ownKeys(t)) {
+                let seen = false;
+                for (const x of keys) { if (x === tk) { seen = true; break; } }
+                if (!seen) keys.push(tk);
+            }
+            return keys;
+        },
+        getOwnPropertyDescriptor: function (t, k) {
+            if (typeof k !== "string") return Reflect.getOwnPropertyDescriptor(t, k);
+            const tg = Reflect.get(t, LAZY);
+            const d = __czLazyDesc(tg.id, tg.node, k);
+            if (d !== undefined) return d;
+            return Reflect.getOwnPropertyDescriptor(t, k);
+        },
     };
 
     function coerceText(v) {
@@ -405,8 +416,10 @@ fn js_to_val<'js>(ctx: &Ctx<'js>, v: &Value<'js>, depth: usize) -> Result<Val<'s
         return Ok(Val::Float(v.get::<f64>()?));
     }
     if v.is_string() {
-        let s = CString::from_string(v.clone().into_string().expect("string view"))?;
-        return Ok(Val::Str(Cow::Owned(s.as_str().to_string())));
+        // ONE owned allocation straight out of QuickJS's string payload (no intermediate `CString`
+        // copy like the old double-marshalled path).
+        let s = v.get::<String>()?;
+        return Ok(Val::Str(Cow::Owned(s)));
     }
     let obj = match v.as_object() {
         Some(o) => o.clone(),
@@ -445,10 +458,12 @@ fn got_to_js<'js>(ctx: &Ctx<'js>, doc: &LazyDoc, got: Got<'_>, parent: u32) -> R
             cz_json::Scalar::Escaped(s) => Ok(rquickjs::String::from_str(ctx.clone(), &s)?.into_value()),
         },
         // Direct members of the ROOT container keep transparent Proxy handles so CoW write
-        // traps stay live. Grandchildren+ of untouched subtrees materialize ONCE into plain
-        // native objects built straight from the Tape — no Proxy/handler churn per read.
+        // traps stay live. Grandchildren+ materialize ONCE into plain native objects built
+        // straight from the Tape ONLY while the whole document is still pristine — that is the
+        // hot zero-clone read path. Once ANY CoW edit exists, every nested container keeps a
+        // transparent handle so deeper writes reach Rust edits instead of a detached JS copy.
         Got::Subtree(child) => {
-            if parent == 0 || !doc.subtree_is_clean(child) {
+            if parent == 0 || !doc.is_clean() || !doc.subtree_is_clean(child) {
                 return make_lazy_handle(
                     ctx,
                     doc.id.load(std::sync::atomic::Ordering::SeqCst),
@@ -732,7 +747,9 @@ unsafe fn js_string_from_bytes<'js>(ctx: &Ctx<'js>, bytes: &[u8]) -> Result<Valu
 }
 
 
-/// Serialize a KV row straight from the Rust `EntryPayload::Record` (sorted field names).
+/// Serialize a KV row straight from the Rust `EntryPayload::Record` (sorted field names) using
+/// the [`cz_hal::kv::KvStore::visit_record`] Visitor API: fields arrive as borrows, so NO
+/// `KvValue` clones and no `Vec<(String, KvValue>)` snapshot are allocated per stringify.
 fn write_kv_record(out: &mut Vec<u8>, store: &str, key: &str) {
     out.push(b'{');
     let handle = match cz_hal::kv::peek_store(store) {
@@ -742,18 +759,13 @@ fn write_kv_record(out: &mut Vec<u8>, store: &str, key: &str) {
             return;
         }
     };
-    let fields = match handle.lock().expect("kv lock").record_fields(key) {
-        Some(f) => f,
-        None => {
-            // Rows backed by scalar/missing entries stringify as an empty object (like before).
-            out.push(b'}');
-            return;
-        }
-    };
-    for (i, (name, val)) in fields.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    // Scalar/missing rows visit nothing and stringify as an empty object (like before).
+    handle.lock().expect("kv lock").visit_record(key, |name, val| {
+        if !first {
             out.push(b',');
         }
+        first = false;
         write_escaped_str(out, name);
         out.push(b':');
         match val {
@@ -763,9 +775,12 @@ fn write_kv_record(out: &mut Vec<u8>, store: &str, key: &str) {
             KvValue::Float(f) => cz_json::write_f64_json(out, *f),
             KvValue::Str(s) => write_escaped_str(out, s.as_ref()),
             // Byte payloads render as UTF-8 (lossy) strings — still valid JSON.
-            KvValue::Bytes(b) => write_escaped_str(out, &String::from_utf8_lossy(b)),
+            KvValue::Bytes(b) => {
+                let lossy = String::from_utf8_lossy(b);
+                write_escaped_str(out, lossy.as_ref());
+            }
         }
-    }
+    });
     out.push(b'}');
 }
 

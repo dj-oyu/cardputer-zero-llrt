@@ -207,6 +207,22 @@ pub enum EntryPayload {
     Record(HashMap<Box<str>, KvValue>),
 }
 
+impl EntryPayload {
+    /// Payload footprint WITHOUT the owning key (field names + value bytes for records).
+    fn value_bytes(&self) -> usize {
+        match self {
+            EntryPayload::Scalar(v) => v.size(),
+            EntryPayload::Record(map) => {
+                let mut c = 0;
+                for (k, v) in map {
+                    c += k.len() + v.size();
+                }
+                c
+            }
+        }
+    }
+}
+
 /// One stored record: a scalar value OR a structured field map, plus LRU/TTL/byte bookkeeping.
 /// `payload` replaces the previous `scalar` + `fields` pair, bounding `Entry` to <= 72 bytes
 /// on 64-bit targets (`seq` 8 + `expires_at_ms` 16 + `EntryPayload` 48).
@@ -221,15 +237,6 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn new(seq: u64, expires_at_ms: Option<u64>) -> Self {
-        Self {
-            seq,
-            expires_at_ms,
-            // A fresh entry starts as a zero-cost Null scalar until `set`/`setField` fills it.
-            payload: EntryPayload::Scalar(KvValue::Null),
-        }
-    }
-
     /// True when the record carries a structured field map (vs a bare scalar).
     pub fn is_structured(&self) -> bool {
         matches!(&self.payload, EntryPayload::Record(map) if !map.is_empty())
@@ -287,8 +294,14 @@ pub struct KvStore {
     hits: u64,
     misses: u64,
     entries: HashMap<String, Entry>,
-    /// Cached running byte total (sum of entry byte costs) for accurate accounting.
+    /// Cached running byte total (sum of entry byte costs) maintained INCREMENTALLY via per-op
+    /// deltas — mutation paths never walk the whole map again.
     bytes: u64,
+    /// How many entries currently carry a TTL (`0` => `purge_expired` is an O(1) no-op).
+    ttl_count: usize,
+    /// Conservative LOWER bound on the earliest live expiry: whenever it is still in the future
+    /// nothing can have expired, so `purge_expired` returns without any scan.
+    earliest_expiry_ms: Option<u64>,
     /// Optional persistence path; `flush()` writes here atomically.
     persist_path: Option<PathBuf>,
 }
@@ -306,6 +319,8 @@ impl KvStore {
             misses: 0,
             entries: HashMap::new(),
             bytes: 0,
+            ttl_count: 0,
+            earliest_expiry_ms: None,
             persist_path,
         }
     }
@@ -328,22 +343,65 @@ impl KvStore {
     }
 
     /// Reclaim any TTL-expired entries (does NOT count toward LRU `evictions`). Returns removed
-    /// count. Called before reads/stats/keys so expired entries vanish naturally.
+    /// count. O(1) when no entry carries a TTL or the known earliest expiry has not elapsed yet;
+    /// only a real expiry event pays for the exact rebuild of the TTL bookkeeping.
     pub fn purge_expired(&mut self) -> usize {
+        if self.ttl_count == 0 {
+            return 0;
+        }
         let now = now_epoch_ms();
+        if matches!(self.earliest_expiry_ms, Some(e) if e > now) {
+            return 0;
+        }
         let expired: Vec<String> = self
             .entries
             .iter()
             .filter(|(_, e)| e.expired_at(now))
             .map(|(k, _)| k.clone())
             .collect();
+        if expired.is_empty() {
+            // Stale lower bound: resync exactly so the next call short-circuits again.
+            self.resync_ttl_bookkeeping();
+            return 0;
+        }
         for k in &expired {
             if let Some(e) = self.entries.remove(k) {
                 self.bytes = self.bytes.saturating_sub(e.byte_cost(k.len()) as u64);
             }
         }
+        self.resync_ttl_bookkeeping();
         expired.len()
     }
+
+    /// Exact TTL count + earliest expiry over the live entries (runs only after a real purge).
+    fn resync_ttl_bookkeeping(&mut self) {
+        self.ttl_count = self.entries.values().filter(|e| e.expires_at_ms.is_some()).count();
+        self.earliest_expiry_ms = self.entries.values().flat_map(|e| e.expires_at_ms).min();
+    }
+
+    /// Track one entry's TTL transition (`count` stays exact; `earliest_expiry_ms` only ever moves
+    /// DOWNWARD, so the fast-path check above can never wrongly skip a scan).
+    #[inline]
+    fn note_ttl(&mut self, old: Option<u64>, new: Option<u64>) {
+        match (old.is_some(), new.is_some()) {
+            (false, true) => self.ttl_count += 1,
+            (true, false) => self.ttl_count = self.ttl_count.saturating_sub(1),
+            _ => {}
+        }
+        if let Some(e) = new {
+            self.earliest_expiry_ms =
+                Some(match self.earliest_expiry_ms { Some(b) if b <= e => b, _ => e });
+        }
+    }
+
+    /// Account one removed entry's TTL presence without breaking the lower-bound invariant.
+    #[inline]
+    fn forget_ttl(&mut self, e: &Entry) {
+        if e.expires_at_ms.is_some() {
+            self.ttl_count = self.ttl_count.saturating_sub(1);
+        }
+    }
+
 
     /// Evict least-recently-used entries until within both caps; counts each eviction.
     fn enforce_limits(&mut self) {
@@ -353,6 +411,7 @@ impl KvStore {
                 Some(k) => {
                     if let Some(e) = self.entries.remove(&k) {
                         self.bytes = self.bytes.saturating_sub(e.byte_cost(k.len()) as u64);
+                        self.forget_ttl(&e);
                     }
                     self.evictions += 1;
                 }
@@ -365,6 +424,7 @@ impl KvStore {
                 Some(k) => {
                     if let Some(e) = self.entries.remove(&k) {
                         self.bytes = self.bytes.saturating_sub(e.byte_cost(k.len()) as u64);
+                        self.forget_ttl(&e);
                     }
                     self.evictions += 1;
                 }
@@ -387,46 +447,68 @@ impl KvStore {
         best.map(|(_, k)| k.clone())
     }
 
-    fn replace_or_new_scalar(&mut self, key: String, value: KvValue, ttl_ms: Option<u64>) {
+    /// Insert/replace a scalar value with optional TTL. Never touches disk. An existing key is
+    /// mutated IN PLACE (no `key.to_string()` / boxed allocation) and `bytes` moves by a delta.
+    pub fn set(&mut self, key: &str, value: KvValue, ttl_sec: Option<f64>) {
+        let expiry = ttl_to_expiry_ms(ttl_sec, now_epoch_ms());
         self.purge_expired();
         self.seq += 1;
-        let now_seq = self.seq;
-        // Replace any prior entry's bytes before recomputing the new footprint.
-        if let Some(old) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(old.byte_cost(key.len()) as u64);
+        let seq = self.seq;
+        // TTL transition + byte delta are computed per branch, then applied once.
+        let old_ex;
+        let new_ex;
+        if let Some(e) = self.entries.get_mut(key) {
+            // Hot update path: the key String is already owned by the map, so nothing allocates.
+            let before = e.payload.value_bytes();
+            old_ex = e.expires_at_ms;
+            new_ex = expiry;
+            e.seq = seq;
+            e.expires_at_ms = expiry;
+            e.payload = EntryPayload::Scalar(value);
+            // Direct field update keeps `bytes` disjoint from the live `entries` borrow.
+            let after = e.payload.value_bytes();
+            if after >= before {
+                self.bytes += (after - before) as u64;
+            } else {
+                self.bytes = self.bytes.saturating_sub((before - after) as u64);
+            }
+        } else {
+            let e = Entry {
+                seq,
+                expires_at_ms: expiry,
+                payload: EntryPayload::Scalar(value),
+            };
+            self.bytes += e.byte_cost(key.len()) as u64;
+            self.entries.insert(key.to_string(), e);
+            old_ex = None;
+            new_ex = expiry;
         }
-        let e = Entry {
-            seq: now_seq,
-            expires_at_ms: ttl_ms,
-            payload: EntryPayload::Scalar(value),
-        };
-        let cost = e.byte_cost(key.len()) as u64;
-        self.bytes += cost;
-        self.entries.insert(key, e);
+        self.note_ttl(old_ex, new_ex);
         self.enforce_limits();
     }
 
-    /// Insert/replace a scalar value with optional TTL. Never touches disk.
-    pub fn set(&mut self, key: &str, value: KvValue, ttl_sec: Option<f64>) {
-        let expiry = ttl_to_expiry_ms(ttl_sec, now_epoch_ms());
-        self.replace_or_new_scalar(key.to_string(), value, expiry);
+    /// Visitor API: hands the live scalar payload (or `None`) to `f` under the store borrow, so
+    /// callers render JS values directly with ZERO `KvValue` clone. Same hit/miss + recency and
+    /// record-vs-scalar semantics as [`KvStore::get`].
+    pub fn with_value<R>(&mut self, key: &str, f: impl FnOnce(Option<&KvValue>) -> R) -> R {
+        self.purge_expired();
+        if !self.touch(key) {
+            self.misses += 1;
+            return f(None);
+        }
+        self.hits += 1;
+        // Structured records never answer `get`-style reads with their field map (like before).
+        let v = match self.entries.get(key).map(|e| &e.payload) {
+            Some(EntryPayload::Scalar(v)) => Some(v),
+            _ => None,
+        };
+        f(v)
     }
 
     /// Read a scalar value (counting hit/miss, bumping recency). Expired entries are absent.
+    /// Kept for backward compatibility: a thin clone over the zero-copy [`KvStore::with_value`].
     pub fn get(&mut self, key: &str) -> Option<KvValue> {
-        self.purge_expired();
-        if self.touch(key) {
-            self.hits += 1;
-            // Scalar payloads return their value; structured records return None via `get`
-            // (identical to the old dual-field layout, which stored no scalar for records).
-            self.entries.get(key).and_then(|e| match &e.payload {
-                EntryPayload::Scalar(v) => Some(v.clone()),
-                EntryPayload::Record(_) => None,
-            })
-        } else {
-            self.misses += 1;
-            None
-        }
+        self.with_value(key, |v| v.cloned())
     }
 
     pub fn has(&mut self, key: &str) -> bool {
@@ -446,6 +528,7 @@ impl KvStore {
         match self.entries.remove(key) {
             Some(e) => {
                 self.bytes = self.bytes.saturating_sub(e.byte_cost(key.len()) as u64);
+                self.forget_ttl(&e);
                 true
             }
             None => false,
@@ -469,65 +552,117 @@ impl KvStore {
     }
 
     /// Set one field on a structured record (creating the record if needed) with optional TTL.
+    /// Existing keys/fields mutate IN PLACE (no key `String` or `Box<str>` allocation), and the
+    /// running byte total moves by a payload delta instead of a full-map recount.
     pub fn set_field(&mut self, key: &str, field: &str, value: KvValue, ttl_sec: Option<f64>) {
         let now = now_epoch_ms();
         self.purge_expired();
         self.seq += 1;
         let seq = self.seq;
         let expiry = ttl_to_expiry_ms(ttl_sec, now);
-        let entry = self
-            .entries
-            .entry(key.to_string())
-            .or_insert_with(|| Entry::new(seq, None));
-        entry.seq = seq;
-        // Switching to a structured record drops any prior scalar payload (byte totals are
-        // recomputed below).
-        if !matches!(entry.payload, EntryPayload::Record(_)) {
-            entry.payload = EntryPayload::Record(HashMap::new());
-        }
-        if let Some(ex) = expiry {
-            entry.expires_at_ms = Some(ex);
-        }
-        if let EntryPayload::Record(map) = &mut entry.payload {
+        let old_ex;
+        let new_ex;
+        if let Some(e) = self.entries.get_mut(key) {
+            old_ex = e.expires_at_ms;
+            e.seq = seq;
+            // A supplied TTL refreshes expiry; otherwise the previous TTL (if any) is kept.
+            if let Some(ex) = expiry {
+                e.expires_at_ms = Some(ex);
+            }
+            let before = e.payload.value_bytes();
+            // Switching to a structured record drops any prior scalar payload.
+            if !matches!(e.payload, EntryPayload::Record(_)) {
+                e.payload = EntryPayload::Record(HashMap::new());
+            }
+            if let EntryPayload::Record(map) = &mut e.payload {
+                match map.get_mut(field) {
+                    // Existing field name: overwrite the value, reuse its boxed key.
+                    Some(slot) => *slot = value,
+                    None => {
+                        map.insert(field.into(), value);
+                    }
+                }
+            }
+            let after = e.payload.value_bytes();
+            if after >= before {
+                self.bytes += (after - before) as u64;
+            } else {
+                self.bytes = self.bytes.saturating_sub((before - after) as u64);
+            }
+            new_ex = e.expires_at_ms;
+        } else {
+            let mut map: HashMap<Box<str>, KvValue> = HashMap::new();
             map.insert(field.into(), value);
+            let e = Entry {
+                seq,
+                expires_at_ms: expiry,
+                payload: EntryPayload::Record(map),
+            };
+            self.bytes += e.byte_cost(key.len()) as u64;
+            self.entries.insert(key.to_string(), e);
+            old_ex = None;
+            new_ex = expiry;
         }
-        // Recompute the running byte total accurately after the in-place field mutation.
-        self.bytes = self.recount_total_bytes();
+        self.note_ttl(old_ex, new_ex);
         self.enforce_limits();
     }
 
     /// Snapshot ALL live fields of a structured record in sorted field-name order WITHOUT touching
-    /// LRU recency or hit/miss counters (used by `JSON.stringify(kv.row(...))` direct native
-    /// serialization so stringifying a row never perturbs store stats). Returns `None` for scalar
-    /// entries, missing keys and expired records.
+    /// LRU recency or hit/miss counters (kept for unit-test compatibility; built on the zero-clone
+    /// [`KvStore::visit_record`] visitor). Returns `None` for scalar entries, missing keys and
+    /// expired records.
     pub fn record_fields(&mut self, key: &str) -> Option<Vec<(String, KvValue)>> {
-        self.purge_expired();
-        let entry = self.entries.get(key)?;
-        match &entry.payload {
-            EntryPayload::Record(map) if !map.is_empty() => {
-                let mut out: Vec<(String, KvValue)> = map
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect();
-                out.sort_by(|a, b| a.0.cmp(&b.0));
-                Some(out)
-            }
-            _ => None,
+        let mut out: Vec<(String, KvValue)> = Vec::new();
+        if self.visit_record(key, |k, v| out.push((k.to_string(), v.clone()))) {
+            Some(out)
+        } else {
+            None
         }
+    }
+
+    /// Visitor API: walk a record's fields in sorted name order with `&str` / `&KvValue` borrows —
+    /// no `KvValue` clones and no `Vec<(String, KvValue>)` allocation. Never perturbs LRU recency
+    /// or hit/miss counters (used by `JSON.stringify(kv.row(...))`). Returns whether a non-empty
+    /// record was visited.
+    pub fn visit_record(&mut self, key: &str, mut f: impl FnMut(&str, &KvValue)) -> bool {
+        self.purge_expired();
+        let entry = match self.entries.get(key) {
+            Some(e) => e,
+            None => return false,
+        };
+        let map = match &entry.payload {
+            EntryPayload::Record(map) if !map.is_empty() => map,
+            _ => return false,
+        };
+        // Only borrowed field NAMEs are sorted (no value copies); names stay valid because the
+        // entry lives untouched inside `entries` for the whole walk.
+        let mut names: Vec<&str> = map.keys().map(|k| k.as_ref()).collect();
+        names.sort_unstable();
+        for name in names {
+            f(name, map.get(name).expect("visited field is present"));
+        }
+        true
     }
 
     /// Read one field from a structured record (hit/miss counted, recency bumped).
     pub fn get_field(&mut self, key: &str, field: &str) -> Option<KvValue> {
+        self.with_field(key, field, |v| v.cloned())
+    }
+
+    /// Visitor API: borrow ONE field of a structured record with zero `KvValue` clone, counting
+    /// hit/miss and bumping recency exactly like [`KvStore::get_field`].
+    pub fn with_field<R>(&mut self, key: &str, field: &str, f: impl FnOnce(Option<&KvValue>) -> R) -> R {
         self.purge_expired();
         if !self.touch(key) {
             self.misses += 1;
-            return None;
+            return f(None);
         }
         self.hits += 1;
-        self.entries.get(key).and_then(|e| match &e.payload {
-            EntryPayload::Record(map) => map.get(field).cloned(),
+        let v = self.entries.get(key).and_then(|e| match &e.payload {
+            EntryPayload::Record(map) => map.get(field),
             EntryPayload::Scalar(_) => None,
-        })
+        });
+        f(v)
     }
 
     /// Remove one field from a record. Returns whether it existed.
@@ -538,46 +673,81 @@ impl KvStore {
         }
         let removed = match self.entries.get_mut(key) {
             Some(e) => match &mut e.payload {
-                EntryPayload::Record(map) => map.remove(field).is_some(),
+                // Targeted delta: only the vanished field's footprint leaves the running total.
+                EntryPayload::Record(map) => match map.remove(field) {
+                    Some(v) => {
+                        self.bytes = self.bytes.saturating_sub((field.len() + v.size()) as u64);
+                        true
+                    }
+                    None => false,
+                },
                 EntryPayload::Scalar(_) => false,
             },
             None => false,
         };
-        // Recompute running bytes since the field's footprint vanished.
-        self.bytes = self.recount_total_bytes();
         removed
     }
 
     /// Increment a numeric field, treating missing/non-numeric as `0`. Returns the new value.
+    /// Existing keys/fields mutate IN PLACE; bytes move by a delta (no full-map recount).
     pub fn incr(&mut self, key: &str, field: &str, delta: f64, ttl_sec: Option<f64>) -> f64 {
         let now = now_epoch_ms();
         self.purge_expired();
         self.seq += 1;
         let seq = self.seq;
         let expiry = ttl_to_expiry_ms(ttl_sec, now);
-        let entry = self
-            .entries
-            .entry(key.to_string())
-            .or_insert_with(|| Entry::new(seq, None));
-        entry.seq = seq;
-        if let Some(ex) = expiry {
-            entry.expires_at_ms = Some(ex);
-        }
-        // `incr` always targets a structured field, so the entry becomes (or stays) a Record.
-        if !matches!(entry.payload, EntryPayload::Record(_)) {
-            entry.payload = EntryPayload::Record(HashMap::new());
-        }
-        let cur = match &entry.payload {
-            EntryPayload::Record(map) => map.get(field).and_then(|v| v.as_f64()),
-            EntryPayload::Scalar(_) => None,
-        }
-        .unwrap_or(0.0);
         let step = if delta.is_finite() { delta } else { 1.0 };
-        let next = cur + step;
-        if let EntryPayload::Record(map) = &mut entry.payload {
-            map.insert(field.into(), KvValue::from_f64(next));
+        let old_ex;
+        let new_ex;
+        let next;
+        if let Some(e) = self.entries.get_mut(key) {
+            old_ex = e.expires_at_ms;
+            e.seq = seq;
+            if let Some(ex) = expiry {
+                e.expires_at_ms = Some(ex);
+            }
+            // `incr` always targets a structured field, so the entry becomes (or stays) a Record.
+            if !matches!(e.payload, EntryPayload::Record(_)) {
+                e.payload = EntryPayload::Record(HashMap::new());
+            }
+            let before = e.payload.value_bytes();
+            let cur = match &e.payload {
+                EntryPayload::Record(map) => map.get(field).and_then(|v| v.as_f64()),
+                EntryPayload::Scalar(_) => None,
+            }
+            .unwrap_or(0.0);
+            next = cur + step;
+            let nv = KvValue::from_f64(next);
+            if let EntryPayload::Record(map) = &mut e.payload {
+                match map.get_mut(field) {
+                    Some(slot) => *slot = nv,
+                    None => {
+                        map.insert(field.into(), nv);
+                    }
+                }
+            }
+            let after = e.payload.value_bytes();
+            if after >= before {
+                self.bytes += (after - before) as u64;
+            } else {
+                self.bytes = self.bytes.saturating_sub((before - after) as u64);
+            }
+            new_ex = e.expires_at_ms;
+        } else {
+            let mut map: HashMap<Box<str>, KvValue> = HashMap::new();
+            map.insert(field.into(), KvValue::from_f64(step));
+            let e = Entry {
+                seq,
+                expires_at_ms: expiry,
+                payload: EntryPayload::Record(map),
+            };
+            self.bytes += e.byte_cost(key.len()) as u64;
+            self.entries.insert(key.to_string(), e);
+            old_ex = None;
+            new_ex = expiry;
+            next = step;
         }
-        self.bytes = self.recount_total_bytes();
+        self.note_ttl(old_ex, new_ex);
         self.enforce_limits();
         next
     }
@@ -595,7 +765,8 @@ impl KvStore {
         Stats {
             name: self.name.clone(),
             entries: self.entries.len() as u64,
-            bytes: self.recount_total_bytes(),
+            // The running total is maintained incrementally now — no O(N) walk in `stats()`.
+            bytes: self.bytes,
             max_bytes: self.max_bytes,
             max_entries: self.max_entries,
             evictions: self.evictions,
@@ -608,6 +779,8 @@ impl KvStore {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
+        self.ttl_count = 0;
+        self.earliest_expiry_ms = None;
     }
 
     // -- Persistence -----------------------------------------------------------
@@ -709,6 +882,7 @@ impl KvStore {
         // Resume monotonic seq above any loaded value so ordering stays sensible.
         self.seq = self.seq.max(saved_seq);
         self.bytes = self.recount_total_bytes();
+        self.resync_ttl_bookkeeping();
         Ok(())
     }
 
@@ -1193,6 +1367,138 @@ mod tests {
         assert!(s.del_field("u", "views"));
         assert!(s.has("u"));
         assert_eq!(s.get_field("u", "views"), None);
+    }
+
+    #[test]
+    fn visitor_api_reads_payloads_with_identical_hit_miss_accounting() {
+        let mut s = fresh_store("visitor_read", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        s.set("sc", KvValue::Int(21), None);
+        // with_value hands the BORROWED scalar to the callback (no clone needed to read it).
+        let doubled = s.with_value("sc", |v| v.and_then(|x| x.as_f64()).map(|n| n * 2.0));
+        assert_eq!(doubled, Some(42.0));
+        assert_eq!(s.with_value("absent", |v| v.is_some()), false);
+        // Structured records answer scalar reads with None through the visitor too.
+        s.set_field("rec", "n", KvValue::Int(3), None);
+        assert_eq!(s.with_value("rec", |v| v.is_some()), false);
+        assert_eq!(s.with_field("rec", "n", |v| v.cloned()), Some(KvValue::Int(3)));
+        assert_eq!(s.with_field("rec", "ghost", |v| v.is_some()), false);
+        assert_eq!(s.with_field("sc", "n", |v| v.is_some()), false);
+        let st = s.stats();
+        // Legacy semantics kept intact: touching a LIVE key counts as a hit even when the asked
+        // member is absent (records answer scalar reads with None, missing fields read undefined).
+        // hits: sc, rec-as-scalar, rec.n, rec.ghost, sc-as-record = 5; misses: absent key = 1.
+        assert_eq!(st.hits, 5, "hits {:?}", st);
+        assert_eq!(st.misses, 1, "misses {:?}", st);
+    }
+
+    #[test]
+    fn visit_record_walks_sorted_field_names_without_perturbing_stats() {
+        let mut s = fresh_store("visitor_record", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        s.set_field("u", "zeta", KvValue::Int(1), None);
+        s.set_field("u", "alpha", KvValue::Str("a".into()), None);
+        s.set_field("u", "mid", KvValue::Bool(true), None);
+        let before = s.stats();
+        let mut seen: Vec<String> = Vec::new();
+        let found = s.visit_record("u", |k, v| {
+            seen.push(k.to_string());
+            // Borrowed values are readable in place (sorted name order, no snapshot Vec).
+            assert!(!k.is_empty());
+            let _ = v.size();
+        });
+        assert!(found);
+        assert_eq!(seen, vec!["alpha", "mid", "zeta"]);
+        let after = s.stats();
+        // Row stringify must not bump recency or hit/miss counters.
+        assert_eq!(after.hits, before.hits);
+        assert_eq!(after.misses, before.misses);
+        // Scalar entries and missing keys visit nothing.
+        s.set("scalar", KvValue::Int(9), None);
+        assert!(!s.visit_record("scalar", |_k, _v| unreachable!("scalar has no fields")));
+        assert!(!s.visit_record("missing", |_k, _v| unreachable!("missing key visits nothing")));
+        // Backward-compatible record_fields keeps the same sorted shape.
+        assert_eq!(
+            s.record_fields("u"),
+            Some(vec![
+                ("alpha".to_string(), KvValue::Str("a".into())),
+                ("mid".to_string(), KvValue::Bool(true)),
+                ("zeta".to_string(), KvValue::Int(1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn incremental_byte_accounting_tracks_every_mutation_without_recounting() {
+        let mut s = fresh_store("acct_delta", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        // Repeated updates to the SAME key/field: running total must stay exactly right while
+        // mutation paths never walk the whole map (`recount_total_bytes` is the oracle here).
+        for i in 0..200 {
+            s.set("counter", KvValue::Int(i), None);
+            s.set_field("rec", "n", KvValue::Str(format!("row-{}", i).into()), None);
+            s.incr("rec", "hits", 1.0, None);
+            assert_eq!(s.bytes, s.recount_total_bytes(), "diverged at step {i}");
+        }
+        assert_eq!(s.get("counter"), Some(KvValue::Int(199)));
+        assert_eq!(s.get_field("rec", "n"), Some(KvValue::Str("row-199".into())));
+        assert_eq!(s.get_field("rec", "hits"), Some(KvValue::Int(200)));
+        assert_eq!(s.stats().bytes, s.recount_total_bytes());
+        // Field removal and whole-entry delete shed exactly their footprint.
+        let field_cost = "n".len() + "row-199".len();
+        let before = s.bytes;
+        assert!(s.del_field("rec", "n"));
+        assert_eq!(s.bytes, before - field_cost as u64);
+        assert_eq!(s.bytes, s.recount_total_bytes());
+        assert!(s.del("counter"));
+        assert_eq!(s.bytes, s.recount_total_bytes());
+        // Record -> scalar conversion drops the field map from the total.
+        let mut t = fresh_store("acct_convert", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        t.set_field("x", "aaaa", KvValue::Bytes(vec![1u8, 2, 3].into()), None);
+        t.set("x", KvValue::Str("zz".into()), None);
+        assert_eq!(t.bytes, ("x".len() + 2) as u64);
+        assert_eq!(t.bytes, t.recount_total_bytes());
+    }
+
+    #[test]
+    fn ttl_purge_short_circuits_when_nothing_has_expired() {
+        let mut s = fresh_store("ttl_fast", DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES);
+        // No TTL entries at all: purge is an O(1) no-op and bookkeeping stays pristine.
+        for i in 0..50 {
+            s.set(&format!("plain{}", i), KvValue::Int(i as i64), None);
+        }
+        assert_eq!(s.ttl_count, 0);
+        assert_eq!(s.earliest_expiry_ms, None);
+        assert_eq!(s.purge_expired(), 0);
+        // A far-future TTL sets the earliest-expiry lower bound; purge still skips the scan.
+        s.set("far", KvValue::Int(1), Some(3600.0));
+        assert_eq!(s.ttl_count, 1);
+        assert!(s.earliest_expiry_ms.is_some());
+        assert_eq!(s.purge_expired(), 0);
+        assert_eq!(s.get("far"), Some(KvValue::Int(1)));
+        // Refreshing a TTL keeps the count stable (no double counting).
+        s.set("far", KvValue::Int(2), Some(3600.0));
+        assert_eq!(s.ttl_count, 1);
+        s.set_field("rec", "f", KvValue::Int(1), Some(3600.0));
+        assert_eq!(s.ttl_count, 2);
+        // Clearing the TTL on an update decrements exactly once.
+        s.set("far", KvValue::Int(3), None);
+        assert_eq!(s.ttl_count, 1);
+        assert_eq!(s.get("far"), Some(KvValue::Int(3)));
+        // A short TTL really expires and the resync leaves exact bookkeeping behind.
+        s.set("eph", KvValue::Str("bye".into()), Some(0.05));
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(s.ttl_count, 2); // `rec.f` + `eph` carry TTLs before the purge
+        assert_eq!(s.purge_expired(), 1, "only the elapsed entry is reclaimed");
+        assert!(!s.entries.contains_key("eph"));
+        // The post-purge resync is exact: count + earliest expiry match the live entries.
+        assert_eq!(s.ttl_count, s.entries.values().filter(|e| e.expires_at_ms.is_some()).count());
+        assert_eq!(
+            s.earliest_expiry_ms,
+            s.entries.values().flat_map(|e| e.expires_at_ms).min()
+        );
+        assert!(!s.entries.contains_key("eph"));
+        // Deleting a TTL'd entry frees its count too.
+        assert!(s.del("rec"));
+        assert_eq!(s.ttl_count, 0);
+        assert_eq!(s.purge_expired(), 0);
     }
 
     #[test]

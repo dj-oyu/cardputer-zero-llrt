@@ -45,7 +45,8 @@ fn value_to_kv(value: &Value<'_>) -> KvValue {
     }
 }
 
-/// Render a native [`KvValue`] back into a JS value (Bytes become a fresh copied Uint8Array).
+/// Render a borrowed native [`KvValue`] back into a JS value (Bytes become a fresh copied
+/// Uint8Array). Takes `&KvValue` so Visitor-API callers hand payloads over without cloning.
 fn kv_to_js<'js>(ctx: &Ctx<'js>, v: &KvValue) -> Result<Value<'js>> {
     match v {
         KvValue::Null => Ok(Value::new_null(ctx.clone())),
@@ -57,14 +58,6 @@ fn kv_to_js<'js>(ctx: &Ctx<'js>, v: &KvValue) -> Result<Value<'js>> {
             let ta = TypedArray::<u8>::new_copy(ctx.clone(), b)?;
             Ok(ta.into_value())
         }
-    }
-}
-
-/// `Option<KvValue>` -> JS value; `None` yields `undefined` (missing keys/fields read as absent).
-fn opt_kv_to_js<'js>(ctx: &Ctx<'js>, v: Option<KvValue>) -> Result<Value<'js>> {
-    match v {
-        Some(inner) => kv_to_js(ctx, &inner),
-        None => Ok(Value::new_undefined(ctx.clone())),
     }
 }
 
@@ -190,9 +183,14 @@ fn store_methods<'js>(ctx: &Ctx<'js>, store: Arc<Mutex<KvStore>>) -> Result<Obje
     })?;
 
     let s = store.clone();
+    // Visitor API: render the JS value straight from the borrowed native payload — zero `KvValue`
+    // clone on every read (`st.get` clones for backward compatibility only).
     let get_fn = Function::new(ctx.clone(), move |ctx: Ctx<'js>, key: String| -> Result<Value<'js>> {
         let mut st = s.lock().expect("kv store lock");
-        opt_kv_to_js(&ctx, st.get(&key))
+        st.with_value(&key, |v| match v {
+            Some(inner) => kv_to_js(&ctx, inner),
+            None => Ok(Value::new_undefined(ctx.clone())),
+        })
     })?;
 
     let s = store.clone();
@@ -228,10 +226,16 @@ fn store_methods<'js>(ctx: &Ctx<'js>, store: Arc<Mutex<KvStore>>) -> Result<Obje
     )?;
 
     let s = store.clone();
-    let get_field_fn = Function::new(ctx.clone(), move |ctx: Ctx<'js>, key: String, field: String| -> Result<Value<'js>> {
-        let mut st = s.lock().expect("kv store lock");
-        opt_kv_to_js(&ctx, st.get_field(&key, &field))
-    })?;
+    let get_field_fn = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, key: String, field: String| -> Result<Value<'js>> {
+            let mut st = s.lock().expect("kv store lock");
+            st.with_field(&key, &field, |v| match v {
+                Some(inner) => kv_to_js(&ctx, inner),
+                None => Ok(Value::new_undefined(ctx.clone())),
+            })
+        },
+    )?;
 
     let s = store.clone();
     let incr_fn = Function::new(
@@ -273,7 +277,8 @@ fn store_methods<'js>(ctx: &Ctx<'js>, store: Arc<Mutex<KvStore>>) -> Result<Obje
     let s = store.clone();
     let has_field_fn = Function::new(ctx.clone(), move |key: String, field: String| -> bool {
         let mut st = s.lock().expect("kv store lock");
-        st.get_field(&key, &field).is_some()
+        // Presence probe over the Visitor API never clones the payload.
+        st.with_field(&key, &field, |v| v.is_some())
     })?;
 
     obj.set("set", set_fn)?;

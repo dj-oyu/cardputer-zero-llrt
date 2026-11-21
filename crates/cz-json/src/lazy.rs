@@ -75,24 +75,71 @@ impl LazyDoc {
             .any(|(_, edits)| !edits.is_empty())
     }
 
-    fn edits_of(&self, node: u32) -> Option<Edit> {
+    /// Run `f` over this node's edit list UNDER the lock (`None` when no edit touches `node`).
+    #[inline]
+    fn with_edits<R>(&self, node: u32, f: impl FnOnce(&Edit) -> R) -> Option<R> {
         let guard = self.edits.lock().expect("edits lock");
-        guard.get(&node).cloned()
+        guard.get(&node).map(f)
     }
 
-    /// Latest edit for `key` on `node` (later pushes win over earlier ones).
+    /// Latest override for `key` on `node`: clones ONLY the one needed payload while the guard is
+    /// held (never a whole-`Vec` deep copy). `None` = untouched, `Some(None)` = tombstone.
+    #[inline]
     fn latest(&self, node: u32, key: &str) -> Option<Option<Val<'static>>> {
-        let list = self.edits_of(node)?;
-        list.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        self.with_edits(node, |edit| latest_in_edit(edit, key).map(|v| v.clone())).flatten()
+    }
+
+    /// Presence-only probe that clones NOTHING: `Some(true)` = live CoW write, `Some(false)` =
+    /// tombstone delete, `None` = no edit for this key.
+    #[inline]
+    fn edit_flag(&self, node: u32, key: &str) -> Option<bool> {
+        self.with_edits(node, |edit| latest_in_edit(edit, key).map(|v| v.is_some())).flatten()
+    }
+
+    /// Last-wins member view for a dirty OBJECT node built with ONE lock acquisition: superseded
+    /// writes are replaced in place (their payloads drop right away), so only surviving values are
+    /// copied — exactly what serialization emits, never unrelated edits.
+    fn member_view(&self, node: u32) -> Option<Vec<(String, Option<Val<'static>>)>> {
+        self.with_edits(node, |edit| {
+            let mut view: Vec<(String, Option<Val<'static>>)> = Vec::new();
+            for (k, v) in edit.iter() {
+                match view.iter_mut().find(|(ek, _)| ek == k) {
+                    Some(slot) => slot.1 = v.clone(),
+                    None => view.push((k.clone(), v.clone())),
+                }
+            }
+            view
+        })
+    }
+
+    /// Index-keyed last-wins view for a dirty ARRAY node: numeric compares replace the old
+    /// `i.to_string()` lookups inside the tape-element loop.
+    fn index_view(&self, node: u32) -> Option<Vec<(usize, Option<Val<'static>>)>> {
+        self.with_edits(node, |edit| {
+            let mut view: Vec<(usize, Option<Val<'static>>)> = Vec::new();
+            for (k, v) in edit.iter() {
+                if let Some(i) = parse_index(k) {
+                    match view.iter_mut().find(|(ei, _)| *ei == i) {
+                        Some(slot) => slot.1 = v.clone(),
+                        None => view.push((i, v.clone())),
+                    }
+                }
+            }
+            view
+        })
     }
 
     /// Read a member / element: overrides first, then the untouched tape.
     pub fn get(&self, node: u32, key: &str) -> Got<'_> {
-        if let Some(edit) = self.latest(node, key) {
-            return match edit {
-                Some(v) => Got::Owned(v),
-                None => Got::Missing, // deleted field reads as absent
-            };
+        // Clean fast-path: an untouched document holds ZERO edits, so skip the `edits` mutex and
+        // every edit lookup entirely and resolve straight from the immutable tape.
+        if !self.is_clean() {
+            if let Some(edit) = self.latest(node, key) {
+                return match edit {
+                    Some(v) => Got::Owned(v),
+                    None => Got::Missing, // deleted field reads as absent
+                };
+            }
         }
         let n = self.tape.node(node);
         if n.kind == KIND_OBJECT {
@@ -125,10 +172,12 @@ impl LazyDoc {
         }
     }
 
-    /// Presence check used by the JS `in` trap.
+    /// Presence check used by the JS `in` trap (zero-lock clean fast path, zero payload clone).
     pub fn has(&self, node: u32, key: &str) -> bool {
-        if let Some(edit) = self.latest(node, key) {
-            return edit.is_some();
+        if !self.is_clean() {
+            if let Some(live) = self.edit_flag(node, key) {
+                return live;
+            }
         }
         let n = self.tape.node(node);
         if n.kind == KIND_OBJECT {
@@ -147,36 +196,45 @@ impl LazyDoc {
     /// elements come out in ascending numeric order like a real JS array).
     pub fn own_keys(&self, node: u32) -> Vec<String> {
         let n = self.tape.node(node);
+        // Clean documents never lock the mutex; a dirty node locks exactly ONCE for its view.
+        let view = if self.is_clean() { None } else { self.member_view(node) };
+        let arr_view = if self.is_clean() { None } else { self.index_view(node) };
         let mut out = Vec::with_capacity(n.child_count());
         if n.kind == KIND_OBJECT {
             for c in self.tape.children(node) {
                 if let Some(Ok(k)) = self.tape.key_bytes(c) {
-                    let present = match self.latest(node, k.as_ref()) {
-                        Some(None) => false, // deleted
-                        _ => true,
-                    };
-                    if present {
+                    // Tombstone (Some(None)) hides a member; untouched/overridden both stay.
+                    if !matches!(view_lookup(view.as_deref(), k.as_ref()), Some(None)) {
                         out.push(k.into_owned());
                     }
                 }
             }
-            self.append_added_keys(node, &mut out, false);
+            if let Some(list) = &view {
+                // Additions append after document order; the last-wins view is already deduped,
+                // and deleted-then-readded keys came through the tape scan above.
+                for (k, v) in list.iter() {
+                    if v.is_some() && self.tape.lookup(node, k).is_none() {
+                        out.push(k.clone());
+                    }
+                }
+            }
         } else if n.kind == KIND_ARRAY {
             let count = n.child_count();
-            let mut live: Vec<usize> = (0..count)
-                .filter(|i| match self.latest(node, &i.to_string()) {
-                    Some(None) => false,
-                    _ => true,
-                })
-                .collect();
-            // Additions beyond the tape length join in ascending numeric order.
-            if let Some(list) = self.edits_of(node) {
-                for (k, v) in list.iter() {
-                    if v.is_some() {
-                        if let Some(i) = parse_index(k) {
-                            if i >= count && !live.contains(&i) {
-                                live.push(i);
-                            }
+            let mut live: Vec<usize> = Vec::with_capacity(count);
+            match &arr_view {
+                // Untouched array: every index survives without any edit probing.
+                None => live.extend(0..count),
+                Some(list) => {
+                    let removed = tombstone_indices(list);
+                    for i in 0..count {
+                        if !removed.contains(&i) {
+                            live.push(i);
+                        }
+                    }
+                    // Additions beyond the tape length join in ascending numeric order.
+                    for (i, v) in list.iter() {
+                        if v.is_some() && *i >= count && !live.contains(i) {
+                            live.push(*i);
                         }
                     }
                 }
@@ -187,17 +245,6 @@ impl LazyDoc {
             }
         }
         out
-    }
-
-    fn append_added_keys(&self, node: u32, out: &mut Vec<String>, _object: bool) {
-        if let Some(list) = self.edits_of(node) {
-            for (k, v) in list.iter() {
-                if v.is_some() && !out.iter().any(|e| e == k) && !self.tape.lookup(node, k).is_some() {
-                    out.push(k.clone());
-                }
-                // Deleted-then-readded keys already appear via the tape scan above.
-            }
-        }
     }
 
     /// Copy-on-Write member write (never touches the immutable tape).
@@ -224,58 +271,68 @@ impl LazyDoc {
     /// copied straight from the raw buffer, edited ones merge tape + CoW overrides.
     pub fn serialize(&self, node: u32, out: &mut Vec<u8>) {
         if self.subtree_is_clean(node) {
-            // Zero-reparse passthrough: emit the exact original bytes for containers.
+            // Zero-reparse passthrough: containers emit their exact original byte span.
             let n = self.tape.node(node);
             if n.is_container() {
                 out.extend_from_slice(self.raw_slice(node));
                 return;
             }
-            // Scalars: wrap string bodies in quotes, copy other tokens verbatim.
-            if n.kind == crate::tape::KIND_STRING {
-                out.push(b'"');
-            }
-            out.extend_from_slice(self.raw_slice(node));
-            if n.kind == crate::tape::KIND_STRING {
-                out.push(b'"');
-            }
+            // Scalars go through the shared token writer: null/bool literals carry NO source
+            // span in the tape, so a blind raw copy used to emit nothing for them.
+            write_scalar_token(&self.tape, out, node);
             return;
         }
         let n = self.tape.node(node);
+        // ONE lock acquisition for this dirty node: the last-wins view is built while the guard is
+        // held, then released BEFORE any recursion so child `subtree_is_clean` never re-locks the
+        // same mutex (std::sync::Mutex is not reentrant).
+        let view = self.member_view(node);
         match n.kind {
             KIND_OBJECT => {
                 out.push(b'{');
                 let mut first = true;
                 for c in self.tape.children(node) {
                     if let Some(Ok(k)) = self.tape.key_bytes(c) {
-                        if matches!(self.latest(node, k.as_ref()), Some(None)) {
-                            continue; // deleted member vanishes
-                        }
-                        if !first {
-                            out.push(b',');
-                        }
-                        first = false;
-                        write_key(out, &self.tape, c, k.as_ref());
-                        out.push(b':');
-                        match self.latest(node, k.as_ref()) {
-                            Some(Some(v)) => serialize_val(&v, out),
-                            _ => self.serialize(c, out),
+                        // SINGLE view lookup per member instead of two `latest()` calls:
+                        // tombstone hides it, an override emits the CoW payload, else recurse.
+                        match view_lookup(view.as_deref(), k.as_ref()) {
+                            Some(None) => continue, // deleted member vanishes
+                            Some(Some(val)) => {
+                                if !first {
+                                    out.push(b',');
+                                }
+                                first = false;
+                                write_key(out, &self.tape, c, k.as_ref());
+                                out.push(b':');
+                                serialize_val(val, out);
+                            }
+                            None => {
+                                if !first {
+                                    out.push(b',');
+                                }
+                                first = false;
+                                write_key(out, &self.tape, c, k.as_ref());
+                                out.push(b':');
+                                self.serialize(c, out);
+                            }
                         }
                     }
                 }
-                // Newly added members append after the original document order.
-                if let Some(list) = self.edits_of(node) {
-                    let keys = self.own_keys(node);
+                // Newly added members append after the original document order (last write wins,
+                // so a re-set key is emitted exactly once).
+                if let Some(list) = &view {
                     for (k, v) in list.iter() {
-                        if v.is_some() && self.tape.lookup(node, k).is_none() {
-                            if !first {
-                                out.push(b',');
+                        if let Some(val) = v {
+                            if self.tape.lookup(node, k).is_none() {
+                                if !first {
+                                    out.push(b',');
+                                }
+                                first = false;
+                                crate::simd::write_escaped_str(out, k);
+                                out.push(b':');
+                                serialize_val(val, out);
                             }
-                            first = false;
-                            crate::simd::write_escaped_str(out, k);
-                            out.push(b':');
-                            serialize_val(v.as_ref().expect("added member has a value"), out);
                         }
-                        let _ = &keys;
                     }
                 }
                 out.push(b'}');
@@ -283,14 +340,7 @@ impl LazyDoc {
             KIND_ARRAY => {
                 out.push(b'[');
                 let count = n.child_count();
-                let mut edits: Vec<(usize, Option<Val<'static>>)> = Vec::new();
-                if let Some(list) = self.edits_of(node) {
-                    for (k, v) in list.iter() {
-                        if let Some(i) = parse_index(k) {
-                            edits.push((i, v.clone()));
-                        }
-                    }
-                }
+                let edits = self.index_view(node).unwrap_or_default();
                 // Effective length includes appended indices beyond the tape count.
                 let mut len = count;
                 for (i, v) in edits.iter() {
@@ -298,19 +348,21 @@ impl LazyDoc {
                         len = i + 1;
                     }
                 }
-                for pos in 0..len {                    if pos > 0 {
+                for pos in 0..len {
+                    if pos > 0 {
                         out.push(b',');
                     }
                     let mut done = false;
                     if pos < count {
                         let child = self.tape.child_at(node, pos).expect("tape element");
-                        match self.latest(node, &pos.to_string()) {
+                        // Numeric index compare: no `pos.to_string()` allocation inside the loop.
+                        match idx_lookup(&edits, pos) {
                             Some(None) => {
                                 out.extend_from_slice(b"null"); // holes serialize as null
                                 done = true;
                             }
                             Some(Some(v)) => {
-                                serialize_val(&v, out);
+                                serialize_val(v, out);
                                 done = true;
                             }
                             None => {}
@@ -320,14 +372,9 @@ impl LazyDoc {
                         }
                     } else {
                         // Appended element: latest edit wins.
-                        let latest = edits
-                            .iter()
-                            .rev()
-                            .find(|(i, _)| *i == pos)
-                            .and_then(|(_, v)| v.clone());
-                        match latest {
-                            Some(v) => serialize_val(&v, out),
-                            None => out.extend_from_slice(b"null"),
+                        match idx_lookup(&edits, pos) {
+                            Some(Some(v)) => serialize_val(v, out),
+                            _ => out.extend_from_slice(b"null"),
                         }
                     }
                 }
@@ -335,39 +382,84 @@ impl LazyDoc {
             }
             _ => {
                 // Scalars inside an edited parent come through `get`/overrides, never here.
-                let n2 = self.tape.node(node);
-                if n2.kind == crate::tape::KIND_STRING {
-                    out.push(b'"');
-                }
-                out.extend_from_slice(self.raw_slice(node));
-                if n2.kind == crate::tape::KIND_STRING {
-                    out.push(b'"');
-                }
+                write_scalar_token(&self.tape, out, node);
             }
         }
     }
 }
 
+/// Emit one scalar node's JSON text. String bodies copy their original (already escaped) source
+/// span between quotes; number tokens copy verbatim; null / true / false have zero-length tape
+/// spans, so they render straight from the tagged scalar value.
+fn write_scalar_token(tape: &TapeDoc, out: &mut Vec<u8>, node: u32) {
+    let n = tape.node(node);
+    if n.kind == crate::tape::KIND_STRING {
+        out.push(b'"');
+        out.extend_from_slice(tape.raw_literal(node));
+        out.push(b'"');
+        return;
+    }
+    let raw = tape.raw_literal(node);
+    if !raw.is_empty() {
+        out.extend_from_slice(raw);
+        return;
+    }
+    match tape.scalar(node) {
+        Ok(Scalar::Null) => out.extend_from_slice(b"null"),
+        Ok(Scalar::Bool(true)) => out.extend_from_slice(b"true"),
+        Ok(Scalar::Bool(false)) => out.extend_from_slice(b"false"),
+        Ok(Scalar::Int(i)) => crate::simd::write_i64(out, i),
+        Ok(Scalar::Float(f)) => crate::simd::write_f64_json(out, f),
+        Ok(Scalar::Clean(s)) => crate::simd::write_escaped_str(out, s),
+        Ok(Scalar::Escaped(s)) => crate::simd::write_escaped_str(out, s.as_ref()),
+        Err(_) => out.extend_from_slice(b"null"),
+    }
+}
+
 fn write_key(out: &mut Vec<u8>, tape: &TapeDoc, child: u32, key: &str) {
-    out.push(b'"');
-    // Unescaped keys can be copied straight from the source bytes; escaped ones re-escape.
+    // Unescaped keys copy straight from the source bytes (the hot path allocates nothing); escaped
+    // keys go through `write_escaped_str`, which emits its own surrounding quotes — no temporary
+    // `Vec<u8>` re-escaping buffer like before.
     let flags = tape.node(child).flags;
     if (flags & crate::tape::FLAG_KEY_ESCAPE) == 0 {
         if let Some(Ok(k)) = tape.key_bytes(child) {
+            out.push(b'"');
             // Borrowed original body bytes are already JSON-escaped-clean.
-            let raw = k.as_ref().as_bytes();
-            out.extend_from_slice(raw);
-        } else {
-            crate::simd::write_escaped_str(&mut *out, key);
+            out.extend_from_slice(k.as_ref().as_bytes());
+            out.push(b'"');
             return;
         }
-    } else {
-        let mut tmp = Vec::new();
-        crate::simd::write_escaped_str(&mut tmp, key);
-        // tmp already includes the surrounding quotes; strip them since we pushed one.
-        out.extend_from_slice(&tmp[1..tmp.len() - 1]);
     }
-    out.push(b'"');
+    crate::simd::write_escaped_str(out, key);
+}
+
+/// Latest entry for `key` inside a raw edit list, read BY REFERENCE (later pushes win).
+#[inline]
+fn latest_in_edit<'a>(edit: &'a Edit, key: &str) -> Option<&'a Option<Val<'static>>> {
+    edit.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// Lookup in a deduped last-wins member view (`None` when the key is untouched by edits).
+#[inline]
+fn view_lookup<'a>(
+    view: Option<&'a [(String, Option<Val<'static>>)]>,
+    key: &str,
+) -> Option<&'a Option<Val<'static>>> {
+    view?.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// Lookup in a deduped last-wins index view with a plain numeric compare.
+#[inline]
+fn idx_lookup<'a>(
+    view: &'a [(usize, Option<Val<'static>>)],
+    i: usize,
+) -> Option<&'a Option<Val<'static>>> {
+    view.iter().rev().find(|(ei, _)| *ei == i).map(|(_, v)| v)
+}
+
+/// Array indices carrying tombstones (deleted slots) from an index view.
+fn tombstone_indices(view: &[(usize, Option<Val<'static>>)]) -> Vec<usize> {
+    view.iter().filter(|(_, v)| v.is_none()).map(|(i, _)| *i).collect()
 }
 
 /// Serialize an owned `Val` (a CoW-written value tree).
@@ -559,6 +651,82 @@ mod lazy_tests {
     }
 
     #[test]
+    fn clean_document_reads_take_the_zero_lock_tape_path_and_stay_pristine() {
+        let doc = LazyDoc::build(SMALL.as_bytes()).expect("clean build");
+        // A big batch of untouched reads never creates or touches CoW edit state.
+        for i in 0..400 {
+            assert!(doc.has(0, "meta"));
+            assert!(matches!(doc.get(0, "pad"), Got::Scalar(_)));
+            let items = doc.tape.lookup(0, "items").expect("items");
+            let _ = doc.own_keys(items);
+            let _ = doc.get(items, "0");
+            if i % 10 == 0 {
+                assert!(
+                    matches!(doc.get(0, "type"), Got::Scalar(Scalar::Clean("batch"))),
+                    "clean tape read must stay immediate"
+                );
+            }
+        }
+        // Untouched means: no edits registered, still clean, byte-exact passthrough serialize.
+        let guard = doc.edits.lock().expect("edits lock");
+        assert!(guard.is_empty(), "clean reads must never create edits");
+        drop(guard);
+        assert!(doc.is_clean());
+        let mut out = Vec::new();
+        doc.serialize(0, &mut out);
+        assert_eq!(std::str::from_utf8(&out).unwrap(), SMALL);
+    }
+
+    #[test]
+    fn repeated_cow_writes_last_win_and_added_members_serialize_exactly_once() {
+        let doc = LazyDoc::build(SMALL.as_bytes()).expect("dup build");
+        doc.set(0, "added", Val::Int(1));
+        doc.set(0, "added", Val::Str(Cow::Owned("final".into()))); // later write wins
+        doc.set(0, "count", Val::Int(2));
+        doc.set(0, "count", Val::Int(3));
+        assert_eq!(doc.own_keys(0), vec!["type", "meta", "items", "pad", "added", "count"]);
+        let mut out = Vec::new();
+        doc.serialize(0, &mut out);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert_eq!(text.matches(r#""added":"final""#).count(), 1, "{text}");
+        assert_eq!(text.matches(r#""count":3"#).count(), 1, "{text}");
+        assert!(!text.contains(r#""added":1"#), "superseded value must not leak: {text}");
+        match doc.get(0, "added") {
+            Got::Owned(Val::Str(s)) => assert_eq!(s.as_ref(), "final"),
+            other => panic!("last write must win, got {other:?}"),
+        }
+        // Delete-then-readd keeps the ORIGINAL document position (tape scan) with the new value.
+        doc.del(0, "pad");
+        doc.set(0, "pad", Val::Bool(false));
+        // The readded key keeps its ORIGINAL tape position; other live members stay put.
+        assert_eq!(doc.own_keys(0), vec!["type", "meta", "items", "pad", "added", "count"]);
+        let mut again = Vec::new();
+        doc.serialize(0, &mut again);
+        let text2 = std::str::from_utf8(&again).unwrap();
+        assert_eq!(text2.matches(r#""pad":false"#).count(), 1, "{text2}");
+    }
+
+    #[test]
+    fn array_edits_resolve_through_numeric_indexes_not_string_keys() {
+        let src = r#"[10,20,30]"#;
+        let doc = LazyDoc::build(src.as_bytes()).expect("numeric build");
+        doc.set(0, "0", Val::Int(11)); // overwrite existing slot
+        doc.del(0, "0");
+        doc.set(0, "0", Val::Int(12)); // re-set wins over the tombstone
+        doc.set(0, "4", Val::Int(44));
+        doc.del(0, "3"); // tombstone beyond the tape length never extends serialization
+        let mut out = Vec::new();
+        doc.serialize(0, &mut out);
+        assert_eq!(std::str::from_utf8(&out).unwrap(), r#"[12,20,30,null,44]"#);
+        assert_eq!(doc.own_keys(0), vec!["0", "1", "2", "4"]);
+        // Non-index keys are ignored by the numeric view entirely.
+        doc.set(0, "not-an-index", Val::Int(7));
+        let mut again = Vec::new();
+        doc.serialize(0, &mut again);
+        assert_eq!(std::str::from_utf8(&again).unwrap(), r#"[12,20,30,null,44]"#);
+    }
+
+    #[test]
     fn registry_roundtrips_ids_and_keeps_documents_shared() {
         let before = registered_count();
         let d1 = LazyDoc::build(SMALL.as_bytes()).expect("registry build");
@@ -571,3 +739,4 @@ mod lazy_tests {
         assert!(got.node_count() > 0);
     }
 }
+
