@@ -138,3 +138,19 @@ regBase = "http://" + fs.readFileSync("/tmp/regport.txt", "utf8");
 
 Equivalent alternative: replace `runSync` with an async `spawn` wrapper exactly like phase7b's
 `runAsync` (already proven shape in this container).
+
+### 5.3 Kernel-layer root-cause proof (read-only /proc/net/tcp sampling during freeze)
+
+Environment fingerprint: Node v22.23.5 at `/usr/local/node/bin/node` (sha256 prefix `2f822d544601dfff`);
+verify_metrics runner uses the same binary (behavior-identical stalls observed in-harness).
+Direct socket-state sampling while a verifier-shaped parent sat blocked in `spawnSync` against an
+in-process server showed:
+
+- LISTEN socket `st=0A` present; ESTABLISHED pair `st=01` formed fine at TCP level.
+- **Server-side Recv-Q stayed `0x000000AB` = 171 bytes constant for ≥5 s**: the full HTTP GET was
+  already in the kernel receive queue, unread — zero JS dispatch (timer log line fired only AFTER
+  `spawnSync` returned). Child emitted nothing and was killed by its timeout.
+
+This pins the failure at Node event-loop starvation INSIDE the verifier process (transport, TLS,
+request bytes, client, esbuild, ZPM_TMPDIR all ruled out with byte-level evidence), so the gate is
+structurally unpassable as authored; §5.2 plumbing fix is sufficient and minimal.
