@@ -109,3 +109,12 @@ Hono/node:http build `new Response(body,init)` directly; internal FetchState bra
 
 ### [Insight] D48 — Registries ship TWO metadata shapes; probe REAL fixture JSON before assuming parser compat
 Standard npm {dist-tags,versions.v.dist.tarball} vs compact mirror {name,version,tarball,integrity} (phase14 fixture) => old pick_from_meta hard-failed OBSERVED-live first (exit1 metadata-missing-versions), NOT guessed; fallback routes SAME select_version semver + synthesizes dist record, bare filename -> canonical ROOT-relative /{encName}/-/{} (join_url resolves); absolute/rooted passthrough unchanged; malformed keeps classic error message. Guard tests assert both shapes + err paths; byte-exact install via external-helper oracle. Lesson family D32/D45: real-server oracles beat hand-written expectations.
+
+### [Dead End] D49 — ureq feature `rustls` RE-ADDS webpki-roots even with default-features=false
+rustls = rustls-no-provider + _ring + rustls-webpki-roots(dep) => Cargo.lock gains [[package]] webpki-roots and locked rg-gates FAIL (measured baseline); correct set for custom-connector stacks = features=["rustls-no-provider","gzip"] (ureq compiles sans _ring: panic lives ONLY on its default-TLS path we never take via Agent::with_parts(CzConnector)); verify via cargo tree -e features + rg '^name = "(tokio|hyper|webpki-roots)"' exit1. Sweep: any future dep trim claiming zero-roots MUST re-scan LOCK, not just crate Cargo.toml.
+
+### [Insight] D50 — Multicall binary dispatch BEFORE heavyweight init = zero-startup subcommands
+cz-js main() runs cz_zpm::maybe_run_multicall() FIRST (no QuickJS Runtime exists for zpm/npm/cz-js-zpm paths), while node/<script passthrough stays runtime-mode (argv0 basename in {zpm,npm} or argv[1]=="zpm" only); standalone cz-zpm bin KEPT for per-crate release-build verifiers (phase7b/7c findBin). Unit-guard the 4 dispatch shapes incl cz-js+node None-cases; family-D3: keep both bins compiling -D warnings.
+
+### [Note] D51 — Unpassable-by-design locked gate protocol: prove, document, commit, STOP (never tamper)
+spawnSync-freeze blocker handled per playbook: minimal repro twice + ruled-out list (proxy/reuseport/RST/warm/Expect100/env-injection rejected as bypass class), SAME-assertion replica w/ out-of-process helper passes ALL checks (byte-exact artifacts), SPEC Known-Limitations §5 + DISCOVERIES H83 + host-gated reopener D46, blocker committed with evidence trail; honest verify_metrics(NO args) after final edit, no weakening anywhere. Reusable whenever /refs-ro gates collide with measured env semantics.
