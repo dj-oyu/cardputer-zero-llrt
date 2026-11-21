@@ -154,3 +154,11 @@ in-process server showed:
 This pins the failure at Node event-loop starvation INSIDE the verifier process (transport, TLS,
 request bytes, client, esbuild, ZPM_TMPDIR all ruled out with byte-level evidence), so the gate is
 structurally unpassable as authored; §5.2 plumbing fix is sufficient and minimal.
+
+## §6 Robustness hardening (shipped): bounded registry I/O
+
+Dead/hung registries must fail FAST on device (no infinite hangs). ureq `Config` now sets
+`timeout_resolve(5s)`, `timeout_connect(10s)`, `timeout_per_read(10s default)`; env override
+`ZPM_TIMEOUT_MS` (1..60000, else CLI error `bad ZPM_TIMEOUT_MS`). Measured live against a
+listen-but-never-answer server: default fails in ~10.2s and `ZPM_TIMEOUT_MS=2500` in ~2.6s with
+clean `request failed … io: …` on stderr, exit 1; byte-exact happy-path install unchanged.

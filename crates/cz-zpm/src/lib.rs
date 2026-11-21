@@ -399,6 +399,15 @@ fn join_url(base: &str, rel: &str) -> Result<String, String> {
 /// system-CA + `ring` stack `cz-js` uses: `cz_net::tls::build_client_config(&TlsClientOptions::
 /// default())` — never `webpki-roots`.
 fn build_client() -> Result<Agent, String> {
+    // Device-realistic bounds (CardputerZero flaky links): DNS/connect/first-read must not hang
+    // forever. Env override ZPM_TIMEOUT_MS tunes the READ bound (1..60_000 ms), else 10 s default.
+    let read_secs = match std::env::var("ZPM_TIMEOUT_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(ms) if (1..=60_000).contains(&ms) => ms,
+            _ => return Err("bad ZPM_TIMEOUT_MS (want 1..60000)".to_string()),
+        },
+        Err(_) => 10_000,
+    };
     let cfg = Config::builder()
         .http_status_as_error(false)
         .max_redirects(0)
@@ -406,7 +415,9 @@ fn build_client() -> Result<Agent, String> {
         // No pooling: zpm makes a handful of requests per command then exits.
         .max_idle_connections(0)
         .max_idle_connections_per_host(0)
+        .timeout_resolve(Some(std::time::Duration::from_secs(5)))
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_per_read(Some(std::time::Duration::from_millis(read_secs)))
         .no_delay(true)
         .build();
     let tls = cz_net::tls::build_client_config(&cz_net::tls::TlsClientOptions::default())?;
@@ -1737,6 +1748,27 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn bounded_io_timeout_knob_validation_and_defaults() {
+        // Harness suite runs with --test-threads=1 (env mutations below assume serialization).
+        // Default bounds must build.
+        std::env::remove_var("ZPM_TIMEOUT_MS");
+        assert!(build_client().is_ok());
+        // Tunable within range...
+        std::env::set_var("ZPM_TIMEOUT_MS", "2500");
+        assert!(build_client().is_ok());
+        std::env::set_var("ZPM_TIMEOUT_MS", "60000");
+        assert!(build_client().is_ok());
+        // ...and reject garbage loudly (never silently ignore).
+        std::env::set_var("ZPM_TIMEOUT_MS", "0");
+        assert_eq!(build_client().unwrap_err(), "bad ZPM_TIMEOUT_MS (want 1..60000)");
+        std::env::set_var("ZPM_TIMEOUT_MS", "70000");
+        assert!(build_client().is_err());
+        std::env::set_var("ZPM_TIMEOUT_MS", "abc");
+        assert!(build_client().is_err());
+        std::env::remove_var("ZPM_TIMEOUT_MS");
     }
 
     #[test]
