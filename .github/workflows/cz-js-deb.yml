@@ -1,0 +1,54 @@
+name: Build cz-js .deb (AWS-LLRT Free, Cortex-A53)
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'cz-js-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Debian package version (e.g. 0.1.0)'
+        required: false
+        default: '0.1.0'
+
+permissions:
+  contents: read
+
+jobs:
+  cz-js-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cardputer-zero-llrt
+        uses: actions/checkout@v4
+
+      - name: Install system build tools (stable Rust only — no legacy toolchains)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Setup stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Workspace tests (RUSTFLAGS="-D warnings", serialized)
+        run: RUSTFLAGS="-D warnings" cargo test --workspace -- --test-threads=1
+
+      - name: Allocation audit (#[global_allocator], zero-alloc hot paths)
+        run: RUSTFLAGS="-D warnings" cargo test -p cz-runner --test alloc_audit -- --test-threads=1
+
+      - name: Cross-build + package cardputer-zero-js_<version>_arm64.deb (-C target-cpu=cortex-a53)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: bash scripts/build-cz-js-deb.sh "${{ inputs.version || '0.1.0' }}"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-zero-js-arm64-deb
+          path: |
+            dist/cardputer-zero-js_*_arm64.deb
+            dist/cardputer-zero-js_*_arm64.deb.sha256
+          if-no-files-found: error

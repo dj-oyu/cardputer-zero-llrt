@@ -94,14 +94,54 @@ impl ConnStream for TlsConnStream {
 /// (PEM parse + rustls validation, including mTLS when `require_client_auth`) is built ONCE here,
 /// so invalid PEM/key pairs fail fast with a descriptive `String` error. The returned closure
 /// runs on the engine's per-connection worker thread.
+///
+/// Hostile-traffic guard (Phase 15): before rustls touches the socket, ONE `MSG_PEEK` byte probe
+/// classifies the first record. Data that is not a TLS `Handshake` record (0x16) is rejected
+/// WITHOUT any outgoing write — a rustls alert flushed toward a half-closed/reset peer leaves
+/// unacked dying sockets behind (kernel ghost entries whose retransmits stall loopback delivery
+/// for later hostile connections). The peek never consumes bytes, so genuine ClientHello flows
+/// stay intact for rustls; silent clients remain bounded by [`HANDSHAKE_TIMEOUT`] via
+/// `SO_RCVTIMEO`.
 pub fn make_tls_acceptor(opts: &TlsServerOptions) -> Result<StreamAcceptor, String> {
     let cfg = build_server_config(opts)?;
     Ok(Arc::new(move |mut tcp: TcpStream| -> std::io::Result<Box<dyn ConnStream>> {
-        tcp.set_nodelay(true)?;
-        // Bound the handshake window BEFORE wrapping: rustls' blocking `complete_io` inherits
-        // these socket timeouts, so a silent client fails instead of hanging the worker.
+        // Bound the probe window FIRST: SO_RCVTIMEO also caps the MSG_PEEK below.
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        // One-byte peek: reject non-TLS traffic BEFORE rustls can flush an alert onto a
+        // hostile/half-closed socket (dying-ghost avoidance; the socket drops silently instead).
+        let mut probe = [0u8; 1];
+        loop {
+            let rc = unsafe {
+                libc::recv(
+                    tcp.as_raw_fd(),
+                    probe.as_mut_ptr() as *mut libc::c_void,
+                    1,
+                    libc::MSG_PEEK,
+                )
+            };
+            if rc == 1 {
+                if probe[0] != 0x16 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "plaintext data on TLS listener (pre-rejected, no alert written)",
+                    ));
+                }
+                break;
+            }
+            if rc == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed before TLS ClientHello",
+                ));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err); // timeout / reset: drop THIS socket only
+        }
+        tcp.set_nodelay(true)?;
         let mut conn = ServerConnection::new(cfg.clone()).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("TLS error: {e}"))
         })?;
