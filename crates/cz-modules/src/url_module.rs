@@ -78,6 +78,23 @@ fn ensure_url_search_params<'js>(ctx: &Ctx<'js>) -> Result<()> {
 const USP_FALLBACK: &str = r#"
 (function () {
     if (typeof globalThis.URLSearchParams !== "undefined") return;
+    // WHATWG application/x-www-form-urlencoded decoding NEVER throws on a bare/invalid `%`
+    // (Node parity: `new URLSearchParams("?q=100%").get("q") === "100%"`). Valid %XX runs are
+    // percent-decoded, '+' becomes a space, anything else stays literal.
+    function formDecode(s) {
+        let out = "";
+        const re = /%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2})*|\+/g;
+        let last = 0, m;
+        while ((m = re.exec(s))) {
+            out += s.slice(last, m.index);
+            if (m[0] === "+") out += " ";
+            else {
+                try { out += decodeURIComponent(m[0]); } catch (_e) { out += m[0]; } // invalid UTF-8 stays raw
+            }
+            last = m.index + m[0].length;
+        }
+        return out + s.slice(last);
+    }
     function parseInto(pairs, text) {
         pairs.length = 0;
         if (!text) return;
@@ -87,7 +104,7 @@ const USP_FALLBACK: &str = r#"
             const eq = p.indexOf("=");
             const k = eq < 0 ? p : p.slice(0, eq);
             const v = eq < 0 ? "" : p.slice(eq + 1);
-            pairs.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]);
+            pairs.push([formDecode(k), formDecode(v)]);
         }
     }
     function URLSearchParams(init) {

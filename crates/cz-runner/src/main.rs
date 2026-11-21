@@ -262,6 +262,9 @@ fn module_error_text(ctx: &Context) -> Option<String> {
 /// when settled, `Ok(false)` when nothing can make progress anymore (deadlock). Never pumps jobs
 /// while a context scope is open (rquickjs RefCell rule).
 fn settle_module(rt: &Runtime, ctx: &Context) -> Result<bool, String> {
+    // Phase 15B: watchdog ONLY when CZ_MAX_LOOP_SECS is explicitly set (u64 seconds); the
+    // former hardcoded 3600 s kill is gone.
+    let max_loop_secs = std::env::var("CZ_MAX_LOOP_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let started = std::time::Instant::now();
     let mut idle_passes = 0usize;
     while !module_settled(ctx) {
@@ -284,8 +287,8 @@ fn settle_module(rt: &Runtime, ctx: &Context) -> Result<bool, String> {
         } else {
             idle_passes = 0;
         }
-        if started.elapsed().as_secs() > 3600 {
-            return Err("module evaluation exceeded the 1h safety valve".to_string());
+        if started.elapsed().as_secs() > max_loop_secs.unwrap_or(u64::MAX) {
+            return Err(format!("module evaluation exceeded CZ_MAX_LOOP_SECS ({}s)", max_loop_secs.unwrap_or(u64::MAX)));
         }
         cz_modules::http_idle_pause();
     }
@@ -459,11 +462,15 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
     if cz_modules::should_quit() {
         return Ok(());
     }
-    if cz_modules::http_listening_count() > 0 && !cz_modules::install_signal_handlers() {
+    // Phase 15B: SIGINT/SIGTERM handlers are installed UNCONDITIONALLY (servers started inside
+    // top-level await, setTimeout or node:tls/WebSocket daemons all get clean signal shutdown,
+    // even when nothing was listening yet at loop entry).
+    if !cz_modules::install_signal_handlers() {
         eprintln!("cz-js: warning: could not install SIGINT/SIGTERM handlers");
     }
     let started = std::time::Instant::now();
-    // Safety valve: a wedged handler must not spin the process forever.
+    // Watchdog only when CZ_MAX_LOOP_SECS is explicitly set; no hardcoded 3600 s kill anymore.
+    let max_loop_secs = std::env::var("CZ_MAX_LOOP_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     loop {
         if cz_modules::should_quit() {
             break;
@@ -473,8 +480,8 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
         if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 && tls_active == 0 && ws_active == 0 {
             break;
         }
-        if started.elapsed().as_secs() > 3600 {
-            eprintln!("cz-js: event loop exceeded the 1h safety valve; exiting");
+        if started.elapsed().as_secs() > max_loop_secs.unwrap_or(u64::MAX) {
+            eprintln!("cz-js: event loop exceeded CZ_MAX_LOOP_SECS ({}s); exiting", max_loop_secs.unwrap_or(u64::MAX));
             break;
         }
         cz_modules::http_idle_pause();

@@ -154,6 +154,11 @@ fn path_dirname(p: &str) -> String {
         return ".".to_string();
     }
     let s = strip_trailing_slashes(p);
+    // Phase 15B: an ALL-slash absolute path ("/", "///") strips down to nothing; Node returns
+    // the POSIX root "/" for those, never ".".
+    if s.is_empty() {
+        return if is_absolute(p) { "/".to_string() } else { ".".to_string() };
+    }
     match last_sep(s) {
         None => ".".to_string(),
         Some(0) => {
@@ -212,7 +217,9 @@ fn path_parse<'js>(ctx: &Ctx<'js>, p: String) -> Result<Object<'js>> {
     let root = if root_ls == 2 { "//" } else if is_absolute(&p) { "/" } else { "" };
     let s = strip_trailing_slashes(&p);
     let (dir, base) = match last_sep(s) {
-        None => ("", s),
+        // Phase 15B: parse("/") strips to an empty path — its dir is the ROOT ("/" or "//"),
+        // matching Node's { root: "/", dir: "/", base: "", ext: "", name: "" }.
+        None => (if s.is_empty() { root } else { "" }, s),
         Some(i) if i == 0 && root.len() <= 1 => {
             // "/file" => dir "/" ; "//file" => dir "//"
             (root, &s[1..])

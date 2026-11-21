@@ -614,7 +614,14 @@ impl RequestParser {
                 }
             }
             ChunkPhase::DataEol => match peek_line_len(self.readable()) {
-                Some((_, drain_len)) => {
+                Some((line_len, drain_len)) => {
+                    // Phase 15B: the chunk-data CRLF MUST terminate an EMPTY line. Trailing
+                    // garbage on that line is a framing violation; reject BEFORE consuming.
+                    if line_len != 0 {
+                        return Err(HttpError::BadRequest(
+                            "chunk framing error: non-empty chunk-data terminator line".into(),
+                        ));
+                    }
                     self.consume(drain_len);
                     Ok(ChunkMove::Advanced(ChunkPhase::SizeLine))
                 }
@@ -1017,10 +1024,13 @@ fn write_filtered_headers(
     let mut has_len = false;
     let mut seen: SeenNames<'_> = SeenNames::new();
     for (name, value) in headers {
+        // Phase 15B (RFC 6265): Set-Cookie must NEVER be collapsed into one comma-joined
+        // field, so duplicate Set-Cookie headers are exempt from the dedup bookkeeping.
+        let is_set_cookie = name.eq_ignore_ascii_case("set-cookie");
         if name.eq_ignore_ascii_case("connection")
             || name.eq_ignore_ascii_case("transfer-encoding")
             || (skip_content_length && name.eq_ignore_ascii_case("content-length"))
-            || seen.any_icase(name)
+            || (!is_set_cookie && seen.any_icase(name))
         {
             continue;
         }
@@ -1031,7 +1041,9 @@ fn write_filtered_headers(
             && !value.contains('\n')
             && !value.contains('\r')
         {
-            seen.push(name.as_str());
+            if !is_set_cookie {
+                seen.push(name.as_str());
+            }
             out.reserve(name.len() + value.len() + 4);
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(b": ");
@@ -1844,6 +1856,79 @@ mod http_tests {
         assert!(!text.contains("X-Injected"), "CRLFs in reason must not inject headers");
         assert!(text.contains("Content-Length: 3\r\n"), "auto CL preserved when hostile CL skipped");
         assert!(!text.contains("\r\n: empty-name"), "empty header name skipped");
+    }
+
+    #[test]
+    fn chunk_data_terminator_line_with_trailing_garbage_is_bad_request() {
+        // Phase 15B: after every chunk payload the terminating line MUST be empty. Garbage
+        // riding on the SAME line as the chunk data (before its CRLF) used to be swallowed
+        // silently; it is now a strict 400 from the DataEol phase itself.
+        let err = one_request(
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe junk\r\n0\r\n\r\n",
+        )
+        .expect_err("non-empty chunk-data terminator must be rejected");
+        assert_eq!(err.status(), 400);
+        assert!(matches!(err, HttpError::BadRequest(_)));
+        assert!(format!("{err}").contains("terminator"), "msg={err}");
+
+        // The garbage terminator arriving split across pushes fails just the same.
+        let mut p = RequestParser::new();
+        p.push(b"PUT /y HTTP/1.1\r\nHost: cz0\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX");
+        assert_eq!(p.step().unwrap(), ParseStep::NeedMore, "awaiting the terminator newline");
+        p.push(b"\r\n");
+        let err = p.step().expect_err("split garbage terminator must fail too");
+        assert_eq!(err.status(), 400);
+        assert!(format!("{err}").contains("terminator"), "msg={err}");
+
+        // Stray text AFTER a proper empty terminator still dies as an invalid size line.
+        let err2 = one_request(
+            "POST /z HTTP/1.1\r\nHost: cz0\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\njunk\r\n0\r\n\r\n",
+        )
+        .expect_err("junk size line must be rejected");
+        assert_eq!(err2.status(), 400);
+
+        // Clean framing (CRLF and bare-LF terminators) still parses exactly as before.
+        let ok = one_request(
+            "POST /ok HTTP/1.1\r\nHost: cz0\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n",
+        )
+        .expect("valid chunk framing must stay valid");
+        assert_eq!(ok.body, b"hi".to_vec());
+        let lf = one_request(
+            "POST /lf HTTP/1.1\nHost: cz0\nTransfer-Encoding: chunked\n\n1\na\n0\n\n",
+        )
+        .expect("bare-LF terminator stays valid");
+        assert_eq!(lf.body, b"a".to_vec());
+    }
+
+    #[test]
+    fn multiple_set_cookie_headers_survive_response_serialization() {
+        // Phase 15B (RFC 6265): duplicate Set-Cookie headers must NEVER be collapsed or dropped,
+        // while every other duplicated name keeps the historical first-wins dedup rule.
+        let headers = vec![
+            ("Set-Cookie".into(), "a=1; Path=/".into()),
+            ("set-cookie".into(), "b=2; HttpOnly".into()),
+            ("X-Dup".into(), "first".into()),
+            ("X-Dup".into(), "second-dropped".into()),
+            ("Content-Type".into(), "text/plain".into()),
+        ];
+        let text = String::from_utf8(serialize_response(200, None, &headers, b"ok", true)).unwrap();
+        // Header names keep the caller's casing, so count case-insensitively.
+        assert_eq!(text.to_lowercase().matches("set-cookie:").count(), 2, "{text:?}");
+        assert!(text.contains("Set-Cookie: a=1; Path=/\r\n"), "{text:?}");
+        assert!(text.contains("set-cookie: b=2; HttpOnly\r\n"), "{text:?}");
+        assert_eq!(text.matches("X-Dup:").count(), 1, "{text:?}");
+        assert!(!text.contains("second-dropped"), "{text:?}");
+
+        // The zero-body-copy Keep-Alive head path applies the identical rules.
+        let mut scratch: Vec<u8> = Vec::new();
+        serialize_response_head_into(&mut scratch, 200, None, &headers, 2, true);
+        let head = String::from_utf8(scratch).unwrap();
+        assert_eq!(head.to_lowercase().matches("set-cookie:").count(), 2, "{head:?}");
+
+        // Hostile CRLF inside a cookie value is still skipped outright (no injection).
+        let hostile = vec![("Set-Cookie".into(), "a=1\r\nX-Evil: 1".into())];
+        let htext = String::from_utf8(serialize_response(200, None, &hostile, b"", true)).unwrap();
+        assert!(!htext.contains("X-Evil"), "CRLF cookie injection must never reach the wire: {htext:?}");
     }
 
 }

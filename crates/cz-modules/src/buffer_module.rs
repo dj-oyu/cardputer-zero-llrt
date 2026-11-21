@@ -250,7 +250,13 @@ const BUFFER_SHIM: &str = r#"
         const enc = normEnc(encoding);
         if (typeof input === "string") return wrapView(__czBufDecode(input, enc));
         if (input instanceof ArrayBuffer) return wrapView(new Uint8Array(input).slice()); // own copy of the bytes
-        if (ArrayBuffer.isView(input)) return wrapView(input.slice(0));                   // native element copy
+        if (ArrayBuffer.isView(input)) {
+            // Phase 15B: ONLY a Uint8Array/Buffer can be wrapped directly. Any other view
+            // (DataView, Uint16Array, Float64Array, ...) gets its BYTE VIEW copied into a
+            // FRESH Uint8Array — NEVER re-prototype the source view (Node Buffer.from parity).
+            if (input instanceof Uint8Array) return wrapView(input.slice(0));           // native element copy
+            return wrapView(new Uint8Array(input.buffer, input.byteOffset, input.byteLength).slice(0));
+        }
         if (Array.isArray(input)) {
             const u = new Uint8Array(input.length);
             for (let i = 0; i < input.length; i++) u[i] = input[i] & 0xff; // number[] shaping (cold path)
@@ -304,6 +310,11 @@ const BUFFER_SHIM: &str = r#"
     Buffer.isBuffer = function (val) { return val instanceof Buffer; };
 
     Buffer.byteLength = function (input, encoding) {
+        // Phase 15B: Buffers, typed arrays and ArrayBuffers report their true byteLength;
+        // only strings (and string-coerced values) go through the native encoding measure.
+        if (typeof ArrayBuffer !== "undefined" && (input instanceof ArrayBuffer || ArrayBuffer.isView(input))) {
+            return input.byteLength;
+        }
         return __czBufByteLength(typeof input === "string" ? input : String(input), normEnc(encoding));
     };
 

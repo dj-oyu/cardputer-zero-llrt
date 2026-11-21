@@ -499,8 +499,9 @@ const WEB_SHIM: &str = r#"
     }
     Object.defineProperty(Blob.prototype, "size", { get: function () { return this._bytes.length; } });
     Blob.prototype.arrayBuffer = async function () {
+        // Phase 15B: ALWAYS hand out a fresh copy — returning the Blob's own ArrayBuffer would
+        // let a caller mutate the Blob's internal bytes through the returned buffer.
         const b = this._bytes;
-        if (b.byteOffset === 0 && b.byteLength === b.buffer.byteLength) return b.buffer;
         const copy = new ArrayBuffer(b.length);
         new Uint8Array(copy).set(b, 0);
         return copy;
@@ -639,7 +640,10 @@ const WEB_SHIM: &str = r#"
             if (fileish(v)) {
                 const fname = e[2] !== undefined ? e[2] : (v.name !== undefined ? v.name : "blob");
                 head += "; filename=\"" + sanitize(fname) + "\"";
-                if (v.type) head += "\r\nContent-Type: " + v.type;
+                // Phase 15B: strip CR/LF out of the blob's Content-Type so a hostile `type`
+                // can never inject extra multipart header lines (CRLF injection guard).
+                const ctype = String(v.type || "").replace(/[\r\n]/g, "");
+                if (ctype) head += "\r\nContent-Type: " + ctype;
             }
             head += "\r\n\r\n";
             push(head);

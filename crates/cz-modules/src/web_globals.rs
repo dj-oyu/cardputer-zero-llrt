@@ -149,8 +149,11 @@ const WEB_GLOBALS_SHIM: &str = r#"
             }
             const fn = entry[0];
             const call = typeof fn === "function" ? fn : fn.handleEvent;
-            if (swallowErrors) { try { call.call(this, event); } catch (_e) {} }
-            else { call.call(this, event); }
+            // Phase 15B (DOM spec): object listeners get `this === listener`; plain function
+            // listeners keep the traditional event-target receiver.
+            const receiver = typeof fn === "function" ? this : fn;
+            if (swallowErrors) { try { call.call(receiver, event); } catch (_e) {} }
+            else { call.call(receiver, event); }
         }
     };
 

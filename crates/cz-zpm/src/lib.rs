@@ -32,7 +32,7 @@ use std::process::Command as StdCommand;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use flate2::read::GzDecoder;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use tar::{Archive, EntryType};
 use serde_json::Value as Json;
 use ureq::config::Config;
@@ -563,17 +563,52 @@ fn fetch_bytes(agent: &Agent, url: &str, accept: Option<&str>) -> Result<Vec<u8>
 // sha512-<base64> integrity verification (BEFORE extraction, in memory)
 // ---------------------------------------------------------------------------------------------
 
-/// Verify a `sha512-<base64>` SRI string against in-memory bytes. `Ok(true)` == match.
+/// Verify an SRI string against in-memory bytes. Phase 15B: the string may list MULTIPLE
+/// space-separated hash tokens (`"sha256-... sha512-..."`); verification PASSES when ANY listed
+/// digest matches. Each needed algorithm is hashed at most once; unknown algorithms and bad
+/// base64 stay hard errors (never silently ignored). `Ok(true)` == match.
 pub fn verify_integrity(bytes: &[u8], sri: &str) -> Result<bool, String> {
-    let b64 = match sri.strip_prefix("sha512-") {
-        Some(rest) => rest.trim(),
-        None => return Err(format!("unsupported/missing integrity algorithm: {sri:?}")),
-    };
-    let expected = BASE64
-        .decode(b64)
-        .map_err(|e| format!("bad base64 in integrity {sri:?}: {e}"))?;
-    let got = sha512_digest(bytes);
-    Ok(got.as_slice() == expected.as_slice())
+    let mut matched = false;
+    let mut known = false;
+    let mut d512: Option<sha2::digest::Output<Sha512>> = None;
+    let mut d256: Option<sha2::digest::Output<Sha256>> = None;
+    for tok in sri.split_whitespace() {
+        if let Some(b64) = tok.strip_prefix("sha512-") {
+            known = true;
+            let expected = BASE64
+                .decode(b64)
+                .map_err(|e| format!("bad base64 in integrity {tok:?}: {e}"))?;
+            // Digest bytes at most once per algorithm, and only while STILL unmatched; every
+            // listed token is still syntactically validated (no early break).
+            if !matched {
+                if d512.is_none() {
+                    d512 = Some(sha512_digest(bytes));
+                }
+                if d512.as_ref().unwrap().as_slice() == expected.as_slice() {
+                    matched = true;
+                }
+            }
+        } else if let Some(b64) = tok.strip_prefix("sha256-") {
+            known = true;
+            let expected = BASE64
+                .decode(b64)
+                .map_err(|e| format!("bad base64 in integrity {tok:?}: {e}"))?;
+            if !matched {
+                if d256.is_none() {
+                    d256 = Some(Sha256::new().chain_update(bytes).finalize());
+                }
+                if d256.as_ref().unwrap().as_slice() == expected.as_slice() {
+                    matched = true;
+                }
+            }
+        } else {
+            return Err(format!("unsupported/missing integrity algorithm: {tok:?}"));
+        }
+    }
+    if !known {
+        return Err(format!("unsupported/missing integrity algorithm: {sri:?}"));
+    }
+    Ok(matched)
 }
 
 /// Compute the SHA-512 digest of `bytes` exactly once (shared by SRI verification and by the
@@ -754,8 +789,16 @@ fn is_prerelease(s: &str) -> bool {
 
 fn satisfies(range: &str, ver: (u64, u64, u64), base: (u64, u64, u64)) -> bool {
     if range.starts_with('^') {
-        // ^base: same major, version >= base.
-        ver.0 == base.0 && ver >= base
+        // Phase 15B standard npm caret rules: ^x.y.z with major > 0 locks MAJOR (>=base,
+        // <next-major); ^0.y.z with minor > 0 locks MINOR (^0.2.3 matches 0.2.9 but NOT 0.3.0);
+        // ^0.0.z locks PATCH too (>=0.0.z <0.0.(z+1)).
+        if base.0 != 0 {
+            ver.0 == base.0 && ver >= base
+        } else if base.1 != 0 {
+            ver.0 == 0 && ver.1 == base.1 && ver >= base
+        } else {
+            ver.0 == 0 && ver.1 == 0 && ver.2 >= base.2
+        }
     } else if range.starts_with('~') {
         // ~base: same major.minor, patch >= base patch.
         ver.0 == base.0 && ver.1 == base.1 && ver >= base
@@ -1077,6 +1120,36 @@ impl LockEntry {
     }
 }
 
+/// Phase 15B: ATOMIC JSON write for SD-card power-loss safety. Stage a hidden tmp file in the
+/// SAME directory, `sync_all()` it, then POSIX-`rename()` over the target (atomic within one
+/// filesystem); best-effort parent-dir fsync persists the rename itself. A crash mid-write can
+/// NEVER leave a torn `package.json` / `zpm-lock.json` behind.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "zpm-meta".into());
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.{}-{}.tmp",
+        name,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(data)?;
+    f.flush()?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path)?;
+    if let Ok(d) = fs::File::open(parent) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 fn update_root_package_json(cwd: &Path, name: &str, version: &str) -> Result<(), String> {
     let path = cwd.join("package.json");
     let mut doc: Json = match fs::read(&path) {
@@ -1097,7 +1170,7 @@ fn update_root_package_json(cwd: &Path, name: &str, version: &str) -> Result<(),
         .unwrap()
         .insert(name.to_string(), Json::String(format!("^{version}")));
     let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize package.json: {e}"))?;
-    fs::write(&path, text + "\n").map_err(|e| format!("write package.json: {e}"))
+    write_atomic(&path, (text + "\n").as_bytes()).map_err(|e| format!("write package.json: {e}"))
 }
 
 fn update_lockfile(cwd: &Path, name: &str, version: &str, integrity: &str, bundled_bytes: u64) -> Result<(), String> {
@@ -1127,7 +1200,7 @@ fn update_lockfile(cwd: &Path, name: &str, version: &str, integrity: &str, bundl
         .to_value()?,
     );
     let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize zpm-lock.json: {e}"))?;
-    fs::write(&path, text + "\n").map_err(|e| format!("write zpm-lock.json: {e}"))
+    write_atomic(&path, (text + "\n").as_bytes()).map_err(|e| format!("write zpm-lock.json: {e}"))
 }
 
 fn cmd_install(args: &[String]) -> u8 {
@@ -1318,7 +1391,7 @@ fn finalize_installed_pkg(cwd: &Path, root: &RootInfo, staged_bundle: &Path, rec
         exports,
     };
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
-    fs::write(final_dir.join("package.json"), text + "\n").map_err(|e| format!("write manifest: {e}"))?;
+    write_atomic(&final_dir.join("package.json"), (text + "\n").as_bytes()).map_err(|e| format!("write manifest: {e}"))?;
     if record_range {
         update_root_package_json(cwd, &root.name, &root.version)?;
     }
@@ -1417,7 +1490,7 @@ fn drop_json_key(path: &Path, section: &str, key: &str) -> Result<bool, String> 
         return Ok(false);
     }
     let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize {}: {e}", path.display()))?;
-    fs::write(path, text + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
+    write_atomic(path, (text + "\n").as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(true)
 }
 
@@ -2125,6 +2198,68 @@ mod tests {
         assert_eq!(BASE64.decode(b64).unwrap().len(), 64);
         assert!(verify_integrity(&data, "md5-abc=").is_err());
         assert!(verify_integrity(&data, "").is_err());
+    }
+
+    #[test]
+    fn multi_hash_sri_strings_pass_when_any_listed_digest_matches() {
+        // Phase 15B: `"sha256-... sha512-..."` style multi-hash SRI (space-separated).
+        let data = b"multi-sri-payload".to_vec();
+        let s512 = sri_from_digest(&sha512_digest(&data));
+        let s256 = format!(
+            "sha256-{}",
+            BASE64.encode(Sha256::new().chain_update(&data).finalize().as_slice())
+        );
+        assert!(verify_integrity(&data, &format!("{s256} {s512}")).unwrap());
+        assert!(verify_integrity(&data, &format!("  {s512}\t{s256}  ")).unwrap());
+        // A wrong-but-well-formed digest list must verify false (NOT error), and a bad base64
+        // or unknown algorithm inside the list stays a hard error.
+        let wrong = sri_from_digest(&sha512_digest(b"definitely-other-bytes"));
+        assert!(!verify_integrity(&data, &format!("{wrong} {wrong}")).unwrap());
+        assert!(verify_integrity(&data, &format!("{s512} sha1-AAA=")).is_err());
+        assert!(verify_integrity(&data, &format!("{s512} sha256-not-base64!!")).is_err());
+    }
+
+    #[test]
+    fn caret_semver_caret_zero_lines_lock_minor_then_patch() {
+        // Phase 15B standard npm caret rules exercised directly on `satisfies`:
+        let b023 = parse_semver("0.2.3").unwrap();
+        assert!(satisfies("^0.2.3", parse_semver("0.2.9").unwrap(), b023), "^0.2.3 must match 0.2.9");
+        assert!(!satisfies("^0.2.3", parse_semver("0.3.0").unwrap(), b023), "^0.2.3 must NOT match 0.3.0");
+        assert!(!satisfies("^0.2.3", parse_semver("0.2.2").unwrap(), b023), "below base rejected");
+        let b004 = parse_semver("0.0.4").unwrap();
+        assert!(satisfies("^0.0.4", parse_semver("0.0.7").unwrap(), b004));
+        assert!(!satisfies("^0.0.4", parse_semver("0.1.0").unwrap(), b004), "^0.0.z locks patch/minor");
+        assert!(!satisfies("^0.0.4", parse_semver("0.0.3").unwrap(), b004));
+        let b123 = parse_semver("1.2.3").unwrap();
+        assert!(satisfies("^1.2.3", parse_semver("1.9.9").unwrap(), b123));
+        assert!(!satisfies("^1.2.3", parse_semver("2.0.0").unwrap(), b123));
+        // End-to-end range selection across a 0.x line:
+        let vers = s(&["0.2.4", "0.2.9", "0.3.0"]);
+        assert_eq!(select_version(&vers, Some("0.3.0"), "^0.2.3").unwrap(), "0.2.9");
+    }
+
+    #[test]
+    fn package_json_and_lockfile_are_written_atomically_without_strays() {
+        // Phase 15B: tmp file in the SAME dir -> sync_all -> rename; no torn files, no strays.
+        let dir = TempDir::new("zpm-atomic").unwrap();
+        update_root_package_json(dir.path(), "left-pad", "1.3.0").expect("package.json write");
+        update_lockfile(dir.path(), "left-pad", "1.3.0", &sri_from_digest(&sha512_digest(b"x")), 42)
+            .expect("lock write");
+        let pj = fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert!(pj.contains("\"left-pad\": \"^1.3.0\"") && pj.ends_with('\n'), "pj={pj:?}");
+        let lk = fs::read_to_string(dir.path().join("zpm-lock.json")).unwrap();
+        assert!(lk.contains("\"version\": \"1.3.0\""), "lock={lk:?}");
+        // The staged .tmp file must have been renamed away completely.
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "atomic write left stray tmp files: {strays:?}");
+        // drop_json_key (remove path) keeps the same atomic discipline for both files.
+        assert!(drop_json_key(&dir.path().join("package.json"), "dependencies", "left-pad").unwrap());
+        assert!(!fs::read_to_string(dir.path().join("package.json")).unwrap().contains("left-pad"));
     }
 
     #[test]

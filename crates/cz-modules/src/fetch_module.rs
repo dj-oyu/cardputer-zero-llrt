@@ -405,6 +405,23 @@ pub(crate) const FETCH_SHIM: &str = r#"
     };
 
     // ------------------------------------------------------------------ URLSearchParams
+    // Phase 15B: WHATWG application/x-www-form-urlencoded decoding NEVER throws on a bare or
+    // invalid `%` (Node parity: `new URLSearchParams("?q=100%").get("q") === "100%"`). Valid
+    // %XX runs are percent-decoded, '+' becomes a space, anything else stays literal.
+    function formDecode(s) {
+        let out = "";
+        const re = /%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2})*|\+/g;
+        let last = 0, m;
+        while ((m = re.exec(s))) {
+            out += s.slice(last, m.index);
+            if (m[0] === "+") out += " ";
+            else {
+                try { out += decodeURIComponent(m[0]); } catch (_e) { out += m[0]; } // invalid UTF-8 stays raw
+            }
+            last = m.index + m[0].length;
+        }
+        return out + s.slice(last);
+    }
     function URLSearchParams(init) {
         this._pairs = [];
         if (typeof init === "string") {
@@ -413,9 +430,8 @@ pub(crate) const FETCH_SHIM: &str = r#"
                 const parts = text.split("&");
                 for (const p of parts) {
                     const eq = p.indexOf("=");
-                    if (eq < 0) this.append(decodeURIComponent(p.replace(/\+/g, " ")), "");
-                    else this.append(decodeURIComponent(p.slice(0, eq).replace(/\+/g, " ")),
-                                       decodeURIComponent(p.slice(eq + 1).replace(/\+/g, " ")));
+                    if (eq < 0) this.append(formDecode(p), "");
+                    else this.append(formDecode(p.slice(0, eq)), formDecode(p.slice(eq + 1)));
                 }
             }
         } else if (init && typeof init === "object") {
@@ -455,7 +471,7 @@ pub(crate) const FETCH_SHIM: &str = r#"
     };
     URLSearchParams.prototype.toString = function () {
         const enc = function (s) {
-            return encodeURIComponent(s).replace(/%20/g, "+").replace(/!'()*/g, function (c) { return c === "!" ? "%21" : (c === "'" ? "%27" : (c === "(" ? "%28" : "%29")); });
+            return encodeURIComponent(s).replace(/%20/g, "+").replace(/[!'()*]/g, function (c) { return c === "!" ? "%21" : (c === "'" ? "%27" : (c === "(" ? "%28" : "%29")); });
         };
         const parts = [];
         for (const p of this._pairs) parts.push(enc(p[0]) + "=" + enc(p[1]));

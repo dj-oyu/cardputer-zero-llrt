@@ -31,9 +31,51 @@ const IV_LEN: usize = 12;
 
 /// Registry entry for an imported secret key. `&'static ring::aead::Algorithm` is a `Copy`
 /// pointer to ring's const tables, so entries never clone key material between calls.
-enum RegKey {
+/// Phase 15B: `extractable` and the `usages` bitmask live HERE (Rust), never on the mutable JS
+/// CryptoKey object, so tampering with `key.extractable`/`key.usages` cannot bypass native checks.
+struct RegKey {
+    extractable: bool,
+    /// Bitmask of permitted operations (`USAGE_SIGN` | `USAGE_VERIFY` | ...); 0 means "recorded
+    /// without usage info" (direct native import) and stays unrestricted.
+    usages: u8,
+    kind: RegKind,
+}
+
+enum RegKind {
     Hmac { alg: Alg, key: Vec<u8> },
     Aes { algo: &'static ring::aead::Algorithm, key: Vec<u8> },
+}
+
+// Web Crypto `KeyUsage` bitmask stored beside every registry entry.
+const USAGE_SIGN: u8 = 1;
+const USAGE_VERIFY: u8 = 2;
+const USAGE_ENCRYPT: u8 = 4;
+const USAGE_DECRYPT: u8 = 8;
+
+fn usage_mask(list: &str) -> u8 {
+    let mut mask = 0u8;
+    for tok in list.split(',') {
+        match tok.trim() {
+            "sign" => mask |= USAGE_SIGN,
+            "verify" => mask |= USAGE_VERIFY,
+            "encrypt" => mask |= USAGE_ENCRYPT,
+            "decrypt" => mask |= USAGE_DECRYPT,
+            _ => {}
+        }
+    }
+    mask
+}
+
+/// Reject an operation the key's recorded usages do not permit (`InvalidAccessError`, per the
+/// Web Crypto algorithm-step rule). Unrecorded (0) usage sets stay unrestricted for native users.
+fn require_usage<'js>(ctx: &Ctx<'js>, usages: u8, need: u8, what: &str) -> Result<()> {
+    if usages != 0 && usages & need == 0 {
+        return Err(Exception::throw_message(
+            ctx,
+            &format!("InvalidAccessError: key usages do not include \"{what}\""),
+        ));
+    }
+    Ok(())
 }
 
 fn key_registry() -> &'static Mutex<Vec<Option<RegKey>>> {
@@ -50,11 +92,14 @@ fn key_entry(id: f64) -> Option<RegKey> {
     let idx = id as usize;
     let reg = key_registry().lock().expect("web crypto registry lock");
     match reg.get(idx).and_then(|slot| slot.as_ref()) {
-        Some(RegKey::Hmac { alg, key }) => Some(RegKey::Hmac {
-            alg: *alg,
-            key: key.clone(),
+        Some(entry) => Some(RegKey {
+            extractable: entry.extractable,
+            usages: entry.usages,
+            kind: match &entry.kind {
+                RegKind::Hmac { alg, key } => RegKind::Hmac { alg: *alg, key: key.clone() },
+                RegKind::Aes { algo, key } => RegKind::Aes { algo, key: key.clone() },
+            },
         }),
-        Some(RegKey::Aes { algo, key }) => Some(RegKey::Aes { algo, key: key.clone() }),
         None => None,
     }
 }
@@ -126,11 +171,13 @@ fn store_key<'js>(
     name: &str,
     hash: &str,
     bytes: &[u8],
+    extractable: bool,
+    usages: u8,
 ) -> Result<RegKey> {
-    if name == "HMAC" {
+    let kind = if name == "HMAC" {
         let alg = alg_of(hash)
             .ok_or_else(|| Exception::throw_type(ctx, "HMAC import requires hash SHA-256 or SHA-512"))?;
-        Ok(RegKey::Hmac { alg, key: bytes.to_vec() })
+        RegKind::Hmac { alg, key: bytes.to_vec() }
     } else if name == "AES-GCM" {
         let algo = match bytes.len() {
             16 => &ring::aead::AES_128_GCM,
@@ -142,10 +189,11 @@ fn store_key<'js>(
                 ))
             }
         };
-        Ok(RegKey::Aes { algo, key: bytes.to_vec() })
+        RegKind::Aes { algo, key: bytes.to_vec() }
     } else {
-        Err(Exception::throw_type(ctx, &format!("UnsupportedAlgorithm: {name}")))
-    }
+        return Err(Exception::throw_type(ctx, &format!("UnsupportedAlgorithm: {name}")));
+    };
+    Ok(RegKey { extractable, usages, kind })
 }
 
 fn import_key_impl<'js>(
@@ -154,6 +202,8 @@ fn import_key_impl<'js>(
     key_data: Value<'js>,
     algorithm: String,
     hash: String,
+    extractable: Opt<bool>,
+    usage_list: Opt<String>,
 ) -> Result<f64> {
     let bytes = match format.as_str() {
         "raw" => {
@@ -182,7 +232,14 @@ fn import_key_impl<'js>(
             return Err(Exception::throw_type(ctx, &format!("Unsupported key format: {other}")));
         }
     };
-    let entry = store_key(ctx, algorithm.as_str(), hash.as_str(), &bytes)?;
+    // Phase 15B: extractable + usages are recorded IN THE REGISTRY. Native callers that omit
+    // the arguments (legacy unit tests) keep extractable=true and an unrecorded (0) usage mask.
+    let extract = extractable.0.unwrap_or(true);
+    let mask = match usage_list.0.as_deref() {
+        Some(list) => usage_mask(list),
+        None => 0,
+    };
+    let entry = store_key(ctx, algorithm.as_str(), hash.as_str(), &bytes, extract, mask)?;
     let mut reg = key_registry().lock().expect("web crypto registry lock");
     let id = reg.len() as f64;
     reg.push(Some(entry));
@@ -191,10 +248,18 @@ fn import_key_impl<'js>(
 
 fn export_raw_impl<'js>(ctx: &Ctx<'js>, id: f64) -> Result<Value<'js>> {
     let entry = key_entry(id).ok_or_else(|| bad_key(ctx))?;
+    // Phase 15B: `extractable` is enforced HERE (Rust registry), never via the mutable JS
+    // CryptoKey wrapper — mutating `key.extractable = true` from JS must not allow an export.
+    if !entry.extractable {
+        return Err(Exception::throw_message(
+            ctx,
+            "NotSupportedError: key is not extractable",
+        ));
+    }
     // Raw export hands out the key bytes as a fresh owned buffer (moved out, no second copy):
     // cloning under the lock is the ONE allocation the export path pays.
-    let key = match entry {
-        RegKey::Hmac { key, .. } | RegKey::Aes { key, .. } => key,
+    let key = match entry.kind {
+        RegKind::Hmac { key, .. } | RegKind::Aes { key, .. } => key,
     };
     vec_to_uint8array(ctx, key)
 }
@@ -203,15 +268,21 @@ fn export_raw_impl<'js>(ctx: &Ctx<'js>, id: f64) -> Result<Value<'js>> {
 // subtle.sign / verify (HMAC, constant-time verify)
 // ---------------------------------------------------------------------------
 
-fn hmac_of<'js>(ctx: &Ctx<'js>, id: f64) -> Result<(ring::hmac::Algorithm, Vec<u8>)> {
+fn hmac_of<'js>(ctx: &Ctx<'js>, id: f64, need: u8, what: &str) -> Result<(ring::hmac::Algorithm, Vec<u8>)> {
     match key_entry(id) {
-        Some(RegKey::Hmac { alg, key }) => Ok((alg.hmac_alg(), key)),
+        Some(entry) if matches!(entry.kind, RegKind::Hmac { .. }) => {
+            require_usage(ctx, entry.usages, need, what)?;
+            match entry.kind {
+                RegKind::Hmac { alg, key } => Ok((alg.hmac_alg(), key)),
+                _ => Err(bad_key(ctx)),
+            }
+        }
         _ => Err(bad_key(ctx)),
     }
 }
 
 fn sign_impl<'js>(ctx: &Ctx<'js>, id: f64, data: Value<'js>) -> Result<Value<'js>> {
-    let (halg, key) = hmac_of(ctx, id)?;
+    let (halg, key) = hmac_of(ctx, id, USAGE_SIGN, "sign")?;
     let ring_key = ring::hmac::Key::new(halg, &key);
     // Sign over the BORROWED input view; the fixed tag is copied into an owned Vec that is
     // then moved straight into the JS ArrayBuffer.
@@ -220,7 +291,7 @@ fn sign_impl<'js>(ctx: &Ctx<'js>, id: f64, data: Value<'js>) -> Result<Value<'js
 }
 
 fn verify_impl<'js>(ctx: &Ctx<'js>, id: f64, signature: Value<'js>, data: Value<'js>) -> Result<bool> {
-    let (halg, key) = hmac_of(ctx, id)?;
+    let (halg, key) = hmac_of(ctx, id, USAGE_VERIFY, "verify")?;
     let ring_key = ring::hmac::Key::new(halg, &key);
     // Nested immutable borrows of two JS buffers + ring's constant-time compare. NO JavaScript
     // executes inside either borrow, so the aliases stay valid (§2/§3).
@@ -234,12 +305,18 @@ fn verify_impl<'js>(ctx: &Ctx<'js>, id: f64, signature: Value<'js>, data: Value<
 // subtle.encrypt / decrypt (AES-128/256-GCM via ring LessSafeKey)
 // ---------------------------------------------------------------------------
 
-fn aes_of<'js>(ctx: &Ctx<'js>, id: f64) -> Result<ring::aead::LessSafeKey> {
+fn aes_of<'js>(ctx: &Ctx<'js>, id: f64, need: u8, what: &str) -> Result<ring::aead::LessSafeKey> {
     match key_entry(id) {
-        Some(RegKey::Aes { algo, key }) => {
-            let unbound = ring::aead::UnboundKey::new(algo, &key)
-                .map_err(|_| Exception::throw_type(ctx, "Invalid AES key length for this algorithm"))?;
-            Ok(ring::aead::LessSafeKey::new(unbound))
+        Some(entry) if matches!(entry.kind, RegKind::Aes { .. }) => {
+            require_usage(ctx, entry.usages, need, what)?;
+            match entry.kind {
+                RegKind::Aes { algo, key } => {
+                    let unbound = ring::aead::UnboundKey::new(algo, &key)
+                        .map_err(|_| Exception::throw_type(ctx, "Invalid AES key length for this algorithm"))?;
+                    Ok(ring::aead::LessSafeKey::new(unbound))
+                }
+                _ => Err(bad_key(ctx)),
+            }
         }
         _ => Err(bad_key(ctx)),
     }
@@ -265,7 +342,7 @@ fn encrypt_impl<'js>(
     additional_data: Opt<Value<'js>>,
     data: Value<'js>,
 ) -> Result<Value<'js>> {
-    let key = aes_of(ctx, id)?;
+    let key = aes_of(ctx, id, USAGE_ENCRYPT, "encrypt")?;
     let nonce = nonce_from(ctx, &iv)?;
     let aad = match additional_data.0 {
         Some(v) if !v.is_undefined() && !v.is_null() => with_borrowed_bytes(&v, |b| b.to_vec())?,
@@ -291,7 +368,7 @@ fn decrypt_impl<'js>(
     additional_data: Opt<Value<'js>>,
     data: Value<'js>,
 ) -> Result<Value<'js>> {
-    let key = aes_of(ctx, id)?;
+    let key = aes_of(ctx, id, USAGE_DECRYPT, "decrypt")?;
     let nonce = nonce_from(ctx, &iv)?;
     let aad = match additional_data.0 {
         Some(v) if !v.is_undefined() && !v.is_null() => with_borrowed_bytes(&v, |b| b.to_vec())?,
@@ -354,6 +431,14 @@ const WEB_CRYPTO_SHIM: &str = r#"
             if (!(typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(array))) {
                 throw new TypeError("crypto.getRandomValues requires a typed array or DataView");
             }
+            // Phase 15B (Web Crypto spec): ONLY integer typed arrays are fillable.
+            // Float32Array / Float64Array / DataView must reject with TypeMismatchError/TypeError.
+            const cn = array.constructor && typeof array.constructor.name === "string"
+                ? array.constructor.name : "";
+            if (cn === "Float32Array" || cn === "Float64Array" ||
+                (typeof DataView !== "undefined" && array instanceof DataView)) {
+                throw new TypeError("TypeMismatchError: crypto.getRandomValues accepts only integer typed arrays");
+            }
             const n = array.byteLength;
             if (n > 65536) throw new RangeError("crypto.getRandomValues exceeds the 65536 byte limit");
             __czCryptoRandomFill(array.buffer, array.byteOffset, n);
@@ -390,13 +475,15 @@ const WEB_CRYPTO_SHIM: &str = r#"
                     }
                 }
                 const extract = extractable === undefined ? true : !!extractable;
-                const id = __czSubtleImportKey(fmt, keyData, canonical, hash);
                 const usages = [];
                 if (keyUsages && typeof keyUsages.length === "number") {
                     for (let i = 0; i < keyUsages.length; i++) usages.push(String(keyUsages[i]));
                 } else if (typeof keyUsages === "string") {
                     usages.push(keyUsages);
                 }
+                // Phase 15B: extractable + usages are recorded IN THE RUST REGISTRY (the JS
+                // wrapper object below is informational and freely mutable).
+                const id = __czSubtleImportKey(fmt, keyData, canonical, hash, extract, usages.join(","));
                 return {
                     type: "secret",
                     algorithm: canonical === "HMAC" ? { name: "HMAC", hash: hash } : { name: "AES-GCM" },
@@ -496,8 +583,9 @@ pub fn install_web_crypto<'js>(ctx: &Ctx<'js>) -> Result<()> {
         "__czSubtleImportKey",
         Function::new(
             ctx.clone(),
-            |ctx: Ctx<'js>, format: String, key_data: Value<'js>, algorithm: String, hash: String| -> Result<f64> {
-                import_key_impl(&ctx, format, key_data, algorithm, hash)
+            |ctx: Ctx<'js>, format: String, key_data: Value<'js>, algorithm: String, hash: String,
+             extractable: Opt<bool>, usage_list: Opt<String>| -> Result<f64> {
+                import_key_impl(&ctx, format, key_data, algorithm, hash, extractable, usage_list)
             },
         )?,
     )?;

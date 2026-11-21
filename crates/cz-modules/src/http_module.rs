@@ -385,7 +385,16 @@ const HTTP_SHIM: &str = r#"
         }
         _emitPairs() {
             const pairs = [];
-            for (const entry of this._headers.values()) pairs.push([entry.name, entry.value]);
+            for (const entry of this._headers.values()) {
+                // Phase 15B (RFC 6265): array-valued Set-Cookie becomes ONE wire header PER
+                // cookie (never a single comma-collapsed field); other array-valued names keep
+                // Node's historical comma-joined form.
+                if (Array.isArray(entry.value) && norm(entry.name) === "set-cookie") {
+                    for (const v of entry.value) pairs.push([entry.name, String(v)]);
+                } else {
+                    pairs.push([entry.name, entry.value]);
+                }
+            }
             return pairs;
         }
         flushHeaders() {
@@ -406,12 +415,17 @@ const HTTP_SHIM: &str = r#"
         }
         setHeader(name, value) {
             if (value === undefined || value === null) this._headers.delete(norm(name));
+            // Phase 15B: keep array values as ARRAYS so getHeader/set-cookies can hand them out
+            // per entry; scalars stay stringified exactly like before.
+            else if (Array.isArray(value)) this._headers.set(norm(name), { name: String(name), value: value.map(String) });
             else this._headers.set(norm(name), { name: String(name), value: String(value) });
             return this;
         }
         getHeader(name) {
             const e = this._headers.get(norm(name));
-            return e === undefined ? undefined : e.value;
+            if (e === undefined) return undefined;
+            // Node parity: an array-valued header reads back as a COPY of its values.
+            return Array.isArray(e.value) ? e.value.slice(0) : e.value;
         }
         hasHeader(name) { return this._headers.has(norm(name)); }
         removeHeader(name) { this._headers.delete(norm(name)); }
