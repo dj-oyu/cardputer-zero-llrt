@@ -60,3 +60,15 @@ obs-fold in-place value-span growth MUST truncate the just-emitted `\r\n` BEFORE
 
 ### [Principle] D29 — Linear-cursor + vectored-TX test/wire rules
 Cursor-state asserts ONLY from literal fixture byte lengths (Vec capacity unspecified; explicit with_capacity(32) rule tests); FULL mid-request consumption resets read_pos+buf to (0,0) so stale NeedMore asserts lie. Vectored TX: NEVER leading zero-length IoSlice, ONE global offset retry mapped on (head,body), flush ONCE = wire-identical to combined encode()+write_all (TCP writev coalesces, TLS std-default sequential)..
+
+### [Principle] D30 — Frame header accumulation: ask EXACTLY what's missing, never fail on growth
+Reading `raw[got..]` (14-byte stack) grabbed 12 SPARE payload bytes after a 2-byte header -> tail silently dropped, auto-Pong never sent; also low==126/127 must set `need=4/10` and CONTINUE, not return false (2-byte header hit bogus 1002). Rule: slice to `need-got`; decode() grows the window instead of erroring; probe received upgrade bytes with a raw net server before trusting any handshake claim.
+
+### [Principle] D31 — Shared-buffer accumulators need a FLOOR + terminal latch
+Dot-segment pops that truncate the whole href wiped the authority ("https:///b"); pass path_start as floor and search only `out[floor..]`. Suppress an emitted separator ONLY for `.`/`..` components (empty segments must keep Node's `//b`) using THIS component's dot flag, not a lagging just_popped var. After a clean Close/`fail` deregisters a socket the pump must EXIT via registry-absence (`socket_gone()`), else EOF emits a second unclean event (reason "" overwrote "done" in the drain).
+
+### [Insight] D32 — Node WHATWG URL oracles repeatedly killed guessed behavior
+Measured truth: relative `""`/`"#y"` KEEP base query (base fragment dropped); `%` escapes stay VERBATIM everywhere incl malformed `%zz`/`%7g` (no re-encode); hostname keeps `[::1]` brackets; `.port` span = DIGITS ONLY while `.host` borrows contiguous host.start..port.end; `u:@h` -> `u@h`; base64("foobar")=`Zm9vYmFy` (openssl hand-copy was wrong twice); rquickjs natives with `Opt<String>` REJECT a null base -> take `Value` args and read `as_string()`; run Node probes BEFORE embedding expectations.
+
+### [Note] Cross-check — D13 realm gap OBSOLETE after Phase 11; D15 still sound
+cz-js now exposes URL/URLSearchParams/TextDecoder/WebSocket globally (probe rc=0), so pure-JS splitUrl()/utf8Decode() fallbacks remain only for cross-realm shared ESM (Node side); absolute-spec/temp-dir + kv semantics parts of D13/D17 unchanged; D15 tape scalar-passthrough conclusion unaffected (workspace tests green post-Phase-11).
