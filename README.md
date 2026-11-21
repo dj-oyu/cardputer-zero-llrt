@@ -16,10 +16,13 @@ Tailscale from a phone/laptop, serving static HTML through minimal `node:fs`.
 | `cz-modules` | JS module bindings: `cardputer:display`, `cardputer:input`, `cardputer:app`, `cardputer:power`, `node:http`, `node:fs`, global `fetch()` (Phase 8A) |
 | `cz-net` | Shared TLS foundation (`rustls` + `ring`, system roots via `rustls-native-certs`) and the sync-threaded HTTP/1.1 `fetch` engine on `ureq` v3 |
 | `cz-runner` | `cz-js` CLI: resolver, Node-compatible timers, event loop (top-level await pumps fetch safely) |
+| `cz-zpm` | Tokio-free native package pipeline on `ureq` v3 via `cz-net` (system-CA TLS, SRI-first staging, zip-slip/native-addon guards); multicall `zpm`/`npm` dispatch inside `cz-js` (Phase 14) |
 
 ```bash
 cargo build --release                 # target/release/cz-js
 ./target/release/cz-js server.mjs     # run a bundler-free HTTP server
+ln -s cz-js target/release/zpm         # multicall: zpm/npm via argv0; node <script|-e> still runs JS
+./target/release/cz-js zpm install hono    # registry install (also: npm install …)
 ```
 
 ## Module surface
@@ -75,7 +78,7 @@ uses a poll-based accept loop plus one reader thread per connection:
 ## Verification
 
 ```bash
-cargo test --workspace          # 262 Rust unit/integration tests (13 gfx + 126 hal + 29 json + 48 modules + 2 net + 24 net-engine + 10 runner + 28 zpm)
+cargo test --workspace          # 390 Rust unit/integration tests, all green under -D warnings (--test-threads=1 in gates)
 RUSTFLAGS="-D warnings" cargo check --workspace --all-targets   # zero-warning gate
 bash /refs/verify/check_integrity.sh    # anti-cheat / Phase 1 file integrity
 bash /refs/verify/check_rust_p2.sh      # >=75 tests, -D warnings
