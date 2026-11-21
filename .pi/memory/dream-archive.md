@@ -59,3 +59,21 @@ Extending a previous header value span in-place for obs-fold continuation MUST t
 
 ### [Principle] D29 — Linear-cursor + vectored-TX test/wire rules
 Linear input cursor (flat Vec<u8> + read_pos, compact ONLY on full drain or when append cannot fit capacity): assert parser cursor state ONLY from literal fixture byte lengths — Vec growth capacity is unspecified, so capacity-heuristic assertions are nondeterministic (use explicit buf = Vec::with_capacity(32) in compaction-rule tests); mid-request FULL consumption resets cursor+buffer to (0,0) via consume(), making stale NeedMore-state asserts lie. Zero-body-copy TX: never pass a leading zero-length IoSlice element into write_vectored, retry via ONE global byte offset mapped onto (head,body) slices (works for both writev coalescing and std's default sequential per-buffer fallback on TLS sessions), and flush ONCE at the end => wire bytes identical to combined encode()+write_all_eof_free. Obs-fold span growth keeps dup-join Cow::Owned only for genuine duplicates; single values borrow Cow::Borrowed even across folds after separator retraction.
+
+### [Principle] D30 (archive) — Frame header accumulation exactness
+`raw[got..]` over-read 12 spare payload bytes after a 2-byte header -> tail dropped, auto-Pong never written; low==126/127 returned false at got<4/10 -> bogus 1002. Fixed: slice `raw[got..need]`, decode() sets need=4/10 and pump CONTINUES. Raw net-server byte dump proved the handshake head was already RFC-correct (GET path, Host, Upgrade, Connection, Key, Version) — trust byte probes, not assumptions.
+
+### [Principle] D31 (archive) — Accumulator floors + terminal latch in shared href buffers
+pop_last_segment truncating whole href erased authority ("https:///b"); floor=path_start, rposition on out[floor..]. Separator suppression keyed on THIS component's dot flag (matches_dot2/is_dot(comp,1)) and only when out ends '/' — empty segments still emit '/' (Node keeps "//b"). lagging just_popped var gave wrong suppression. socket_gone() registry-absence exit after Close/fail prevents EOF emitting a second unclean Close event (reason "" overwrote "done").
+
+### [Insight] D32 (archive) — Node v22 WHATWG oracle specifics for URL parsers
+Relative ""/#y keep base query (base fragment dropped); "?x" replaces query clears fragment; malformed % sequences (%zz/%7g/lone %) kept VERBATIM everywhere incl paths; hostname keeps IPv6 brackets; .port digits-only while .host slices host.start..port.end contiguous (colon inside); default-port elision http/ws 80 https/wss 443; file: allows empty host; `u:@h`->`u@h`; password-only `:pw@h` kept; sub_delims MUST include '&'; scheme validation first-char alpha; empty reference legal ONLY with base; base64("foobar")=Zm9vYmFy (two hand-written vectors were wrong).
+
+### [Principle] D38 (archive) — Orderly test-server teardown + tolerant assertions
+Server sent Close then returned -> unread client Close bytes -> TCP RST -> client unclean "closed unexpectedly"; drain frames until Close/EOF bounded, shutdown(Write), sleep ~120ms before join. RFC 6455 §5.2/§7.1.1: Pong may interleave with data and the closing handshake, so collect-until-invariants instead of positional asserts (control-first worker pump made "frame#2=PONG" race; TEXT sometimes arrived after PONG).
+
+### [Note] D33/D40/D41 merge facts (archive)
+Phase 11 purity gates read cz-hal/Cargo.toml (word-boundary regex) + cz-net/Cargo.toml (`^\s*name\s*=`) only — 4 banned names in ws.rs comments/tests pass today but would trip a raw-source assert. URLSearchParams reuse gated by globals().get existence + fallback shim when fetch absent; node:url exports MUST be the SAME global objects (identity gate); live searchParams refreshed IN PLACE via _pairs swap (throwaway instance copies pairs) with wrapped original prototype methods flushing upward; binaryType arraybuffer default maps Uint8Array->.buffer view (zero copy move preserved).
+
+### [Note] Lock topology proof (archive)
+cz_net::ws: sockets()/events() are separate std Mutexes; every function holds ONE at a time (closed() push_event THEN deregister; control_tx_of clones Sender outside guard before send; terminate uses wake_slot clone). notify_event_loop Waker = third independent flag+condvar+mutex (cz-hal/src/http_server.rs:271-290), never acquires registries -> no cycle even while events lock held.
