@@ -7,24 +7,24 @@
       "weight": 10
     },
     {
-      "name": "phase10-alloc-audit",
-      "command": "node /refs/phase10/verify_phase10_final.mjs",
-      "weight": 35
+      "name": "phase11-url-websocket-e2e",
+      "command": "node /refs/phase11/verify_phase11.mjs",
+      "weight": 45
     },
     {
-      "name": "phase9a-aws-emulator-e2e",
-      "command": "node /refs/phase9a/verify_phase9a_aws.mjs",
+      "name": "phase10-alloc-audit-regression",
+      "command": "node /refs/phase10/verify_phase10_final.mjs",
       "weight": 20
     },
     {
       "name": "phase8abc-net-tls-regression",
       "command": "node /refs/phase8a/verify_phase8a.mjs && node /refs/phase8b/verify_phase8b.mjs && node /refs/phase8c/verify_phase8c.mjs",
-      "weight": 20
+      "weight": 15
     },
     {
       "name": "rust-workspace-tests-all",
       "command": "RUSTFLAGS=\"-D warnings\" cargo test --workspace -- --test-threads=1",
-      "weight": 15
+      "weight": 10
     }
   ]
 }
