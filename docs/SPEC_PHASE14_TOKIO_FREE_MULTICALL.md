@@ -106,3 +106,35 @@ and `zpm install hono` against that helper exits 0 producing the authentic
 **Requested host fix (host-owned `/refs`, agent cannot touch):** serve the fixtures from a
 helper subprocess BEFORE entering `spawnSync` (or switch steps 3–4 to async `spawn` like
 phase7b/phase12). No verifier weakenings: same fixtures, same assertions.
+
+### 5.2 Ready-made host remediation snippet (minimal, assertion-identical)
+
+The ONLY change needed is moving fixture serving out of the blocked main thread. Drop-in
+pattern for `/refs/phase14/verify_phase14.mjs` (same routes, same fixture bytes, same
+assertions — strictly a plumbing move, zero relaxations):
+
+```js
+// Spawn a fixture helper subprocess (its own event loop answers while main thread blocks):
+const helperSrc = `
+import http from "node:http"; import fs from "node:fs";
+const tgz = fs.readFileSync("/refs/fixtures/zpm/hono-4.13.19.tgz");
+const metaRaw = fs.readFileSync("/refs/fixtures/zpm/hono-meta.json", "utf8");
+let base = "";
+const s = http.createServer((req, res) => {
+  if (req.url === "/hono") { res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(metaRaw.replaceAll("__REGISTRY_BASE__", base)); return; }
+  if (req.url === "/hono/-/hono-4.13.19.tgz") { res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    res.end(tgz); return; }
+  res.writeHead(404); res.end("not found");
+});
+s.listen(0, "127.0.0.1", () => { base = "http://127.0.0.1:" + s.address().port;
+  fs.writeFileSync(process.env.REG_PORT_FILE || "/tmp/regport.txt", base); });
+`;
+const helper = spawn(process.execPath, ["-e", helperSrc], { stdio: "ignore", env: process.env });
+// wait for the port file, then use it as regBase for the runSync steps:
+regBase = "http://" + fs.readFileSync("/tmp/regport.txt", "utf8");
+// ... existing runSync(install/run) UNCHANGED ... finally: helper.kill("SIGKILL") after rm -rf tmp.
+```
+
+Equivalent alternative: replace `runSync` with an async `spawn` wrapper exactly like phase7b's
+`runAsync` (already proven shape in this container).
