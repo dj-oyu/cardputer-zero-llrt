@@ -14,7 +14,7 @@ RAIIstagingBEFOREwrites;commitsame-dirtemp+fs::rename;verify+sizecapsBEFOREextra
 CountsdecrementatEVERYterminalpoint;countsINCLUDElisteners->closeserversFIRSTthenpollzero;stop-flagbeforejoin;hang->inspectlive-id/listenerregistry..
 
 ### [Principle] D5 = D11 = D21 = D23 — Harness discipline: standalone reproduce, verifier trust
-ReproSTANDALONEBEFOREfix;lockedverifier=groundtruthNEVERweakenchecks | memoryconsolidationmath:draftADDSfirst,awkLINEBYTES(charcount!=bytes),iterateto<=cap..
+ReproSTANDALONEBEFOREfix;lockedverifier=groundtruthNEVERweakenchecks;re-ground AFTER final edit even docs-only | memoryconsolidationmath:draftADDSfirst,awkLINEBYTES(charcount!=bytes),iterateto<=cap | recall snapshots can lag LIVE dream.md-diffagainstlivebefore"fixing"phantomdrift..
 
 ### [Insight] D6 = D19 — rquickjs API + zero-copy buffer idioms
 ValuenoDisplay->Coerced::<String>::from_js;globals().setneedsOUTER?;throwException::throw_message/Error::Io(io::Error::other);Canvasas_le_bytescfg(LE)-gatedw/BEfallback;fbmock:parentdirEXISTSelseNotFound;Rest<Value>=VARIADICnotRest<Vec>;with(nonResultT)->BARETnounwrap..
@@ -35,7 +35,7 @@ SQSJSONprotoALWAYSPOSTROOT'/':pathstyle->QueueDoesNotExist;ConditionalCheckFaile
 NodeoraclesBEFOREembeddingvectors/rasters(hand-writtenwerewrong).ringhmac::sign(&Key,data)NOTtag(),digest()->Digest.as_ref().Opt<Value>explicitundefinedseesSome(undefined-value)->is_undefined()..
 
 ### [Dead End] D15 = D35 — cz-json tape zero-span scalars break passthrough
-KIND_BOOL/KIND_NULLspan(0,0)->EMPTYrawslice->passthroughemitsNOTHING->invalidJSON;containersfineuntilparentdirtied.Renderscalarsfromtaggedtape.scalar(),stringscopyescapedrawspan;A/BHEAD-vs-patchedSAMEscriptisolatespre-existingbugs;tempprobethenDELETE..
+KIND_BOOL/KIND_NULLspan(0,0)->EMPTYrawslice->passthroughemitsNOTHING->invalidJSON;renderscalarsviataggedtape.scalar();A/BHEAD-vs-PATCHSAMEscriptisolatespre-existingbugs;tempprobeDELETEafter..
 
 ### [Principle] D16 — Lazy CoW transparency + non-reentrant edits-mutex recurs
 MaterializeONLYwhileWHOLEdocis_clean()elseProxydetachesnestedwrites;is_cleanfastpathBEFORElocking;under-guardrefsNOTVecclones;DROPMutexGuardBEFORErecursion(samemutexre-lock=DEADLOCK)..
@@ -53,7 +53,7 @@ JSstringbuiltINSIDEwith_borrowed_byteslegal(alloc!=JSexec;argrootedonJSstack)->v
 ..
 
 ### [Insight] D27 — Span-backed head: retract the fold separator first
-obs-foldin-placevalue-spangrowthMUSTtruncatethejust-emitted`\r\n`BEFORE""+trimelsespanswallowsCRLF("one\r\nfolded"vslegacy"onefolded");ends_withguardidempotent;restoreseparatoratnextfieldbegin;legacyjoinfixtures=exactbyteoracle..
+obs-foldin-placevalue-spangrowthMUSTretractthejust-emitted`\r\n`BEFOREappendingtrimmedcontinuationelsespanswallowsCRLF;restoresparatoratnextfieldbegin;fixtures=exactbyteoracle..
 
 ### [Dead End] D28 = D33 — Structural greps scan raw text; comments trip banned-lit
 /refsstructuralassertsregexRAWfiletext->bannedliteraleveninsideanexplanatorycommentFAILScleancode;rewordw/opattern("noname->valuesmap/novaluevectors");grep-npinpointsfast..
