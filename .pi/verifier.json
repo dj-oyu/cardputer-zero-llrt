@@ -7,19 +7,24 @@
       "weight": 10
     },
     {
-      "name": "phase8a-fetch-tls-e2e",
+      "name": "phase8b-https-server-e2e",
+      "command": "node /refs/phase8b/verify_phase8b.mjs",
+      "weight": 45
+    },
+    {
+      "name": "phase8a-fetch-tls-regression",
       "command": "node /refs/phase8a/verify_phase8a.mjs",
-      "weight": 50
+      "weight": 20
     },
     {
       "name": "rust-workspace-tests-no-regression",
       "command": "RUSTFLAGS=\"-D warnings\" cargo test --workspace -- --test-threads=1",
-      "weight": 25
+      "weight": 15
     },
     {
       "name": "phase2-http-e2e-regression",
       "command": "bash /refs/verify/check_e2e_p2.sh",
-      "weight": 15
+      "weight": 10
     }
   ]
 }
