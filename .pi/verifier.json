@@ -7,8 +7,8 @@
       "weight": 10
     },
     {
-      "name": "phase10a-lightweight-harness",
-      "command": "node /refs/phase10/verify_phase10.mjs --phase=10a",
+      "name": "phase10b-lightweight-harness",
+      "command": "node /refs/phase10/verify_phase10.mjs --phase=10b",
       "weight": 45
     },
     {
@@ -17,8 +17,8 @@
       "weight": 25
     },
     {
-      "name": "phase3a-5-kv-json-regression",
-      "command": "bash /refs/verify/check_e2e_p3a.sh && bash /refs/verify/check_e2e_p5.sh",
+      "name": "phase1-display-e2e-regression",
+      "command": "bash /refs/verify/check_e2e.sh",
       "weight": 20
     }
   ]
