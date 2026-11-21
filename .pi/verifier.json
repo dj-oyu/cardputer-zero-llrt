@@ -7,8 +7,8 @@
       "weight": 10
     },
     {
-      "name": "phase10c-lightweight-harness",
-      "command": "node /refs/phase10/verify_phase10.mjs --phase=10c",
+      "name": "phase10d-lightweight-harness",
+      "command": "node /refs/phase10/verify_phase10.mjs --phase=10d",
       "weight": 45
     },
     {
@@ -17,8 +17,8 @@
       "weight": 20
     },
     {
-      "name": "phase8a-8c-net-regression",
-      "command": "node /refs/phase8a/verify_phase8a.mjs && node /refs/phase8c/verify_phase8c.mjs",
+      "name": "phase2-8b-http-https-regression",
+      "command": "bash /refs/verify/check_e2e_p2.sh && node /refs/phase8b/verify_phase8b.mjs",
       "weight": 25
     }
   ]
