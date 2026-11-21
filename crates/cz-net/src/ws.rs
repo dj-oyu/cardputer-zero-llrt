@@ -42,8 +42,10 @@ pub const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Worker thread stack budget (same 256 KiB shape as Phase 8A fetch workers).
 pub const WS_WORKER_STACK_BYTES: usize = 256 * 1024;
 
-/// Hard ceiling for one inbound frame payload, so a hostile peer cannot force unbounded growth.
+/// Hard ceiling for one inbound frame payload AND cumulative fragmented message size,
+/// so a hostile peer cannot force unbounded growth on 512 MB RAM.
 pub const WS_MAX_FRAME: usize = 16 * 1024 * 1024;
+const WS_MAX_MESSAGE: usize = WS_MAX_FRAME;
 
 /// Control-channel slice on blocking sockets (Phase 8C idiom): reads wake at least this often.
 const IO_SLICE: Duration = Duration::from_millis(20);
@@ -246,7 +248,7 @@ pub fn ws_connect(
             buffered: Arc::new(AtomicUsize::new(0)),
         },
     );
-    Builder::new()
+    if let Err(e) = Builder::new()
         .name(format!("cz-ws-{ws_id}"))
         .stack_size(WS_WORKER_STACK_BYTES)
         .spawn(move || {
@@ -264,7 +266,10 @@ pub fn ws_connect(
                 wake_slot,
             )
         })
-        .map_err(|e| format!("cannot spawn WebSocket worker: {e}"))?;
+    {
+        deregister(ws_id);
+        return Err(format!("cannot spawn WebSocket worker: {e}"));
+    }
     Ok(ws_id)
 }
 
@@ -727,7 +732,12 @@ fn build_tls_session(
         match conn.complete_io(&mut tcp) {
             Ok(_) => {}
             Err(e)
-                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
             {
                 if Instant::now() > deadline {
                     fail(ws_id, "WebSocket TLS error: handshake timed out".to_string());
@@ -809,16 +819,25 @@ impl InFrame {
         }
     }
 
-    /// Resolve a fully received header into fields (mask key included). False when malformed.
+    /// Resolve a fully received header into fields. False when malformed or when an extended
+    /// length needs more header bytes (`self.need > self.got` with `!self.decoded`).
     fn decode(&mut self) -> bool {
         let b0 = self.raw[0];
         let b1 = self.raw[1];
         self.fin = (b0 & 0x80) != 0;
         self.opcode = b0 & 0x0F;
         self.masked = (b1 & 0x80) != 0;
-        // Server frames are never masked, but we accept either shape defensively.
+        // RFC 6455 §5.1: servers MUST NOT mask frames sent to a client. Reject immediately
+        // before attempting any payload/mask read (and never touch uninitialized `raw` bytes).
+        if self.masked {
+            return false;
+        }
         let low = b1 & 0x7F;
-        let base = if low < 126 {
+        // RFC 6455 §5.5: control frames (opcode >= 0x8) MUST NOT be fragmented and MUST have <=125B payload.
+        if (self.opcode & 0x08) != 0 && (!self.fin || low >= 126) {
+            return false;
+        }
+        let _base = if low < 126 {
             self.len = low as usize;
             2
         } else if low == 126 {
@@ -851,11 +870,7 @@ impl InFrame {
             self.len = wide as usize;
             10
         };
-        let key_at = base;
-        self.need = base + if self.masked { 4 } else { 0 };
-        if self.masked {
-            self.key.copy_from_slice(&self.raw[key_at..key_at + 4]);
-        }
+        self.need = _base;
         self.decoded = true;
         true
     }
@@ -938,7 +953,12 @@ fn run_frames(
                     }
                     reply.clear();
                     reply.extend_from_slice(&code.to_be_bytes());
-                    reply.extend_from_slice(reason.as_bytes());
+                    // RFC 6455 §5.5: Close control payload <= 125 bytes -> reason <= 123 bytes.
+                    let mut r_end = reason.len().min(123);
+                    while r_end > 0 && !reason.is_char_boundary(r_end) {
+                        r_end -= 1;
+                    }
+                    reply.extend_from_slice(&reason.as_bytes()[..r_end]);
                     let mut key = [0u8; 4];
                     rng.fill(&mut key[..]).ok();
                     let rlen = reply.len();
@@ -1026,7 +1046,9 @@ fn run_frames(
                     return;
                 }
                 Err(e) if retryable(&e) => {
-                    check_close_deadline(ws_id, close_deadline, we_sent_close, sent_code, session);
+                    if check_close_deadline(ws_id, close_deadline, we_sent_close, sent_code, session) {
+                        return;
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -1060,7 +1082,9 @@ fn run_frames(
                     return;
                 }
                 Err(e) if retryable(&e) => {
-                    check_close_deadline(ws_id, close_deadline, we_sent_close, sent_code, session);
+                    if check_close_deadline(ws_id, close_deadline, we_sent_close, sent_code, session) {
+                        return;
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -1086,7 +1110,7 @@ fn run_frames(
                 if masked {
                     apply_mask_in_place(&mut owned[..len], key);
                 }
-                deliver_owned(ws_id, &mut frag, fin, op, owned);
+                deliver_owned(ws_id, &mut frag, session, fin, op, owned);
             } else {
                 if masked {
                     apply_mask_in_place(&mut scratch[..len], key);
@@ -1132,16 +1156,18 @@ fn check_close_deadline(
     we_sent_close: bool,
     sent_code: u16,
     session: &mut Session,
-) {
+) -> bool {
     if we_sent_close {
         if let Some(dl) = deadline {
             if Instant::now() > dl {
                 // Our Close left the socket but the peer never echoed one: unclean, still finished.
                 session.shutdown_hard();
                 closed(ws_id, sent_code, String::new(), false);
+                return true;
             }
         }
     }
+    false
 }
 
 /// Deliver a whole (unfragmented) DATA frame whose payload buffer was read directly into its final
@@ -1150,22 +1176,45 @@ fn check_close_deadline(
 fn deliver_owned(
     ws_id: u64,
     frag: &mut Option<(u8, Vec<u8>)>,
+    session: &mut Session,
     fin: bool,
     opcode: u8,
     payload: Vec<u8>,
 ) {
     if !fin {
+        if frag.is_some() {
+            send_close_and_finish(ws_id, session, 1002);
+            return;
+        }
+        if payload.len() > WS_MAX_MESSAGE {
+            send_close_and_finish(ws_id, session, 1009);
+            return;
+        }
         // First piece of a fragmented message keeps its own buffer (still zero copies).
         *frag = Some((opcode, payload));
         return;
     }
     match frag.take() {
         Some((first_op, mut acc)) => {
+            if opcode != OP_CONT {
+                send_close_and_finish(ws_id, session, 1002);
+                return;
+            }
+            if acc.len().saturating_add(payload.len()) > WS_MAX_MESSAGE {
+                send_close_and_finish(ws_id, session, 1009);
+                return;
+            }
             // Only continuation pieces ever copy, and only once into the merged buffer.
             acc.extend_from_slice(&payload);
             dispatch_message(ws_id, first_op, acc);
         }
-        None => dispatch_message(ws_id, opcode, payload),
+        None => {
+            if opcode == OP_CONT {
+                send_close_and_finish(ws_id, session, 1002);
+                return;
+            }
+            dispatch_message(ws_id, opcode, payload);
+        }
     }
 }
 
@@ -1183,10 +1232,13 @@ fn deliver_slice(
     payload: &[u8],
 ) {
     match opcode {
-        OP_TEXT | OP_BINARY | OP_CONT => {
-            // A data frame reaching this path means fragmentation is already in progress
-            // (`deliver_owned` claims unfragmented messages), so append then merge on `fin`.
+        OP_CONT => {
             if let Some((op, acc)) = frag.as_mut() {
+                if acc.len().saturating_add(payload.len()) > WS_MAX_MESSAGE {
+                    *frag = None;
+                    send_close_and_finish(ws_id, session, 1009);
+                    return;
+                }
                 acc.extend_from_slice(payload);
                 if fin {
                     let merged = std::mem::replace(acc, Vec::new());
@@ -1194,27 +1246,46 @@ fn deliver_slice(
                     *frag = None;
                     dispatch_message(ws_id, op, merged);
                 }
-            } else if !fin {
-                // Continuation-in-progress that somehow started without an owner: adopt a copy.
-                *frag = Some((if opcode == OP_CONT { OP_TEXT } else { opcode }, payload.to_vec()));
-            } else if opcode == OP_CONT {
-                // Unsolicited continuation with no message in flight -> 1002 Protocol Error.
+            } else {
+                // Unsolicited continuation (FIN=0 or FIN=1) with no fragmented message in flight -> 1002.
                 send_close_and_finish(ws_id, session, 1002);
+            }
+        }
+        OP_TEXT | OP_BINARY => {
+            if frag.is_some() {
+                // RFC 6455 §5.4: a new data frame cannot interleave before the fragmented message ends.
+                send_close_and_finish(ws_id, session, 1002);
+                return;
+            }
+            if !fin {
+                if payload.len() > WS_MAX_MESSAGE {
+                    send_close_and_finish(ws_id, session, 1009);
+                    return;
+                }
+                *frag = Some((opcode, payload.to_vec()));
             } else {
                 dispatch_message(ws_id, opcode, payload.to_vec());
             }
         }
         OP_PING => {
-            // RFC 6455 §5.5: every Ping gets an automatic Pong echoing its payload verbatim.
-            write_masked_frame(session, rng, reply, OP_PONG, payload);
-        }
-        OP_PONG => { /* the peer answering our auto-Pong: nothing to surface to JavaScript */ }
-        OP_CLOSE => {
-            let (code, reason) = parse_close_payload(payload);
-            if !fin {
+            if !fin || payload.len() > 125 {
                 send_close_and_finish(ws_id, session, 1002);
                 return;
             }
+            // RFC 6455 §5.5: every Ping gets an automatic Pong echoing its payload verbatim.
+            write_masked_frame(session, rng, reply, OP_PONG, payload);
+        }
+        OP_PONG => {
+            if !fin || payload.len() > 125 {
+                send_close_and_finish(ws_id, session, 1002);
+            }
+        }
+        OP_CLOSE => {
+            if !fin || payload.len() > 125 {
+                send_close_and_finish(ws_id, session, 1002);
+                return;
+            }
+            let (code, reason) = parse_close_payload(payload);
             if !*we_sent_close {
                 // Peer initiated the handshake: answer with our Close frame (echoing a valid code).
                 let reply_code = if code == 0 || code == 1005 || code == 1006 || code == 1015 {
@@ -1795,5 +1866,93 @@ mod ws_tests {
             apply_mask_in_place(&mut payload, key);
         }
         Ok((opcode, payload))
+    }
+
+    #[test]
+    fn masked_server_frame_and_oversized_or_fragmented_control_frames_fail_with_1002() {
+        let mut f = InFrame::new();
+        f.raw[0] = 0x81;
+        f.raw[1] = 0x85; // masked bit set from server
+        f.got = 2;
+        assert!(!f.decode());
+        assert!(!f.decoded);
+        assert_eq!(f.need, 2, "must fail immediately without expanding need for mask bytes");
+
+        let mut f_ping_big = InFrame::new();
+        f_ping_big.raw[0] = 0x89; // FIN + OP_PING
+        f_ping_big.raw[1] = 126; // > 125 bytes
+        f_ping_big.got = 2;
+        assert!(!f_ping_big.decode());
+
+        let mut f_ping_frag = InFrame::new();
+        f_ping_frag.raw[0] = 0x09; // FIN=0 + OP_PING
+        f_ping_frag.raw[1] = 0;
+        f_ping_frag.got = 2;
+        assert!(!f_ping_frag.decode());
+    }
+
+    #[test]
+    fn silent_peer_after_close_handshake_emits_single_close_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ws test server");
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            while find_crlf_crlf(&acc).is_none() {
+                match sock.read(&mut buf[..]) {
+                    Ok(n) if n > 0 => acc.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+            }
+            let text = String::from_utf8_lossy(&acc[..find_crlf_crlf(&acc).unwrap()]).into_owned();
+            let key = text
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("sec-websocket-key:"))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                .unwrap();
+            let mut expect = [0u8; 32];
+            let n = accept_hash(key.as_bytes(), &mut expect);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                std::str::from_utf8(&expect[..n]).unwrap()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            // Intentionally hold socket open silently and never echo Close.
+            std::thread::sleep(Duration::from_millis(2600));
+        });
+
+        let id = ws_connect(&format!("ws://127.0.0.1:{port}/silent"), Vec::new(), TlsClientOptions::default())
+            .expect("connect");
+        let mut close_count = 0usize;
+        let mut sent_close = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            while let Some(ev) = next_ws_event() {
+                match ev {
+                    WsEngineEvent::Open { ws_id, .. } if ws_id == id => {
+                        close_ws(id, 1000, "bye".to_string());
+                        sent_close = true;
+                    }
+                    WsEngineEvent::Close { ws_id, .. } if ws_id == id => {
+                        close_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if sent_close && close_count > 0 && ws_active_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Wait briefly to confirm no second Close event arrives.
+        std::thread::sleep(Duration::from_millis(120));
+        while let Some(ev) = next_ws_event() {
+            if matches!(ev, WsEngineEvent::Close { ws_id, .. } if ws_id == id) {
+                close_count += 1;
+            }
+        }
+        srv.join().ok();
+        assert_eq!(close_count, 1, "must emit exactly one Close event after close deadline");
     }
 }

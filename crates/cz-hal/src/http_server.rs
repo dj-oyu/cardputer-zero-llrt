@@ -121,6 +121,8 @@ impl ConnStream for Box<dyn ConnStream> {
 
 /// Read size used while pulling bytes off a connection.
 const READ_CHUNK: usize = 8 * 1024;
+/// Per-connection worker thread stack budget (matches `cz-net`'s 256 KiB workers for 512 MB RAM).
+const CONN_STACK_BYTES: usize = 256 * 1024;
 /// Poll slice used by the accept loop (bounded stop latency, low idle CPU).
 const ACCEPT_POLL_MS: i32 = 20;
 /// Wall-clock budget for JavaScript to answer one request; a hung handler is answered `500` and
@@ -601,7 +603,11 @@ fn accept_loop(
                     );
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => break,
-                Err(_) => return,
+                Err(_) => {
+                    // Transient accept errors (ECONNABORTED, EMFILE, ENFILE) must not kill the server.
+                    std::thread::sleep(Duration::from_millis(5));
+                    break;
+                }
             }
         }
     }
@@ -618,8 +624,9 @@ fn spawn_connection(
     acceptor: Option<StreamAcceptor>,
 ) {
     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
-    std::thread::Builder::new()
+    if std::thread::Builder::new()
         .name(format!("cz-http-conn-{conn_id}"))
+        .stack_size(CONN_STACK_BYTES)
         // Intentionally detached: `server.close()` may leave clients mid-flight, and the process
         // exits once every server closed; stray threads must not block shutdown.
         .spawn(move || {
@@ -786,6 +793,7 @@ fn spawn_connection(
                         }
                         ReplyOutcome::Closed => {
                             DIAG_CHAN_GONE_EXITS.fetch_add(1, Ordering::SeqCst);
+                            mark_client_closed(conn_id);
                             // JS dropped the response object without finalizing it.
                             if !streaming {
                                 let body = ResponseFrame::error(500, "request handler did not respond", false);
@@ -803,11 +811,10 @@ fn spawn_connection(
                                 return;
                             }
                             if Instant::now() >= deadline {
-                                if streaming {
-                                    // A wedged streamer must not hold the socket hostage: end it
-                                    // and fire the disconnect path so JS cleans up.
-                                    mark_client_closed(conn_id);
-                                } else {
+                                // Both streaming and unanswered non-streaming timeouts must clean up
+                                // JS links and Rust reply/stream state.
+                                mark_client_closed(conn_id);
+                                if !streaming {
                                     let body =
                                         ResponseFrame::error(500, "request handler did not respond", false);
                                     let _ = write_all_eof_free(&mut conn, &body.encode());
@@ -820,7 +827,11 @@ fn spawn_connection(
                 }
             }
         })
-        .ok(); // thread creation failure merely drops (closes) the socket
+        .is_err()
+    {
+        // Thread creation failure drops the socket and restores connection accounting.
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct ConnectionGuard;

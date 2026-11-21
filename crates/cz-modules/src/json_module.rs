@@ -934,8 +934,23 @@ fn walk_json<'js>(
             (rquickjs::qjs::JS_GPN_STRING_MASK | rquickjs::qjs::JS_GPN_ENUM_ONLY) as i32,
         ) == 0
         {
+            struct PropEnumGuard {
+                q: *mut rquickjs::qjs::JSContext,
+                tab: *mut rquickjs::qjs::JSPropertyEnum,
+                len: u32,
+            }
+            impl Drop for PropEnumGuard {
+                fn drop(&mut self) {
+                    if !self.tab.is_null() {
+                        unsafe {
+                            rquickjs::qjs::JS_FreePropertyEnum(self.q, self.tab, self.len);
+                        }
+                    }
+                }
+            }
+            let enum_guard = PropEnumGuard { q, tab, len };
             if len == 0 {
-                rquickjs::qjs::JS_FreePropertyEnum(q, tab, len);
+                drop(enum_guard);
                 // Nested cardputer:kv row handles are Proxies over an empty target (len == 0).
                 // Checking kv_row_tag only here keeps 0% overhead on plain non-empty objects.
                 if let Some((store, key)) = kv_row_tag(ctx, v)? {
@@ -952,15 +967,30 @@ fn walk_json<'js>(
             for i in 0..len {
                 let pe = &*tab.add(i as usize);
                 let mut desc: rquickjs::qjs::JSPropertyDescriptor = std::mem::zeroed();
-                if rquickjs::qjs::JS_GetOwnProperty(q, &mut desc, obj_raw, pe.atom) != 1 {
+                let rc = rquickjs::qjs::JS_GetOwnProperty(q, &mut desc, obj_raw, pe.atom);
+                if rc < 0 {
+                    return Err(rquickjs::Error::Exception);
+                }
+                if rc == 0 {
                     continue;
                 }
-                // NORMAL (non GETSET/ref) data properties only; getset needs JS-side invocation.
-                if desc.flags & 0x30 != 0 {
+                let val = if desc.flags & 0x30 != 0 {
+                    // GETSET / VARREF / AUTOINIT: free descriptor refs (including getter/setter)
+                    // and evaluate the property via JS_GetProperty so getters serialize cleanly.
                     rquickjs::qjs::JS_FreeValue(q, desc.value);
-                    continue;
-                }
-                let val = Value::from_raw(ctx.clone(), desc.value);
+                    rquickjs::qjs::JS_FreeValue(q, desc.getter);
+                    rquickjs::qjs::JS_FreeValue(q, desc.setter);
+                    let raw_val = rquickjs::qjs::JS_GetProperty(q, obj_raw, pe.atom);
+                    if rquickjs::qjs::JS_IsException(raw_val) {
+                        rquickjs::qjs::JS_FreeValue(q, raw_val);
+                        return Err(rquickjs::Error::Exception);
+                    }
+                    Value::from_raw(ctx.clone(), raw_val)
+                } else {
+                    rquickjs::qjs::JS_FreeValue(q, desc.getter);
+                    rquickjs::qjs::JS_FreeValue(q, desc.setter);
+                    Value::from_raw(ctx.clone(), desc.value)
+                };
                 if val.is_undefined() || val.is_function() || val.is_symbol() {
                     continue; // ECMA: object members with these types vanish
                 }
@@ -978,7 +1008,7 @@ fn walk_json<'js>(
                 out.push(b':');
                 walk_json(ctx, &val, out, stack, depth + 1)?;
             }
-            rquickjs::qjs::JS_FreePropertyEnum(q, tab, len);
+            drop(enum_guard);
             out.push(b'}');
             stack.pop();
             return Ok(());
@@ -1258,6 +1288,27 @@ mod json_module_tests {
                 "#
             ),
             "BYTES_PARSE_OK"
+        );
+    }
+
+    #[test]
+    fn stringify_getters_and_circular_error_leave_runtime_clean_on_drop() {
+        assert_eq!(
+            run_with_json(
+                r#"
+                const obj = { a: 1, get b() { return "hi"; }, get skip() { return undefined; } };
+                if (JSON.stringify(obj) !== '{"a":1,"b":"hi"}') {
+                    throw new Error("getter mismatch: " + JSON.stringify(obj));
+                }
+                const cyc = { x: 1, get boom() { return 2; } };
+                cyc.self = cyc;
+                let threw = false;
+                try { JSON.stringify(cyc); } catch (e) { threw = e instanceof TypeError; }
+                if (!threw) throw new Error("circular inside getter object must throw");
+                globalThis.__R = "GETTER_AND_CLEAN_DROP_OK";
+                "#
+            ),
+            "GETTER_AND_CLEAN_DROP_OK"
         );
     }
 }

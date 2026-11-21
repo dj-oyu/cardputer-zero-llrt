@@ -217,14 +217,31 @@ impl RequestHead {
             .any(|v| contains_ascii_ignore_case(v, "chunked"))
     }
 
-    /// Declared `Content-Length` when present and numeric.
+    /// Declared `Content-Length` when present and numeric (legacy non-failing lookup).
     pub fn content_length(&self) -> Option<u64> {
+        self.checked_content_length().ok().flatten()
+    }
+
+    /// Strict RFC 9112 `Content-Length` parsing: rejects duplicate, non-digit, or overflowing
+    /// `Content-Length` headers as `400 Bad Request` so they never fall back to `Length(0)`.
+    pub fn checked_content_length(&self) -> Result<Option<u64>, HttpError> {
         let mut vals = self.header_values("content-length");
-        let first = vals.next()?;
+        let Some(first) = vals.next() else {
+            return Ok(None);
+        };
         if vals.next().is_some() {
-            return None;
+            return Err(HttpError::BadRequest("duplicate content-length header".into()));
         }
-        first.trim().parse::<u64>().ok()
+        let trimmed = first.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(HttpError::BadRequest(format!(
+                "invalid content-length {first:?}"
+            )));
+        }
+        trimmed
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| HttpError::BadRequest(format!("invalid content-length {first:?}")))
     }
 }
 
@@ -501,7 +518,7 @@ impl RequestParser {
         // Chunked transfer-encoding wins over Content-Length per RFC 9112 / Node.js behavior.
         let mode = if head.chunked() {
             State::Chunked(ChunkPhase::SizeLine)
-        } else if let Some(cl) = head.content_length() {
+        } else if let Some(cl) = head.checked_content_length()? {
             if cl > MAX_BODY_BYTES as u64 {
                 return Err(HttpError::PayloadTooLarge(format!(
                     "content-length {cl} exceeds {} bytes",
@@ -563,7 +580,12 @@ impl RequestParser {
                 };
                 self.consume(drain_len);
                 let size = size_res?;
-                if self.body_read + size > MAX_BODY_BYTES as u64 {
+                if size > MAX_BODY_BYTES as u64
+                    || self
+                        .body_read
+                        .checked_add(size)
+                        .is_none_or(|sum| sum > MAX_BODY_BYTES as u64)
+                {
                     return Err(HttpError::PayloadTooLarge(format!(
                         "chunked body exceeds {} bytes",
                         MAX_BODY_BYTES
@@ -579,7 +601,7 @@ impl RequestParser {
                 if size == 0 {
                     return Ok(ChunkMove::Advanced(ChunkPhase::DataEol));
                 }
-                let take = std::cmp::min(size as usize, self.buffered());
+                let take = std::cmp::min(size, self.buffered() as u64) as usize;
                 if take == 0 {
                     return Ok(ChunkMove::NeedMore(ChunkPhase::Data(size)));
                 }
@@ -1002,23 +1024,32 @@ fn write_filtered_headers(
         {
             continue;
         }
-        seen.push(name.as_str());
-        // Header names must be field-content safe; skip anything hostile instead of crashing.
-        if name.chars().all(|c| c.is_ascii_graphic() && c != ':')
+        // Header names must be non-empty and field-content safe; skip anything hostile before
+        // updating dedup/length bookkeeping so dropped headers never disable auto Content-Length.
+        if !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_graphic() && c != ':')
             && !value.contains('\n')
             && !value.contains('\r')
         {
+            seen.push(name.as_str());
             out.reserve(name.len() + value.len() + 4);
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(value.as_bytes());
             out.extend_from_slice(b"\r\n");
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            has_len = true;
+            if name.eq_ignore_ascii_case("content-length") {
+                has_len = true;
+            }
         }
     }
     has_len
+}
+
+fn safe_reason_phrase(status: u16, reason: Option<&str>) -> &str {
+    match reason {
+        Some(r) if !r.contains(['\r', '\n']) => r,
+        _ => reason_phrase(status),
+    }
 }
 
 /// Serialize **only** the status line + headers into a caller-owned reusable `out` buffer (the
@@ -1034,7 +1065,7 @@ pub fn serialize_response_head_into(
     body_len: usize,
     keep_alive: bool,
 ) {
-    let phrase = reason.unwrap_or_else(|| reason_phrase(status));
+    let phrase = safe_reason_phrase(status, reason);
     out.clear();
     out.reserve(64 + headers.len() * 40);
     let _ = write!(out, "HTTP/1.1 {status} {phrase}\r\n");
@@ -1076,7 +1107,7 @@ pub fn serialize_stream_head(
     headers: &[(String, String)],
     keep_alive: bool,
 ) -> Vec<u8> {
-    let phrase = reason.unwrap_or_else(|| reason_phrase(status));
+    let phrase = safe_reason_phrase(status, reason);
     // H23 idiom mirrored to the streaming head: capacity reserve + direct emission, no format!
     // per line; skip/dedup semantics unchanged.
     let mut out: Vec<u8> = Vec::with_capacity(72 + headers.len() * 40);
@@ -1769,6 +1800,50 @@ mod http_tests {
         let mut want = scratch.clone();
         want.extend_from_slice(b"{\"ok\":true}");
         assert_eq!(full, want, "serialize_response must equal head_into + body");
+    }
+
+    #[test]
+    fn chunked_u64_overflow_is_rejected_without_panic_or_wrap() {
+        let err = one_request(
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n",
+        )
+        .expect_err("u64::MAX chunk after body must fail 413");
+        assert_eq!(err.status(), 413);
+        assert!(matches!(err, HttpError::PayloadTooLarge(_)));
+    }
+
+    #[test]
+    fn duplicate_or_invalid_content_length_is_bad_request() {
+        for bad in [
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello",
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nContent-Length: abc\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n",
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nContent-Length: +5\r\n\r\nhello",
+            "POST /x HTTP/1.1\r\nHost: cz0\r\nContent-Length: -1\r\n\r\n",
+        ] {
+            let err = one_request(bad).expect_err("ambiguous/invalid CL must return 400");
+            assert_eq!(err.status(), 400, "fixture {bad:?} -> {err}");
+            assert!(matches!(err, HttpError::BadRequest(_)));
+        }
+    }
+
+    #[test]
+    fn response_head_sanitizes_crlf_reason_and_rejected_content_length() {
+        let resp = serialize_response(
+            200,
+            Some("OK\r\nX-Injected: evil"),
+            &[
+                ("Content-Length".into(), "5\r\nX-Evil: 1".into()),
+                ("".into(), "empty-name".into()),
+            ],
+            b"abc",
+            true,
+        );
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "sanitized status line: {text:?}");
+        assert!(!text.contains("X-Injected"), "CRLFs in reason must not inject headers");
+        assert!(text.contains("Content-Length: 3\r\n"), "auto CL preserved when hostile CL skipped");
+        assert!(!text.contains("\r\n: empty-name"), "empty header name skipped");
     }
 
 }

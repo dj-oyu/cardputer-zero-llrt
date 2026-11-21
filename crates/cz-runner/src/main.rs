@@ -408,11 +408,6 @@ fn call_js_i64(ctx: &Ctx<'_>, fn_name: &str, fallback: i64) -> i64 {
     }
 }
 
-/// True when the JS HTTP dispatch glue exists in this context (node:http was imported).
-fn has_http_glue(ctx: &Ctx<'_>) -> bool {
-    ctx.globals().get::<_, Function>("__czHttpDrainLoop").is_ok()
-}
-
 /// One event-loop iteration: dispatch queued HTTP requests (which delivers `data`/`end` through
 /// JS jobs), flush their responses, then fire due timers.
 ///
@@ -464,7 +459,6 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
     if cz_modules::should_quit() {
         return Ok(());
     }
-    let has_http = ctx.with(|c| has_http_glue(&c));
     if cz_modules::http_listening_count() > 0 && !cz_modules::install_signal_handlers() {
         eprintln!("cz-js: warning: could not install SIGINT/SIGTERM handlers");
     }
@@ -477,9 +471,6 @@ fn run_event_loop(rt: &Runtime, ctx: &Context) -> Result<(), String> {
         loop_pass(rt, ctx);
         let (listening, timers, extra_work, fetch_active, tls_active, ws_active) = loop_liveness(rt, ctx);
         if listening == 0 && timers <= 0 && !extra_work && fetch_active == 0 && tls_active == 0 && ws_active == 0 {
-            break;
-        }
-        if !has_http && listening == 0 && timers <= 0 && fetch_active == 0 && tls_active == 0 && ws_active == 0 {
             break;
         }
         if started.elapsed().as_secs() > 3600 {
@@ -947,6 +938,50 @@ Connection: close
         }
         assert_eq!(cz_modules::http_listening_count(), 0);
         cz_modules::reset_quit_flag();
+    }
+
+    #[test]
+    fn event_loop_waits_for_non_http_fetch_and_timers_without_http_glue() {
+        let _lock = event_test_lock();
+        cz_modules::reset_quit_flag();
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+            }
+        });
+
+        let (rt, ctx) = loop_setup();
+        ctx.with(|c| {
+            cz_modules::install_web_globals(&c).unwrap();
+            cz_modules::install_fetch(&c).unwrap();
+            eval_module(
+                &c,
+                "no_http_fetch.mjs",
+                &format!(
+                    r#"
+                    globalThis.__NO_HTTP_RES = null;
+                    fetch("http://127.0.0.1:{port}/ping")
+                        .then((r) => r.text())
+                        .then((t) => {{
+                            setTimeout(() => {{ globalThis.__NO_HTTP_RES = t + ":after_timer"; }}, 10);
+                        }});
+                    "#
+                ),
+            )
+            .unwrap();
+        });
+        drain_jobs(&rt);
+        run_event_loop(&rt, &ctx).unwrap();
+        let _ = srv.join();
+        let got = ctx.with(|c| c.eval::<Option<String>, _>("globalThis.__NO_HTTP_RES").unwrap());
+        assert_eq!(got.as_deref(), Some("pong:after_timer"));
     }
 
     // Compile-time usage guard for the console value plumbing types.

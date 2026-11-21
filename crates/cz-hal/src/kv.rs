@@ -1009,7 +1009,11 @@ pub fn open_store(
 /// Remove (free) a named store from the registry; returns whether it existed.
 pub fn drop_store(name: &str) -> bool {
     let mut reg = registry().lock().expect("kv registry lock");
-    reg.remove(name).is_some()
+    let removed = reg.remove(name).is_some();
+    if removed {
+        reg_version().fetch_add(1, Ordering::Release);
+    }
+    removed
 }
 
 /// True when a named store currently exists in the registry.
@@ -1528,5 +1532,15 @@ mod tests {
         assert!(t.entries.get("rec").map(|e| matches!(e.payload, EntryPayload::Record(_))).unwrap_or(false));
         assert_eq!(t.get_field("rec", "a"), Some(KvValue::Int(2)));
         assert_eq!(t.get_field("rec", "b"), Some(KvValue::Bool(true)));
+    }
+
+    #[test]
+    fn drop_store_invalidates_peek_store_thread_local_memo() {
+        let name = "drop_memo_invalidates";
+        let store = open_store(name, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES, None).expect("open");
+        store.lock().expect("lock").set("k", KvValue::Int(42), None);
+        assert!(peek_store(name).is_some(), "warm PEEK_MEMO with live store");
+        assert!(drop_store(name));
+        assert!(peek_store(name).is_none(), "drop_store must invalidate PEEK_MEMO");
     }
 }

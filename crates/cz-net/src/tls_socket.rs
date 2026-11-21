@@ -258,13 +258,16 @@ pub fn connect_tls(
             server_id: None,
         },
     );
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name(format!("cz-tls-client-{socket_id}"))
         .stack_size(TLS_WORKER_STACK_BYTES)
         .spawn(move || {
             client_worker(socket_id, host, port, servername, opts, ctrl_rx, destroyed, wake_slot)
         })
-        .map_err(|e| format!("cannot spawn TLS worker: {e}"))?;
+    {
+        deregister_socket(socket_id);
+        return Err(format!("cannot spawn TLS worker: {e}"));
+    }
     Ok(socket_id)
 }
 
@@ -562,7 +565,11 @@ fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, server_id: u64, cfg
                     spawn_server_connection(stream, peer, server_id, cfg.clone());
                 }
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => break,
-                Err(_) => return,
+                Err(_) => {
+                    // Transient accept errors (ECONNABORTED, EMFILE, ENFILE) must not kill the listener.
+                    std::thread::sleep(Duration::from_millis(5));
+                    break;
+                }
             }
         }
     }
@@ -629,7 +636,9 @@ fn server_conn_worker(
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) =>
             {
                 if started.elapsed() > SERVER_HANDSHAKE_TIMEOUT + IO_SLICE {

@@ -44,7 +44,10 @@ fn key_registry() -> &'static Mutex<Vec<Option<RegKey>>> {
 /// Copy-out of a registry slot under the lock: tiny (≤ 32 B) key bytes only, and the guard is
 /// ALWAYS dropped before touching QuickJS values (under-lock visitor discipline §3).
 fn key_entry(id: f64) -> Option<RegKey> {
-    let idx = id.max(0.0) as usize;
+    if !id.is_finite() || id < 0.0 || id.fract() != 0.0 || id > usize::MAX as f64 {
+        return None;
+    }
+    let idx = id as usize;
     let reg = key_registry().lock().expect("web crypto registry lock");
     match reg.get(idx).and_then(|slot| slot.as_ref()) {
         Some(RegKey::Hmac { alg, key }) => Some(RegKey::Hmac {
@@ -67,21 +70,32 @@ fn bad_key<'js>(ctx: &Ctx<'js>) -> rquickjs::Error {
 /// Fill `[byteOffset, byteOffset + byteLength)` of the caller's ArrayBuffer with CSPRNG bytes
 /// IN PLACE. No JavaScript may run while the raw alias is live (`as_raw` contract).
 fn fill_random_impl<'js>(ctx: &Ctx<'js>, buffer: ArrayBuffer<'js>, offset: f64, len: f64) -> Result<()> {
-    if !offset.is_finite() || !len.is_finite() || offset < 0.0 || len < 0.0 {
-        return Err(Exception::throw_range(&ctx, "getRandomValues offset/length must not be negative"));
+    if !offset.is_finite() || !len.is_finite() || offset < 0.0 || len < 0.0 || offset.fract() != 0.0 || len.fract() != 0.0 {
+        return Err(Exception::throw_range(
+            ctx,
+            "getRandomValues offset/length must be non-negative integers",
+        ));
     }
     let off = offset as usize;
     let n = len as usize;
-    // SAFETY: `ring::rand` never re-enters the QuickJS engine for as long as this alias lives.
+    if n == 0 && off == 0 {
+        return Ok(());
+    }
+    // SAFETY: `ring::rand` never re-enters the QuickJS engine while this slice is live, and we
+    // derive `*mut u8` directly from `NonNull<[u8]>` without creating an intermediate `&[u8]`.
     let slice = unsafe {
         let raw = buffer
             .as_raw()
-            .ok_or_else(|| Exception::throw_type(&ctx, "ArrayBuffer is detached"))?;
-        let raw = raw.as_ref();
-        if off.checked_add(n).unwrap_or(usize::MAX) > raw.len() {
-            return Err(Exception::throw_range(&ctx, "getRandomValues range exceeds the ArrayBuffer"));
+            .ok_or_else(|| Exception::throw_type(ctx, "ArrayBuffer is detached"))?;
+        let raw_ptr: *mut [u8] = raw.as_ptr();
+        let total_len = raw_ptr.len();
+        if off.checked_add(n).is_none_or(|end| end > total_len) {
+            return Err(Exception::throw_range(
+                ctx,
+                "getRandomValues range exceeds the ArrayBuffer",
+            ));
         }
-        std::slice::from_raw_parts_mut(raw.as_ptr().cast_mut().add(off), n)
+        std::slice::from_raw_parts_mut((raw_ptr as *mut u8).add(off), n)
     };
     use ring::rand::SecureRandom;
     system_rng()
@@ -714,5 +728,30 @@ mod web_crypto_tests {
         assert_eq!(base64_decode("YQ==", false), Some(vec![b'a']));
         assert_eq!(base64_decode("a", false), None); // dangling lone sextet per HTML spec
         assert_eq!(base64_decode(" \t\n Y W J j \r\n", false), Some(b"abc".to_vec()));
+    }
+
+    #[test]
+    fn nan_and_negative_key_handles_reject_instead_of_aliasing_slot_zero() {
+        assert_eq!(
+            run(
+                r#"
+                const enc = new TextEncoder();
+                const id = __czSubtleImportKey("raw", enc.encode("secret-slot-0"), "HMAC", "sha256");
+                if (id < 0) throw new Error("expected non-negative id");
+                for (const badId of [-1, -100, NaN, Infinity, -Infinity, 0.5]) {
+                    let threw = false;
+                    try { __czSubtleExportKey(badId); } catch (_e) { threw = true; }
+                    if (!threw) throw new Error("bad id must reject export: " + badId);
+                    threw = false;
+                    try { __czSubtleSign(badId, enc.encode("msg")); } catch (_e) { threw = true; }
+                    if (!threw) throw new Error("bad id must reject sign: " + badId);
+                }
+                const zeroArr = crypto.getRandomValues(new Uint8Array(0));
+                if (zeroArr.length !== 0) throw new Error("zero-len getRandomValues");
+                "HANDLE_GUARDS_OK"
+            "#
+            ),
+            "HANDLE_GUARDS_OK"
+        );
     }
 }

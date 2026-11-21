@@ -143,6 +143,7 @@ fn begin_stream(conn_id: u64, server_id: u64, action_head: ResponseAction) -> bo
         None => return false,
     };
     if tx.send(action_head).is_err() {
+        reg.replies.lock().expect("replies lock").remove(&conn_id);
         return false;
     }
     reg.streams.lock().expect("streams lock").insert(conn_id, server_id);
@@ -196,6 +197,7 @@ pub fn close_server(id: u64) -> bool {
             // Force the terminating chunk; the reader thread then shuts that socket down.
             tx.send(ResponseAction::StreamEnd { keep_alive: false }).ok();
         }
+        reg.streams.lock().expect("streams lock").remove(&conn);
         cz_hal::http_server::mark_client_closed_public(conn);
     }
     match reg.servers.lock().expect("servers lock").remove(&id) {
@@ -214,9 +216,25 @@ pub fn close_all_servers() {
 }
 
 /// Pull pending client-disconnect notifications (conn ids) for the JS event loop to fire
-/// `"close"` listeners on `req`/`res`.
+/// `"close"` listeners on `req`/`res`, and drop any Rust-side reply/stream handles for those ids.
 pub fn drain_disconnects() -> Vec<u64> {
-    take_disconnect_events()
+    let ids = take_disconnect_events();
+    if !ids.is_empty() {
+        let reg = registry();
+        {
+            let mut replies = reg.replies.lock().expect("replies lock");
+            for id in &ids {
+                replies.remove(id);
+            }
+        }
+        {
+            let mut streams = reg.streams.lock().expect("streams lock");
+            for id in &ids {
+                streams.remove(id);
+            }
+        }
+    }
+    ids
 }
 
 // ---------------------------------------------------------------------------
@@ -817,10 +835,22 @@ fn build_descriptor<'js>(ctx: &Ctx<'js>, ev: ConnectionEvent) -> Result<Value<'j
     obj.set("httpVersion", ev.request.head.version())?;
 
     // Phase 10D: NO per-request Rust join scaffolding (no name->values map, no value vectors);
-    // the JS `headers` object is built in ONE pass over the borrowed lowercased spans. A
-    // repeated field name appends ", " + value onto the existing JS string exactly like
-    // Node.js; single fields are set directly with zero Rust-side allocations.
-    let headers = Object::new(ctx.clone())?;
+    // the JS `headers` object is built in ONE pass over the borrowed lowercased spans with a null
+    // prototype (`JS_NewObjectProto(..., JS_NULL)`) so headers like `constructor` / `toString` /
+    // `__proto__` can never collide with `Object.prototype` properties.
+    let headers = unsafe {
+        let q = ctx.as_raw().as_ptr();
+        let null_val = Value::new_null(ctx.clone());
+        let raw = rquickjs::qjs::JS_NewObjectProto(q, null_val.as_raw());
+        drop(null_val);
+        if rquickjs::qjs::JS_IsException(raw) {
+            rquickjs::qjs::JS_FreeValue(q, raw);
+            return Err(rquickjs::Error::Exception);
+        }
+        Value::from_raw(ctx.clone(), raw)
+            .into_object()
+            .expect("null-prototype object")
+    };
     for (name, value) in ev.request.head.headers_iter() {
         let prev = headers.get::<_, Option<JsString>>(name)?;
         match prev {
@@ -1631,6 +1661,103 @@ mod http_module_tests {
         assert!(res_json.contains("\"headersSent\":true"), "headers sent: {res_json}");
         assert!(res_json.contains("\"writableEnded\":true"), "writableEnded set: {res_json}");
         assert!(res_json.contains("\"ended\":true"), "end() returns this: {res_json}");
+
+        ctx.with(|ctx| ctx.eval::<(), _>("globalThis.__SERVER.close();"))?;
+        while let Ok(true) = rt.execute_pending_job() {}
+        Ok(())
+    }
+
+    #[test]
+    fn request_headers_use_null_prototype_and_aborted_conn_cleans_up_replies() -> Result<()> {
+        let _lock = http_test_lock();
+        reset_engine_state();
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let src = r#"
+            import http from "node:http";
+            globalThis.__HDR_REPORT = null;
+            const s = http.createServer((req, res) => {
+                const protoIsNull = Object.getPrototypeOf(req.headers) === null;
+                globalThis.__HDR_REPORT = JSON.stringify({
+                    protoIsNull,
+                    ctor: req.headers.constructor,
+                    toStr: req.headers.tostring,
+                    toStrProtoType: typeof req.headers.toString,
+                    protoHdr: req.headers["__proto__"],
+                    hasOwn: req.headers.hasownproperty,
+                    hasOwnProtoType: typeof req.headers.hasOwnProperty,
+                });
+                if (req.url === "/hang") {
+                    // Intentionally do not call res.end() so client disconnect must clean up replies/streams.
+                    return;
+                }
+                res.end("ok");
+            });
+            s.listen(0, "127.0.0.1", () => { globalThis.__ADDR = JSON.stringify(s.address()); });
+            globalThis.__SERVER = s;
+        "#;
+        let rt = Runtime::new()?;
+        let ctx = Context::full(&rt)?;
+        ctx.with(|ctx| -> Result<()> {
+            Module::declare_def::<HttpModule, _>(ctx.clone(), "node:http")?;
+            let p = Module::evaluate(ctx.clone(), "hdr-proto.mjs", src)?;
+            p.finish::<()>()?;
+            Ok(())
+        })?;
+        while let Ok(true) = rt.execute_pending_job() {}
+        let addr = take_addr(&ctx).expect("addr");
+
+        // 1) Hostile prototype-key headers (repeated ToString + constructor + __proto__ + hasOwnProperty)
+        let mut sock = TcpStream::connect(("127.0.0.1", addr)).expect("connect");
+        sock.write_all(
+            b"GET /ok HTTP/1.1\r\nHost: z\r\nToString: one\r\nToString: two\r\nConstructor: ctor-val\r\n__proto__: pval\r\nhasOwnProperty: hop\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        drive_until_dispatched(&rt, &ctx, 1);
+        let mut resp = String::new();
+        sock.read_to_string(&mut resp).unwrap();
+        assert!(resp.ends_with("\r\n\r\nok"), "expected 200 ok, got {resp:?}");
+        let report = ctx.with(|c| c.eval::<String, _>("String(globalThis.__HDR_REPORT)")).unwrap();
+        assert!(report.contains("\"protoIsNull\":true"), "{report}");
+        assert!(report.contains("\"ctor\":\"ctor-val\""), "{report}");
+        assert!(report.contains("\"toStr\":\"one, two\""), "{report}");
+        assert!(report.contains("\"toStrProtoType\":\"undefined\""), "{report}");
+        assert!(report.contains("\"protoHdr\":\"pval\""), "{report}");
+        assert!(report.contains("\"hasOwn\":\"hop\""), "{report}");
+        assert!(report.contains("\"hasOwnProtoType\":\"undefined\""), "{report}");
+
+        // 2) Client aborts before handler responds: `drain_disconnects()` must drop `replies`/`streams`.
+        let sock2 = TcpStream::connect(("127.0.0.1", addr)).expect("connect 2");
+        let mut s2 = sock2;
+        s2.write_all(b"GET /hang HTTP/1.1\r\nHost: z\r\n\r\n").unwrap();
+        drive_until_dispatched(&rt, &ctx, 1);
+        assert!(
+            !registry().replies.lock().expect("replies").is_empty(),
+            "unanswered request holds reply sender until disconnect"
+        );
+        drop(s2);
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(2000) {
+            ctx.with(|c| {
+                let _ = c.eval::<i64, _>("__czHttpCheckCloses()");
+            });
+            while let Ok(true) = rt.execute_pending_job() {}
+            if registry().replies.lock().expect("replies").is_empty()
+                && registry().streams.lock().expect("streams").is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            registry().replies.lock().expect("replies").is_empty(),
+            "aborted connection leaked into replies map"
+        );
+        assert!(
+            registry().streams.lock().expect("streams").is_empty(),
+            "aborted connection leaked into streams map"
+        );
 
         ctx.with(|ctx| ctx.eval::<(), _>("globalThis.__SERVER.close();"))?;
         while let Ok(true) = rt.execute_pending_job() {}

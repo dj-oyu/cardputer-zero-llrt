@@ -61,18 +61,27 @@ pub(crate) fn alg_of(name: &str) -> Option<Alg> {
     }
 }
 
-/// One hash/HMAC sink accumulated across chained `update()` calls (single-shot finalize).
+enum DigestCtx {
+    Hash(ring::digest::Context),
+    Hmac(Box<ring::hmac::Context>),
+}
+
+/// One incremental hash/HMAC sink across chained `update()` calls (never buffers payload in RAM).
 struct Sink {
-    alg: Alg,
-    /// `Some(key)` turns the sink into an HMAC; `None` is a plain hash.
-    key: Option<Vec<u8>>,
-    data: Vec<u8>,
+    ctx: DigestCtx,
     done: bool,
 }
 
 fn registry() -> &'static Mutex<Vec<Option<Sink>>> {
     static REG: OnceLock<Mutex<Vec<Option<Sink>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn sink_index<'js>(ctx: &Ctx<'js>, id: f64, msg: &str) -> Result<usize> {
+    if !id.is_finite() || id < 0.0 || id.fract() != 0.0 || id > usize::MAX as f64 {
+        return Err(Exception::throw_message(ctx, msg));
+    }
+    Ok(id as usize)
 }
 
 /// `string | Uint8Array | ArrayBuffer` → owned bytes (`bytes_from_value` handles buffer kinds).
@@ -123,35 +132,44 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 // Rust natives (registered as globalThis.__czCrypto*)
 // ---------------------------------------------------------------------------
 
-fn new_impl<'js>(ctx: &Ctx<'js>, alg: String, key: Opt<Value<'js>>) -> Result<i64> {
+fn new_impl<'js>(ctx: &Ctx<'js>, alg: String, key: Opt<Value<'js>>) -> Result<f64> {
     let alg = alg_of(&alg).ok_or_else(|| {
         Exception::throw_message(ctx, &format!("Unsupported digest algorithm: {alg}"))
     })?;
-    let key = match key.0 {
-        Some(v) if !v.is_undefined() && !v.is_null() => Some(js_bytes(&v)?),
-        _ => None,
+    let digest_ctx = match key.0 {
+        Some(v) if !v.is_undefined() && !v.is_null() => {
+            let kb = js_bytes(&v)?;
+            let ring_key = ring::hmac::Key::new(alg.hmac_alg(), &kb);
+            DigestCtx::Hmac(Box::new(ring::hmac::Context::with_key(&ring_key)))
+        }
+        _ => DigestCtx::Hash(ring::digest::Context::new(alg.digest_alg())),
     };
     let mut reg = registry().lock().expect("crypto registry lock");
-    let id = reg.len() as i64;
-    reg.push(Some(Sink { alg, key, data: Vec::new(), done: false }));
+    let id = reg.len() as f64;
+    reg.push(Some(Sink { ctx: digest_ctx, done: false }));
     Ok(id)
 }
 
-fn update_impl<'js>(ctx: &Ctx<'js>, id: i64, data: Value<'js>) -> Result<()> {
+fn update_impl<'js>(ctx: &Ctx<'js>, id: f64, data: Value<'js>) -> Result<()> {
+    let idx = sink_index(ctx, id, "invalid crypto handle")?;
     let bytes = js_bytes(&data)?;
     let mut reg = registry().lock().expect("crypto registry lock");
     let slot = reg
-        .get_mut(id.max(0) as usize)
+        .get_mut(idx)
         .and_then(|s| s.as_mut())
         .ok_or_else(|| Exception::throw_message(ctx, "invalid crypto handle"))?;
     if slot.done {
         return Err(Exception::throw_message(ctx, "digest already computed for this hash"));
     }
-    slot.data.extend_from_slice(&bytes);
+    match &mut slot.ctx {
+        DigestCtx::Hash(c) => c.update(&bytes),
+        DigestCtx::Hmac(c) => c.update(&bytes),
+    }
     Ok(())
 }
 
-fn final_impl<'js>(ctx: &Ctx<'js>, id: i64, encoding: Opt<String>) -> Result<Value<'js>> {
+fn final_impl<'js>(ctx: &Ctx<'js>, id: f64, encoding: Opt<String>) -> Result<Value<'js>> {
+    let idx = sink_index(ctx, id, "invalid crypto handle")?;
     let enc = encoding.0.unwrap_or_default();
     if !matches!(enc.as_str(), "" | "hex" | "base64") {
         return Err(Exception::throw_message(
@@ -161,15 +179,12 @@ fn final_impl<'js>(ctx: &Ctx<'js>, id: i64, encoding: Opt<String>) -> Result<Val
     }
     let mut reg = registry().lock().expect("crypto registry lock");
     let slot = reg
-        .get_mut(id.max(0) as usize)
+        .get_mut(idx)
         .and_then(|s| s.take())
         .ok_or_else(|| Exception::throw_message(ctx, "digest already computed for this hash"))?;
-    let out = match slot.key {
-        None => ring::digest::digest(slot.alg.digest_alg(), &slot.data).as_ref().to_vec(),
-        Some(key) => {
-            let tag = ring::hmac::sign(&ring::hmac::Key::new(slot.alg.hmac_alg(), &key), &slot.data);
-            tag.as_ref().to_vec()
-        }
+    let out = match slot.ctx {
+        DigestCtx::Hash(c) => c.finish().as_ref().to_vec(),
+        DigestCtx::Hmac(c) => c.sign().as_ref().to_vec(),
     };
     if enc == "hex" {
         Ok(rquickjs::String::from_str(ctx.clone(), &hex_encode(&out))?.into_value())
@@ -352,13 +367,13 @@ const CRYPTO_SHIM: &str = r#"
 pub fn ensure_crypto_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
     ctx.globals().set(
         "__czCryptoNew",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, alg: String, key: Opt<Value<'js>>| -> Result<i64> {
+        Function::new(ctx.clone(), |ctx: Ctx<'js>, alg: String, key: Opt<Value<'js>>| -> Result<f64> {
             new_impl(&ctx, alg, key)
         })?,
     )?;
     ctx.globals().set(
         "__czCryptoUpdate",
-        Function::new(ctx.clone(), |ctx: Ctx<'js>, id: i64, data: Value<'js>| -> Result<()> {
+        Function::new(ctx.clone(), |ctx: Ctx<'js>, id: f64, data: Value<'js>| -> Result<()> {
             update_impl(&ctx, id, data)
         })?,
     )?;
@@ -366,7 +381,7 @@ pub fn ensure_crypto_glue<'js>(ctx: &Ctx<'js>) -> Result<()> {
         "__czCryptoFinal",
         Function::new(
             ctx.clone(),
-            |ctx: Ctx<'js>, id: i64, encoding: Opt<String>| -> Result<Value<'js>> {
+            |ctx: Ctx<'js>, id: f64, encoding: Opt<String>| -> Result<Value<'js>> {
                 final_impl(&ctx, id, encoding)
             },
         )?,
@@ -648,5 +663,28 @@ mod crypto_tests {
         "#,
         );
         assert_eq!(r, "CRYPTO_DEFAULTS_OK");
+    }
+
+    #[test]
+    fn nan_and_negative_crypto_handles_do_not_alias_slot_zero() {
+        let r = run_crypto_script(
+            r#"
+            import crypto from "node:crypto";
+            const h0 = crypto.createHash("sha256").update("a");
+            for (const bad of [-1, NaN, Infinity, 0.5]) {
+                let updErr = false;
+                try { __czCryptoUpdate(bad, "evil"); } catch (_e) { updErr = true; }
+                if (!updErr) throw new Error("bad update id must fail: " + bad);
+                let finErr = false;
+                try { __czCryptoFinal(bad, "hex"); } catch (_e) { finErr = true; }
+                if (!finErr) throw new Error("bad final id must fail: " + bad);
+            }
+            if (h0.update("bc").digest("hex") !== "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+                throw new Error("live handle 0 was corrupted by bad ids");
+            }
+            globalThis.__R = "CRYPTO_HANDLE_GUARD_OK";
+        "#,
+        );
+        assert_eq!(r, "CRYPTO_HANDLE_GUARD_OK");
     }
 }

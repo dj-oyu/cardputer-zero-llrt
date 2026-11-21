@@ -19,7 +19,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Builder;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
@@ -345,14 +345,19 @@ impl fmt::Debug for CzConnector {
     }
 }
 
-/// Extract the bare host from a URI authority (handles bracketed IPv6 and ports).
+/// Extract the bare host from a URI authority (handles bracketed IPv6, userinfo, and ports).
 fn bare_host(uri: &ureq::http::Uri) -> Option<&str> {
     let auth = uri.authority()?.as_str();
-    if auth.starts_with('[') {
-        // [::1]:port
-        return Some(auth.trim_start_matches('[').trim_end_matches(']'));
+    let hostport = auth.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(auth);
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let inner = &rest[..end];
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(inner);
     }
-    let host = auth.rsplit_once(':').map(|(h, _)| h).unwrap_or(auth);
+    let host = hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport);
     if host.is_empty() {
         return None;
     }
@@ -452,16 +457,33 @@ impl Connector for CzConnector {
 
         let mut conn = ClientConnection::new(config, name)?;
         let mut sock = SharedSock { stream: shared.clone() };
-        // Blocking handshake (rustls drives I/O over our shared socket). `complete_io` returns
-        // `(bytes_read, bytes_written)`; loop until `CommonState::is_handshaking()` clears.
+        let hs_deadline = Instant::now() + handshake_timeout;
+        // Blocking handshake (rustls drives I/O over our shared socket). Loop until
+        // `CommonState::is_handshaking()` clears, bounded by abort + handshake_timeout.
         loop {
+            if self.abort.is_aborted() {
+                let _ = TcpStream::shutdown(&shared, Shutdown::Both);
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "fetch aborted during TLS handshake",
+                )));
+            }
             match conn.complete_io(&mut sock) {
                 Ok(_) if !conn.is_handshaking() => break,
+                Ok((0, 0)) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "EOF during TLS handshake",
+                    )));
+                }
                 Ok(_) => continue,
                 Err(ref e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::Interrupted =>
                 {
+                    if Instant::now() >= hs_deadline {
+                        return Err(Error::Timeout(ureq::Timeout::Connect));
+                    }
                     continue;
                 }
                 Err(e) => return Err(Error::Io(e)),
@@ -707,10 +729,19 @@ fn find_slot(id: u64) -> Option<Arc<Slot>> {
 /// Pop the next queued event for `id` (JS pump loop calls this until it returns `None`).
 pub fn next_event(id: u64) -> Option<EngineEvent> {
     let slot = find_slot(id)?;
-    let ev = slot.inner.lock().expect("slot events lock").events.pop_front();
-    if let Some(EngineEvent::Chunk(_)) = &ev {
-        // Consuming a chunk pins the stream to streaming mode (guards later buffered switch).
-        slot.inner.lock().expect("slot events lock").chunks_delivered += 1;
+    let (ev, popped_chunk) = {
+        let mut guard = slot.inner.lock().expect("slot events lock");
+        let ev = guard.events.pop_front();
+        let is_chunk = matches!(&ev, Some(EngineEvent::Chunk(_)));
+        if is_chunk {
+            // Consuming a chunk pins the stream to streaming mode (guards later buffered switch).
+            guard.chunks_delivered += 1;
+        }
+        (ev, is_chunk)
+    };
+    if popped_chunk {
+        // Wake a worker parked on a full streaming backpressure queue immediately.
+        slot.cv.notify_all();
     }
     if ev.is_some() {
         cz_hal::http_server::notify_event_loop();
@@ -826,7 +857,7 @@ pub fn switch_streaming(id: u64) -> bool {
         }
         // Insert the chunked replay right after the Headers event (if it is still queued), then
         // terminate with Done when the body had already completed.
-        let insert_at = guard
+        let mut insert_at = guard
             .events
             .iter()
             .position(|e| matches!(e, EngineEvent::Headers { .. }))
@@ -835,6 +866,7 @@ pub fn switch_streaming(id: u64) -> bool {
         let already_done = guard.finished;
         for piece in pending.iter().flat_map(|b| b.chunks(CHUNK_SIZE)) {
             guard.events.insert(insert_at, EngineEvent::Chunk(piece.to_vec()));
+            insert_at += 1;
         }
         if already_done && !guard.events.iter().any(|e| matches!(e, EngineEvent::Done | EngineEvent::Failed { .. })) {
             guard.events.push_back(EngineEvent::Done);
@@ -964,7 +996,12 @@ fn header_pairs(res: &ureq::http::Response<ureq::Body>) -> Vec<(String, String)>
 
 fn worker_main(mut spec: FetchSpec, slot: Arc<Slot>, abort: Arc<AbortHandle>) {
     // 1. Build the agent with the per-request TLS config + our abortable connector.
-    let tls_config = if spec.url.starts_with("https") {
+    let is_https = spec
+        .url
+        .trim_start()
+        .get(..6)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https:"));
+    let tls_config = if is_https {
         match build_client_config(&spec.tls) {
             Ok(c) => Some(c),
             Err(msg) => {
@@ -1073,18 +1110,19 @@ fn worker_main(mut spec: FetchSpec, slot: Arc<Slot>, abort: Arc<AbortHandle>) {
         slot.fail(FailKind::Abort, "This operation was aborted".to_string());
         return;
     }
-    let streaming = slot.inner.lock().expect("slot events lock").mode == Mode::Streaming;
-    if streaming {
-        // Prefix split is handled inside handle_body_chunk; emit Done now.
-        slot.push(EngineEvent::Done);
-    } else {
-        let bytes = {
-            let mut g = slot.inner.lock().expect("slot events lock");
-            g.finished = true;
-            std::mem::take(&mut g.buffer)
-        };
-        slot.push(EngineEvent::Body(bytes));
+    {
+        let mut g = slot.inner.lock().expect("slot events lock");
+        g.finished = true;
+        if g.mode == Mode::Streaming {
+            // Prefix split is handled inside handle_body_chunk; emit Done atomically with finished.
+            g.events.push_back(EngineEvent::Done);
+        } else {
+            let bytes = std::mem::take(&mut g.buffer);
+            g.events.push_back(EngineEvent::Body(bytes));
+        }
     }
+    slot.cv.notify_all();
+    cz_hal::http_server::notify_event_loop();
 }
 
 /// Route one decoded body chunk according to the current consumer mode.
@@ -1316,5 +1354,53 @@ mod backpressure_tests {
             assert_eq!(g.buffer[0], 7);
         }
         release_slot(999_010);
+    }
+
+    #[test]
+    fn switch_streaming_preserves_chunk_order_over_multi_chunk_prefix_and_notifies_cv() {
+        let _lock = registry_test_lock();
+        let abort = Arc::new(AbortHandle::new());
+        let slot = Arc::new(Slot::new(999_020, abort));
+        engine().slots.lock().expect("slots").push(slot.clone());
+        {
+            let mut g = slot.inner.lock().expect("inner");
+            // 40 KiB across 3 chunks: 16 KiB (0x01), 16 KiB (0x02), 8 KiB (0x03).
+            let mut buf = vec![1u8; CHUNK_SIZE];
+            buf.extend(vec![2u8; CHUNK_SIZE]);
+            buf.extend(vec![3u8; 8 * 1024]);
+            g.buffer = buf;
+            g.events.push_back(EngineEvent::Headers {
+                status: 200,
+                status_text: "OK".into(),
+                url: "http://example.test/".into(),
+                redirected: false,
+                headers: Vec::new(),
+            });
+            g.finished = true;
+        }
+        assert!(switch_streaming(999_020));
+        assert!(matches!(next_event(999_020), Some(EngineEvent::Headers { .. })));
+        let c1 = match next_event(999_020) {
+            Some(EngineEvent::Chunk(b)) => b,
+            other => panic!("expected chunk 1, got {other:?}"),
+        };
+        let c2 = match next_event(999_020) {
+            Some(EngineEvent::Chunk(b)) => b,
+            other => panic!("expected chunk 2, got {other:?}"),
+        };
+        let c3 = match next_event(999_020) {
+            Some(EngineEvent::Chunk(b)) => b,
+            other => panic!("expected chunk 3, got {other:?}"),
+        };
+        assert_eq!(c1[0], 1);
+        assert_eq!(c2[0], 2);
+        assert_eq!(c3[0], 3);
+        assert!(matches!(next_event(999_020), Some(EngineEvent::Done)));
+        release_slot(999_020);
+
+        let uri_v6: ureq::http::Uri = "https://[::1]:8443/api".parse().unwrap();
+        assert_eq!(bare_host(&uri_v6), Some("::1"));
+        let uri_v4: ureq::http::Uri = "https://127.0.0.1:8443/api".parse().unwrap();
+        assert_eq!(bare_host(&uri_v4), Some("127.0.0.1"));
     }
 }

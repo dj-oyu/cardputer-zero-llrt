@@ -40,6 +40,8 @@ use ureq::Agent;
 
 /// Strict streaming cap for downloaded tarballs: 5 MiB.
 pub const TARBALL_CAP: usize = 5 * 1024 * 1024;
+/// Maximum cumulative decompressed bytes extracted from a single tarball: 32 MiB (gzip-bomb cap).
+pub const EXTRACTED_CAP: usize = 32 * 1024 * 1024;
 /// Maximum total packages (root + transitive deps) per install graph.
 pub const MAX_PACKAGES: usize = 20;
 
@@ -323,6 +325,72 @@ impl Drop for TempDir {
 // URL helpers (redirect + relative resolution)
 // ---------------------------------------------------------------------------------------------
 
+/// Validate a strict npm package name (lowercase ASCII `[a-z0-9-~][a-z0-9-._~]*`,
+/// optional single `@scope/`, length `1..=214`). Makes filesystem traversal (`..`, `.`, `\`,
+/// extra `/`) and URL/query smuggling (`?`, `#`, `%`, whitespace, control chars) impossible.
+pub fn validate_pkg_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 214 {
+        return Err(format!("invalid npm package name {name:?}: bad length"));
+    }
+    fn check_seg(seg: &str, full: &str) -> Result<(), String> {
+        if seg.is_empty() || seg == "." || seg == ".." || seg.starts_with('.') || seg.starts_with('_') {
+            return Err(format!("invalid npm package name {full:?}"));
+        }
+        let bytes = seg.as_bytes();
+        if !matches!(bytes[0], b'a'..=b'z' | b'0'..=b'9' | b'-' | b'~') {
+            return Err(format!("invalid npm package name {full:?}"));
+        }
+        for &b in &bytes[1..] {
+            if !matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+                return Err(format!("invalid npm package name {full:?}"));
+            }
+        }
+        Ok(())
+    }
+    if let Some(rest) = name.strip_prefix('@') {
+        let (scope, pkg) = rest
+            .split_once('/')
+            .ok_or_else(|| format!("invalid scoped npm package name {name:?}"))?;
+        if pkg.contains('/') {
+            return Err(format!("invalid scoped npm package name {name:?}"));
+        }
+        check_seg(scope, name)?;
+        check_seg(pkg, name)
+    } else {
+        if name.contains('/') {
+            return Err(format!("invalid npm package name {name:?}"));
+        }
+        check_seg(name, name)
+    }
+}
+
+/// Validate that a relative entry path stays strictly inside its package root: rejects empty
+/// strings, NULs, backslashes, absolute/prefixed paths, and `.`/`..` traversal segments.
+pub fn validate_safe_rel_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.contains('\\') {
+        return Err(format!("unsafe package entry path {raw:?}"));
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        return Err(format!("absolute package entry path rejected: {raw:?}"));
+    }
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(seg) => out.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("path traversal in package entry rejected: {raw:?}"));
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(format!("empty package entry path: {raw:?}"));
+    }
+    Ok(out)
+}
+
 /// Percent-encode a package specifier for use in an HTTP path (keeps `/` and `@` for scopes).
 fn encode_pkg_spec(spec: &str) -> String {
     let mut out = String::new();
@@ -387,6 +455,19 @@ fn join_url(base: &str, rel: &str) -> Result<String, String> {
     Ok(format!("{}://{}{}", bu.scheme, bu.authority, target))
 }
 
+/// Resolve a redirect `Location` against `current_url`, rejecting HTTPS->HTTP downgrades.
+fn check_redirect_target(current_url: &str, location: &str) -> Result<String, String> {
+    let cur = split_url(current_url)?;
+    let next_uri = join_url(current_url, location)?;
+    let next = split_url(&next_uri)?;
+    if cur.scheme == "https" && next.scheme != "https" {
+        return Err(format!(
+            "refusing HTTPS->HTTP redirect downgrade from {current_url} to {next_uri}"
+        ));
+    }
+    Ok(next_uri)
+}
+
 // ---------------------------------------------------------------------------------------------
 // HTTP fetch (ureq v3 over cz-net's sync transport; system CA + ring via build_client_config;
 // HTTP and HTTPS; <=5 manual redirects; strict streaming cap). No tokio, no hyper.
@@ -424,8 +505,9 @@ fn build_client() -> Result<Agent, String> {
     Ok(cz_net::fetch::sync_agent(cfg, Some(tls)))
 }
 
-/// GET a URL with optional `Accept` header; follows up to 5 (301/302/307/308) redirects; streams
-/// the body into memory under the strict 5 MiB cap through a fixed 64 KiB stack chunk buffer.
+/// GET a URL with optional `Accept` header; follows up to 5 (301/302/307/308) redirects (rejecting
+/// HTTPS->HTTP downgrades); streams the body into memory under the strict 5 MiB cap through a
+/// fixed 64 KiB stack chunk buffer.
 fn fetch_bytes(agent: &Agent, url: &str, accept: Option<&str>) -> Result<Vec<u8>, String> {
     split_url(url)?;
     let mut uri = url.to_string();
@@ -448,7 +530,7 @@ fn fetch_bytes(agent: &Agent, url: &str, accept: Option<&str>) -> Result<Vec<u8>
                 .headers()
                 .get("location")
                 .ok_or(format!("redirect {status} without Location for {url}"))?;
-            uri = join_url(&uri, &String::from_utf8_lossy(loc.as_bytes()))?;
+            uri = check_redirect_target(&uri, &String::from_utf8_lossy(loc.as_bytes()))?;
             continue; // drop redirect body
         }
         if !(200..=299).contains(&status) {
@@ -575,9 +657,11 @@ fn entry_is_native_artifact(rel: &Path) -> bool {
 pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<Json, String> {
     // Phase 10D: borrow the tarball bytes through the cursor instead of copying the whole
     // (up-to-5 MiB) `.tgz` buffer (`Cursor<&[u8]>` implements `Read` directly).
-    let dec = GzDecoder::new(Cursor::new(bytes));
+    // Bound decompressed stream bytes + track cumulative extracted bytes against gzip bombs.
+    let dec = GzDecoder::new(Cursor::new(bytes)).take((EXTRACTED_CAP as u64) * 2 + 1024 * 1024);
     let mut ar = Archive::new(dec);
     let mut pkg_json: Option<Json> = None;
+    let mut total_extracted: u64 = 0;
     for entry in ar.entries().map_err(|e| format!("tar parse error: {e}"))? {
         let mut entry = entry.map_err(|e| format!("tar entry error: {e}"))?;
         let ty = entry.header().entry_type();
@@ -605,14 +689,34 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<Json, String> {
         if size > TARBALL_CAP as u64 {
             return Err(format!("tar entry {raw:?} exceeds 5 MiB cap"));
         }
+        let projected_total = total_extracted
+            .checked_add(size)
+            .ok_or_else(|| "cumulative extracted size overflow".to_string())?;
+        if projected_total > EXTRACTED_CAP as u64 {
+            return Err(format!(
+                "cumulative extracted size exceeds {} MiB cap",
+                EXTRACTED_CAP / (1024 * 1024)
+            ));
+        }
+        let remaining = (EXTRACTED_CAP as u64).saturating_sub(total_extracted);
+        let entry_cap = std::cmp::min(TARBALL_CAP as u64, remaining);
         let mut content: Vec<u8> = Vec::new();
         entry
             .by_ref()
-            .take(TARBALL_CAP as u64 + 1)
+            .take(entry_cap + 1)
             .read_to_end(&mut content)
             .map_err(|e| format!("tar read error for {raw:?}: {e}"))?;
         if content.len() as u64 > size {
-            return Err(format!("tar entry {raw:?} read exceeded declared size", ));
+            return Err(format!("tar entry {raw:?} read exceeded declared size"));
+        }
+        total_extracted = total_extracted
+            .checked_add(content.len() as u64)
+            .ok_or_else(|| "cumulative extracted size overflow".to_string())?;
+        if total_extracted > EXTRACTED_CAP as u64 {
+            return Err(format!(
+                "cumulative extracted size exceeds {} MiB cap",
+                EXTRACTED_CAP / (1024 * 1024)
+            ));
         }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
@@ -751,12 +855,14 @@ pub fn resolve_esm_entry(pkg: &Json) -> String {
 // install (BFS dep tree, <=20 packages, staged + esbuild bundled)
 // ---------------------------------------------------------------------------------------------
 
-fn split_spec(spec: &str) -> (String, String) {
+fn split_spec(spec: &str) -> Result<(String, String), String> {
     // Scoped names start with '@': search from index 1.
-    match spec.rfind('@') {
+    let (name, range) = match spec.rfind('@') {
         Some(idx) if idx > 0 => (spec[..idx].to_string(), spec[idx + 1..].to_string()),
         _ => (spec.to_string(), String::new()),
-    }
+    };
+    validate_pkg_name(&name)?;
+    Ok((name, range))
 }
 
 /// Fetch the abbreviated install metadata JSON and select `range`'s version.
@@ -808,15 +914,16 @@ fn pick_from_meta(meta: &Json, want: &str) -> Result<(String, Json), String> {
     Ok((picked, vobj))
 }
 
-fn dep_map(pkg: &Json) -> Vec<(String, String)> {
+fn dep_map(pkg: &Json) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     if let Some(o) = pkg.get("dependencies").and_then(|v| v.as_object()) {
         for (k, v) in o {
+            validate_pkg_name(k)?;
             let range = v.as_str().unwrap_or("*").to_string();
             out.push((k.clone(), range));
         }
     }
-    out
+    Ok(out)
 }
 
 struct RootInfo {
@@ -833,6 +940,7 @@ fn fetch_dep_tree(client: &Agent, registry: &str, stage: &Path, specs: Vec<(Stri
     // Queue items: (name, range, staged dest, is_root).
     let mut queue: VecDeque<(String, String, PathBuf, bool)> = VecDeque::new();
     for (n, r) in specs {
+        validate_pkg_name(&n)?;
         queue.push_back((n, r, stage.join("package"), true));
     }
     let mut seen: HashSet<String> = HashSet::new();
@@ -889,7 +997,7 @@ fn fetch_dep_tree(client: &Agent, registry: &str, stage: &Path, specs: Vec<(Stri
             return Err(format!("{name}@{ver}: {msg}"));
         }
         let integrity = sri_from_digest(&got);
-        for (dn, dr) in dep_map(&pkg_json) {
+        for (dn, dr) in dep_map(&pkg_json)? {
             let dep_dest = stage.join("node_modules").join(&dn);
             queue.push_back((dn, dr, dep_dest, false));
         }
@@ -1051,12 +1159,30 @@ fn cmd_install(args: &[String]) -> u8 {
                 return 1;
             }
         };
-        for (n, r) in dep_map(&doc) {
+        let deps = match dep_map(&doc) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("zpm: {e}");
+                return 1;
+            }
+        };
+        for (n, r) in deps {
             specs.push(if r.is_empty() || r == "*" { n } else { format!("{n}@{r}") });
         }
         if specs.is_empty() {
             println!("zpm: nothing to install (no dependencies in ./package.json)");
             return 0;
+        }
+    }
+
+    let mut parsed_specs: Vec<(String, String, String)> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        match split_spec(spec) {
+            Ok((name, range)) => parsed_specs.push((spec.clone(), name, range)),
+            Err(e) => {
+                eprintln!("zpm install {spec}: {e}");
+                return 1;
+            }
         }
     }
 
@@ -1070,8 +1196,7 @@ fn cmd_install(args: &[String]) -> u8 {
         }
     };
 
-    for spec in specs {
-        let (name, range) = split_spec(&spec);
+    for (spec, name, range) in parsed_specs {
         // Fetch + bundle ENTIRELY in staging (all guards included) BEFORE any project write: a
         // failure here leaves the previously installed package and lockfile completely intact, and
         // the RAII TempDir keeps ZPM_TMPDIR clean.
@@ -1126,12 +1251,36 @@ fn stage_package_bundle(
     range: &str,
     minify: bool,
 ) -> Result<StagedBundle, String> {
+    validate_pkg_name(name)?;
     let stage = TempDir::new("zpm")?;
     let root = fetch_dep_tree(client, registry, stage.path(), vec![(name.to_string(), range.to_string())])?;
+    // Ensure `entry_rel` cannot traverse outside `<stage>/package` when passed to esbuild.
+    let pkg_root = stage.path().join("package");
+    let safe_entry = validate_safe_rel_path(&root.entry_rel)?;
+    let entry_full = pkg_root.join(&safe_entry);
+    if let Ok(canon_root) = fs::canonicalize(&pkg_root) {
+        let mut probe = entry_full.as_path();
+        while !probe.exists() {
+            match probe.parent() {
+                Some(p) => probe = p,
+                None => break,
+            }
+        }
+        let canon_probe = fs::canonicalize(probe)
+            .map_err(|e| format!("invalid package entry {:?}: {e}", root.entry_rel))?;
+        if !canon_probe.starts_with(&canon_root) {
+            return Err(format!("package entry {:?} escapes package root", root.entry_rel));
+        }
+    }
+    let entry_slash = safe_entry
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
     // Bundle from the staging tree: root entry lives at <stage>/package/<entry>, deps are
     // resolved by esbuild via <stage>/node_modules (never written to the project dir).
     let out_rel = PathBuf::from("node_modules").join(name).join("index.mjs");
-    let entry_arg = format!("package/{}", root.entry_rel);
+    let entry_arg = format!("package/{entry_slash}");
     run_esbuild(esbuild, stage.path(), &entry_arg, &out_rel, ESBUILD_BUNDLE_ARGS, minify, true)?;
     let staged_bundle = stage.path().join(&out_rel);
     if !staged_bundle.is_file() {
@@ -1149,6 +1298,7 @@ fn stage_package_bundle(
 /// final package.json manifest, optionally rewrite the `./package.json` dependency range to
 /// `^<version>` (`record_range`) and refresh `zpm-lock.json`. Returns bundled byte size.
 fn finalize_installed_pkg(cwd: &Path, root: &RootInfo, staged_bundle: &Path, record_range: bool) -> Result<u64, String> {
+    validate_pkg_name(&root.name)?;
     let final_dir = cwd.join("node_modules").join(root.name.as_str());
     fs::create_dir_all(&final_dir).map_err(|e| format!("mkdir failed: {e}"))?;
     let final_out = final_dir.join("index.mjs");
@@ -1367,6 +1517,10 @@ fn cmd_update(args: &[String]) -> u8 {
     } else {
         // Requested packages MUST be listed in package.json dependencies OR zpm-lock.json.
         for n in &names {
+            if let Err(e) = validate_pkg_name(n) {
+                eprintln!("zpm update {n}: {e}");
+                return 1;
+            }
             if !object_has_key(doc.get("dependencies"), n) && !object_has_key(lock.get("packages"), n) {
                 eprintln!("zpm update: {n} is not listed in ./package.json or zpm-lock.json");
                 eprintln!("usage: zpm update [pkg ...] [--latest] [--dry-run] [--no-minify]");
@@ -1375,6 +1529,12 @@ fn cmd_update(args: &[String]) -> u8 {
         }
         names
     };
+    for name in &targets {
+        if let Err(e) = validate_pkg_name(name) {
+            eprintln!("zpm update {name}: {e}");
+            return 1;
+        }
+    }
 
     let registry = registry_base();
     let esbuild = esbuild_bin();
@@ -1473,6 +1633,12 @@ fn cmd_outdated(args: &[String]) -> u8 {
         Err(_) => Json::Object(serde_json::Map::new()),
     };
     let names = object_keys_sorted(doc.get("dependencies"));
+    for name in &names {
+        if let Err(e) = validate_pkg_name(name) {
+            eprintln!("zpm outdated {name}: {e}");
+            return 1;
+        }
+    }
     let registry = registry_base();
     let client = match build_client() {
         Ok(c) => c,
@@ -1572,6 +1738,12 @@ fn cmd_remove(args: &[String]) -> u8 {
     if names.is_empty() {
         eprintln!("usage: zpm remove <pkg> ...");
         return 1;
+    }
+    for name in &names {
+        if let Err(e) = validate_pkg_name(name) {
+            eprintln!("zpm remove {name}: {e}");
+            return 1;
+        }
     }
     let pkg_json = cwd.join("package.json");
     let doc: Json = match fs::read(&pkg_json) {
@@ -2251,5 +2423,98 @@ mod tests {
         }
         assert!(help_text(None).contains("ZPM_REGISTRY"));
         assert!(!has_help_flag(&s(&["myscript", "--", "--help"])));
+    }
+
+    #[test]
+    fn package_name_validation_rejects_traversal_and_accepts_npm_names() {
+        assert!(validate_pkg_name("hono").is_ok());
+        assert!(validate_pkg_name("mini-calc.js").is_ok());
+        assert!(validate_pkg_name("@scope/pkg-1_a").is_ok());
+
+        for bad in [
+            "",
+            ".hidden",
+            "_priv",
+            "..",
+            "../evil",
+            "../../evil",
+            "foo/bar",
+            "@scope/../../evil",
+            "@scope/a/b",
+            "@scope/",
+            "@/pkg",
+            "@.bad/pkg",
+            "pkg\\evil",
+            "pkg?x=1",
+            "pkg#frag",
+            "BadUpper",
+        ] {
+            assert!(validate_pkg_name(bad).is_err(), "must reject bad package name {bad:?}");
+            assert!(split_spec(&format!("{bad}@^1.0.0")).is_err(), "split_spec must reject {bad:?}");
+        }
+        assert_eq!(split_spec("@scope/pkg@^1.2.3").unwrap(), ("@scope/pkg".into(), "^1.2.3".into()));
+        assert_eq!(split_spec("@scope/pkg").unwrap(), ("@scope/pkg".into(), String::new()));
+
+        let bad_deps: Json = serde_json::json!({"dependencies": {"../../evil": "*"}});
+        assert!(dep_map(&bad_deps).is_err());
+
+        // `cmd_remove` must refuse traversal args without deleting anything.
+        let sandbox = TempDir::new("zpm-rm-guard").unwrap();
+        let victim = sandbox.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(sandbox.path()).unwrap();
+        let code = run_cli(&s(&["remove", "../../victim"]));
+        env::set_current_dir(prev).unwrap();
+        assert_ne!(code, 0);
+        assert!(victim.is_dir(), "path traversal remove must not delete victim");
+    }
+
+    #[test]
+    fn entry_rel_containment_rejects_traversal() {
+        assert!(validate_safe_rel_path("../../evil.mjs").is_err());
+        assert!(validate_safe_rel_path("dist/../../evil.mjs").is_err());
+        assert!(validate_safe_rel_path("/etc/passwd").is_err());
+        assert!(validate_safe_rel_path("dist\\evil.mjs").is_err());
+        assert!(validate_safe_rel_path("").is_err());
+        assert!(validate_safe_rel_path("./").is_err());
+        assert_eq!(validate_safe_rel_path("./dist/index.mjs").unwrap(), PathBuf::from("dist/index.mjs"));
+    }
+
+    #[test]
+    fn extract_rejects_gzip_bomb_over_cumulative_32_mib_cap() {
+        assert_eq!(EXTRACTED_CAP, 32 * 1024 * 1024);
+        // Seven 5 MiB entries = 35 MiB uncompressed (> 32 MiB EXTRACTED_CAP), yet < 100 KiB gzipped.
+        let five_mib = vec![0u8; 5 * 1024 * 1024];
+        let mut entries = vec![(
+            "package/package.json".to_string(),
+            b"{\"name\":\"bomb\",\"version\":\"1.0.0\"}".to_vec(),
+        )];
+        for i in 0..7 {
+            entries.push((format!("package/blob-{i}.bin"), five_mib.clone()));
+        }
+        let tgz = gzip_tar(entries);
+        assert!(tgz.len() < TARBALL_CAP, "compressed fixture must stay under TARBALL_CAP");
+        let dir = TempDir::new("zpm-bomb").unwrap();
+        let err = extract_tarball(&tgz, dir.path()).unwrap_err();
+        assert!(err.contains("32 MiB"), "expected cumulative cap error, got: {err}");
+    }
+
+    #[test]
+    fn redirect_downgrade_from_https_to_http_is_rejected() {
+        let err = check_redirect_target("https://registry.npmjs.org/hono", "http://evil.test/hono.tgz").unwrap_err();
+        assert!(err.contains("HTTPS->HTTP"), "got: {err}");
+        assert_eq!(
+            check_redirect_target("https://registry.npmjs.org/a/b", "/c/d").unwrap(),
+            "https://registry.npmjs.org/c/d"
+        );
+        assert_eq!(
+            check_redirect_target("https://registry.npmjs.org/a", "https://cdn.example/b").unwrap(),
+            "https://cdn.example/b"
+        );
+        assert_eq!(
+            check_redirect_target("http://127.0.0.1:8080/a", "/b").unwrap(),
+            "http://127.0.0.1:8080/b"
+        );
     }
 }

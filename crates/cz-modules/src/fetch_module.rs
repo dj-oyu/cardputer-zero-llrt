@@ -570,6 +570,8 @@ pub(crate) const FETCH_SHIM: &str = r#"
             consumedChunks: 0,
             bufferedBytes: null,
             signal: signal || null,
+            _abortTarget: null,
+            _onAbort: null,
             response: null,
             released: false,
         };
@@ -583,6 +585,12 @@ pub(crate) const FETCH_SHIM: &str = r#"
         // part of the guard; leaking slots would keep the runner alive forever after SSE streams.
         if (!s.released && s.closed && s.waitingReads.length === 0) {
             s.released = true;
+            states.delete(s.id);
+            if (s._abortTarget && s._onAbort) {
+                s._abortTarget.removeEventListener("abort", s._onAbort);
+                s._abortTarget = null;
+                s._onAbort = null;
+            }
             __czFetchRelease(s.id);
         }
     }
@@ -970,10 +978,13 @@ pub(crate) const FETCH_SHIM: &str = r#"
             s.headerResolve = resolve; s.headerReject = reject;
         });
         if (signal) {
-            signal.addEventListener("abort", function () {
+            const onAbort = function () {
                 __czFetchCancel(id);
                 globalThis.__czFetchDispatchId(id);
-            });
+            };
+            s._abortTarget = signal;
+            s._onAbort = onAbort;
+            signal.addEventListener("abort", onAbort);
         }
         // Pump immediately so already-arrived events do not wait for the next loop pass.
         globalThis.__czFetchDispatchId(id);
@@ -991,3 +1002,116 @@ pub(crate) const FETCH_SHIM: &str = r#"
     globalThis.__czFetchInstalled = true;
 })();
 "#;
+
+#[cfg(test)]
+mod fetch_module_tests {
+    use super::*;
+    use rquickjs::{Context, Runtime};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[test]
+    fn settled_and_aborted_fetches_prune_fetch_states_and_abort_listeners() -> Result<()> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let srv = std::thread::spawn(move || {
+            // Connection 1: normal 200 OK response
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                let _ = s.flush();
+            }
+            // Connection 2: headers only, body stalls until aborted / test completes
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n");
+                let _ = s.flush();
+                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+            }
+        });
+
+        let rt = Runtime::new()?;
+        let ctx = Context::full(&rt)?;
+        ctx.with(|c| -> Result<()> {
+            install_fetch(&c)?;
+            c.eval::<(), _>(format!(
+                r#"
+                globalThis.__OUT = null;
+                (async () => {{
+                    const ac = new AbortController();
+                    const res = await fetch("http://127.0.0.1:{port}/a", {{ signal: ac.signal }});
+                    const txt = await res.text();
+                    const afterSettleSize = globalThis.__czFetchStates.size;
+                    const listenerCount = (ac.signal._listeners && ac.signal._listeners.abort)
+                        ? ac.signal._listeners.abort.length : -1;
+
+                    // Pre-aborted controller rejects cleanly without touching TCP or leaking states
+                    const ac2 = new AbortController();
+                    ac2.abort("stop");
+                    let abortedErr = "";
+                    try {{ await fetch("http://127.0.0.1:{port}/b", {{ signal: ac2.signal }}); }}
+                    catch (e) {{ abortedErr = String(e); }}
+
+                    // Mid-flight abort after headers arrive cleans up states + abort listener
+                    const ac3 = new AbortController();
+                    const r3 = await fetch("http://127.0.0.1:{port}/hang", {{ signal: ac3.signal }});
+                    ac3.abort("mid");
+                    let midErr = "";
+                    try {{ await r3.text(); }}
+                    catch (e) {{ midErr = String(e); }}
+                    const midListenerCount = (ac3.signal._listeners && ac3.signal._listeners.abort)
+                        ? ac3.signal._listeners.abort.length : -1;
+
+                    globalThis.__OUT = JSON.stringify({{
+                        txt,
+                        afterSettleSize,
+                        listenerCount,
+                        midErr,
+                        midListenerCount,
+                        finalSize: globalThis.__czFetchStates.size,
+                        abortedErr,
+                    }});
+                }})();
+                "#
+            ))?;
+            Ok(())
+        })?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let out = loop {
+            ctx.with(|c| {
+                let _ = c.eval::<i64, _>("__czFetchDrainLoop()");
+            });
+            while let Ok(true) = rt.execute_pending_job() {}
+            let s = ctx.with(|c| {
+                c.eval::<Option<String>, _>("globalThis.__OUT")
+                    .unwrap_or(None)
+            });
+            if let Some(v) = s {
+                break v;
+            }
+            assert!(std::time::Instant::now() < deadline, "fetch module test timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(done_tx);
+        let _ = srv.join();
+        assert!(out.contains("\"txt\":\"ok\""), "{out}");
+        assert!(out.contains("\"afterSettleSize\":0"), "state map leaked: {out}");
+        assert!(out.contains("\"finalSize\":0"), "final state map leaked: {out}");
+        assert!(
+            out.contains("\"listenerCount\":0") || out.contains("\"listenerCount\":-1"),
+            "abort listener leaked: {out}"
+        );
+        assert!(
+            out.contains("\"midListenerCount\":0") || out.contains("\"midListenerCount\":-1"),
+            "mid-flight abort listener leaked: {out}"
+        );
+        assert!(out.contains("\"abortedErr\":\"stop\""), "{out}");
+        assert!(out.contains("\"midErr\":\"mid\""), "{out}");
+        Ok(())
+    }
+}
