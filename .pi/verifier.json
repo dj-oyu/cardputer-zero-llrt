@@ -7,19 +7,19 @@
       "weight": 10
     },
     {
-      "name": "phase13-wintertc-e2e",
-      "command": "node /refs/phase13/verify_phase13.mjs",
-      "weight": 45
+      "name": "phase14-tokio-free-multicall-e2e",
+      "command": "node /refs/phase14/verify_phase14.mjs",
+      "weight": 40
+    },
+    {
+      "name": "phase7b-7c-zpm-regression",
+      "command": "node /refs/phase7b/verify_phase7b.mjs && node /refs/phase7c/verify_phase7c.mjs",
+      "weight": 20
     },
     {
       "name": "phase10-alloc-audit-regression",
       "command": "node /refs/phase10/verify_phase10_final.mjs",
       "weight": 20
-    },
-    {
-      "name": "phase12-modern-web-regression",
-      "command": "node /refs/phase12/verify_phase12.mjs",
-      "weight": 15
     },
     {
       "name": "rust-workspace-tests-all",
