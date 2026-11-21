@@ -86,11 +86,34 @@ pub async fn maybe_run_multicall_async() -> Option<u8> {
 
 /// Run the zpm CLI directly with the given arguments (excluding program name).
 pub async fn run_cli_async(args: &[String]) -> u8 {
-    match args.first().map(|s| s.as_str()) {
+    let sub = args.first().map(|s| s.as_str());
+    match sub {
+        None | Some("--help") | Some("-h") => {
+            println!("{}", help_text(None));
+            return 0;
+        }
+        Some("help") => {
+            let target = args.get(1).map(|s| s.as_str());
+            println!("{}", help_text(target));
+            return 0;
+        }
         Some("--version") | Some("-v") | Some("version") => {
             println!("{}", version_line());
-            0
+            return 0;
         }
+        _ => {}
+    }
+
+    if let Some(cmd) = sub {
+        if has_help_flag(&args[1..]) {
+            if let Some(txt) = subcommand_help(cmd) {
+                println!("{txt}");
+                return 0;
+            }
+        }
+    }
+
+    match sub {
         Some("install") | Some("i") | Some("add") => cmd_install(&args[1..]).await,
         Some("update") | Some("up") | Some("upgrade") => cmd_update(&args[1..]).await,
         Some("outdated") => cmd_outdated(&args[1..]).await,
@@ -100,11 +123,126 @@ pub async fn run_cli_async(args: &[String]) -> u8 {
         Some("bundle") => cmd_bundle(&args[1..]),
         _ => {
             eprintln!(
-                "zpm: unknown or missing command. usage: zpm <install|update|outdated|remove|list|run|bundle|--version> ..."
+                "zpm: unknown command '{}'. Run `zpm --help` for usage.",
+                sub.unwrap_or("")
             );
             1
         }
     }
+}
+
+fn has_help_flag(args: &[String]) -> bool {
+    for a in args {
+        if a == "--" {
+            break;
+        }
+        if a == "--help" || a == "-h" {
+            return true;
+        }
+    }
+    false
+}
+
+fn subcommand_help(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "install" | "i" | "add" => Some(
+            "usage: zpm install [pkg[@range] ...] [--no-minify]\n\
+             aliases: i, add\n\n\
+             Install pure-JS npm package(s) as single-file ESM bundles (node_modules/<pkg>/index.mjs).\n\
+             With no package arguments, installs all dependencies listed in ./package.json.\n\n\
+             Options:\n\
+               --no-minify    Keep esbuild output unminified (default: minified)\n\
+               -h, --help     Show this help\n\n\
+             Safety guards:\n\
+               - Stages in tmpfs ($ZPM_TMPDIR, default /tmp) and cleans up automatically\n\
+               - Verifies SHA-512 integrity, rejects zip-slip paths, >5 MiB tarballs, >20 deps\n\
+               - Rejects native C/C++ addons (binding.gyp, *.node, gypfile)\n\
+               - Marks node:* and cardputer:* as external builtins",
+        ),
+        "update" | "up" | "upgrade" => Some(
+            "usage: zpm update [pkg ...] [--latest] [--dry-run] [--no-minify]\n\
+             aliases: up, upgrade\n\n\
+             Update installed package(s) within package.json semver ranges (or all dependencies).\n\
+             Skips download/bundle when already up to date; rolls back atomically on failure.\n\n\
+             Options:\n\
+               --latest       Upgrade beyond semver range to dist-tags.latest and update package.json\n\
+               --dry-run      Show planned updates without downloading or writing files\n\
+               --no-minify    Keep esbuild output unminified\n\
+               -h, --help     Show this help",
+        ),
+        "outdated" => Some(
+            "usage: zpm outdated [--json]\n\n\
+             Check installed packages in ./package.json against the registry.\n\n\
+             Options:\n\
+               --json         Emit machine-readable JSON array [{name, current, wanted, latest}]\n\
+               -h, --help     Show this help",
+        ),
+        "remove" | "rm" | "uninstall" | "un" => Some(
+            "usage: zpm remove <pkg ...>\n\
+             aliases: rm, uninstall, un\n\n\
+             Remove installed package(s) from node_modules/, package.json, and zpm-lock.json.\n\n\
+             Options:\n\
+               -h, --help     Show this help",
+        ),
+        "list" | "ls" => Some(
+            "usage: zpm list\n\
+             aliases: ls\n\n\
+             List installed packages from zpm-lock.json (or node_modules/*/package.json).\n\n\
+             Options:\n\
+               -h, --help     Show this help",
+        ),
+        "run" => Some(
+            "usage: zpm run <script>\n\n\
+             Execute scripts.<script> from ./package.json via `sh -c`,\n\
+             substituting a leading `node ` with `$ZPM_RUNTIME` (default: cz-llrt).\n\n\
+             Options:\n\
+               -h, --help     Show this help",
+        ),
+        "bundle" => Some(
+            "usage: zpm bundle <entry> -o <out.mjs> [--no-minify]\n\n\
+             Bundle a local JS/TS entry file into a single ESM file via esbuild\n\
+             with --external:node:* and --external:cardputer:*.\n\n\
+             Options:\n\
+               -o, --out <file>   Output bundle path (required)\n\
+               --no-minify        Keep output unminified (default: minified)\n\
+               -h, --help         Show this help",
+        ),
+        _ => None,
+    }
+}
+
+fn help_text(sub: Option<&str>) -> String {
+    if let Some(cmd) = sub {
+        if let Some(txt) = subcommand_help(cmd) {
+            return txt.to_string();
+        }
+    }
+    format!(
+        "{}\n\n\
+         SD-card-friendly npm shim for CardputerZero: stages tarballs in tmpfs (/tmp),\n\
+         verifies SHA-512, rejects native addons, and bundles each package into a single\n\
+         ESM file (`node_modules/<pkg>/index.mjs`) with `node:*` & `cardputer:*` external.\n\n\
+         Usage:\n\
+           zpm <command> [options]   (or invoke via `npm` symlink)\n\n\
+         Commands:\n\
+           install, i, add   Install package(s) as single-file ESM bundles\n\
+           update, up        Update installed package(s) (--latest, --dry-run)\n\
+           outdated          Show outdated dependencies (--json)\n\
+           remove, rm, un    Remove installed package(s)\n\
+           list, ls          List installed packages\n\
+           run               Run a script from package.json\n\
+           bundle            Bundle a local entry file with esbuild\n\
+           help [command]    Show help for zpm or a subcommand\n\n\
+         Global options:\n\
+           -v, --version     Print runtime/shim identity\n\
+           -h, --help        Show help (works on any subcommand too)\n\n\
+         Environment:\n\
+           ZPM_REGISTRY      npm registry URL (default: {DEFAULT_REGISTRY})\n\
+           ZPM_ESBUILD       esbuild binary path (default: {DEFAULT_ESBUILD})\n\
+           ZPM_RUNTIME       JS runtime for `zpm run` (default: {DEFAULT_RUNTIME})\n\
+           ZPM_TMPDIR        tmpfs staging dir (default: /tmp)",
+        version_line()
+    )
 }
 
 /// Identity line for `--version` / `-v` (contains: zpm, native, shim, esbuild, cardputer:*).
@@ -1928,5 +2066,21 @@ mod tests {
         // `remove` without package args must exit non-zero; `list` always exits 0.
         assert_ne!(run_cli_async(&s(&["remove"])).await, 0);
         assert_eq!(run_cli_async(&s(&["ls"])).await, 0);
+    }
+
+    #[tokio::test]
+    async fn help_flags_succeed_for_root_and_all_subcommands() {
+        assert_eq!(run_cli_async(&[]).await, 0);
+        assert_eq!(run_cli_async(&s(&["--help"])).await, 0);
+        assert_eq!(run_cli_async(&s(&["-h"])).await, 0);
+        assert_eq!(run_cli_async(&s(&["help"])).await, 0);
+        assert_eq!(run_cli_async(&s(&["help", "install"])).await, 0);
+        for cmd in ["install", "i", "add", "update", "up", "outdated", "remove", "rm", "list", "ls", "run", "bundle"] {
+            assert_eq!(run_cli_async(&s(&[cmd, "--help"])).await, 0, "failed --help for {cmd}");
+            assert_eq!(run_cli_async(&s(&[cmd, "-h"])).await, 0, "failed -h for {cmd}");
+            assert!(subcommand_help(cmd).is_some(), "missing help text for {cmd}");
+        }
+        assert!(help_text(None).contains("ZPM_REGISTRY"));
+        assert!(!has_help_flag(&s(&["myscript", "--", "--help"])));
     }
 }
