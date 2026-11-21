@@ -635,7 +635,23 @@ impl KvStore {
             _ => return false,
         };
         // Only borrowed field NAMEs are sorted (no value copies); names stay valid because the
-        // entry lives untouched inside `entries` for the whole walk.
+        // entry lives untouched inside `entries` for the whole walk. Phase 10D: records up to
+        // INLINE_FIELDS members walk a stack buffer with ZERO heap allocations; larger records
+        // fall back to the borrowed-name Vec (sorted-name emission semantics unchanged).
+        const INLINE_FIELDS: usize = 32;
+        if map.len() <= INLINE_FIELDS {
+            let mut names: [&str; INLINE_FIELDS] = [""; INLINE_FIELDS];
+            let mut n = 0;
+            for k in map.keys() {
+                names[n] = k.as_ref();
+                n += 1;
+            }
+            names[..n].sort_unstable();
+            for &name in &names[..n] {
+                f(name, map.get(name).expect("visited field is present"));
+            }
+            return true;
+        }
         let mut names: Vec<&str> = map.keys().map(|k| k.as_ref()).collect();
         names.sort_unstable();
         for name in names {

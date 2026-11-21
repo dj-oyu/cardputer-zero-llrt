@@ -11,3 +11,8 @@ path = "src/main.rs"
 [dependencies]
 cz-modules = { path = "../cz-modules" }
 rquickjs.workspace = true
+
+[dev-dependencies]
+cz-gfx = { path = "../cz-gfx" }
+cz-hal = { path = "../cz-hal" }
+cz-json = { path = "../cz-json" }

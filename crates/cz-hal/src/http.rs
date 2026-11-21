@@ -955,18 +955,50 @@ impl ResponseFrame {
     }
 }
 
+/// Duplicate-header bookkeeping for [`write_filtered_headers`]: up to `INLINE_SEEN` names live in
+/// a stack buffer with ZERO heap allocations (Keep-Alive TX reuses one scratch head per response);
+/// only anomalously long header lists spill onto the heap.
+struct SeenNames<'a> {
+    inline: [&'a str; 32],
+    n: usize,
+    spill: Vec<&'a str>,
+}
+
+impl<'a> SeenNames<'a> {
+    #[inline]
+    fn new() -> Self {
+        Self { inline: [""; 32], n: 0, spill: Vec::new() }
+    }
+
+    #[inline]
+    fn any_icase(&self, name: &str) -> bool {
+        self.inline[..self.n].iter().any(|s| s.eq_ignore_ascii_case(name))
+            || self.spill.iter().any(|s| s.eq_ignore_ascii_case(name))
+    }
+
+    #[inline]
+    fn push(&mut self, name: &'a str) {
+        if self.n < self.inline.len() {
+            self.inline[self.n] = name;
+            self.n += 1;
+        } else {
+            self.spill.push(name);
+        }
+    }
+}
+
 fn write_filtered_headers(
     out: &mut Vec<u8>,
     headers: &[(String, String)],
     skip_content_length: bool,
 ) -> bool {
     let mut has_len = false;
-    let mut seen: Vec<&str> = Vec::with_capacity(headers.len());
+    let mut seen: SeenNames<'_> = SeenNames::new();
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("connection")
             || name.eq_ignore_ascii_case("transfer-encoding")
             || (skip_content_length && name.eq_ignore_ascii_case("content-length"))
-            || seen.iter().any(|s| s.eq_ignore_ascii_case(name))
+            || seen.any_icase(name)
         {
             continue;
         }

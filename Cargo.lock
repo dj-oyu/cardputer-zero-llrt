@@ -182,6 +182,9 @@ dependencies = [
 name = "cz-runner"
 version = "0.1.0"
 dependencies = [
+ "cz-gfx",
+ "cz-hal",
+ "cz-json",
  "cz-modules",
  "rquickjs",
 ]
