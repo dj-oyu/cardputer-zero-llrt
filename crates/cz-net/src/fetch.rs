@@ -702,6 +702,18 @@ pub fn next_event(id: u64) -> Option<EngineEvent> {
     ev
 }
 
+#[cfg(test)]
+/// Serial guard for tests that depend on the process-wide slot registry (concurrency cap,
+/// pending/active counts, cancellation, body cap, redirects). Without it, concurrently scheduled
+/// engine tests observe each other's in-flight slots and fail spuriously; the verifier happens to
+/// run serially (`--test-threads=1`), but the suite is now deterministic under default parallelism.
+pub(crate) fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// All live slot ids (requests whose slots have not been released yet).
 pub fn live_ids() -> Vec<u64> {
     engine().slots.lock().expect("slots lock").iter().map(|s| s.id).collect()
@@ -1079,6 +1091,9 @@ mod backpressure_tests {
 
     #[test]
     fn chunk_queue_backpressure_parks_then_wakes_after_draining() {
+        // Uses the process-wide registry + a worker thread park/wake pair: serialize with all
+        // other registry-dependent engine tests.
+        let _lock = registry_test_lock();
         // Exercise the internal streaming queue directly: CHUNK_QUEUE_DEPTH chunks fit, and the
         // next push parks on the Condvar until JavaScript drains (spec §4.1).
         let abort = Arc::new(AbortHandle::new());
@@ -1128,6 +1143,7 @@ mod backpressure_tests {
 
     #[test]
     fn abort_while_parked_on_full_queue_wakes_the_worker() {
+        let _lock = registry_test_lock();
         let abort = Arc::new(AbortHandle::new());
         let slot = Arc::new(Slot::new(999_002, abort.clone()));
         engine().slots.lock().expect("slots").push(slot.clone());

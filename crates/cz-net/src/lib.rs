@@ -30,7 +30,7 @@ mod tests {
     use super::tls::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     fn fixture(name: &str) -> Vec<u8> {
@@ -144,9 +144,19 @@ mod tests {
         assert!(err.contains("no valid PEM certificate"), "was: {err}");
     }
 
+    /// CA env vars are *process-global* and the root store is a process-wide `OnceLock`, so tests
+    /// that mutate `SSL_CERT_FILE` / `SSL_CERT_DIR` / `NODE_EXTRA_CA_CERTS` (or latch the cache)
+    /// must never interleave — they run under this shared serial guard regardless of harness threads.
+    fn ca_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn system_roots_honor_ssl_cert_file_and_extra_certs_env() {
-        // Serialized workspace tests (--test-threads=1) make process env mutation safe here.
+        let _lock = ca_env_lock();
         let dir = std::env::temp_dir().join(format!("cz-net-ca-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmpdir");
         let ca = dir.join("ca.pem");
@@ -180,6 +190,9 @@ mod tests {
 
     #[test]
     fn system_root_store_is_memoized_per_process() {
+        // Latching the cache while another test mutates CA env would make the first load depend on
+        // scheduling; the guard keeps env mutation and cache latching mutually exclusive.
+        let _lock = ca_env_lock();
         let a = system_root_store().expect("system roots present in sandbox");
         let b = system_root_store().expect("cached system roots");
         assert!(Arc::ptr_eq(&a, &b), "OnceLock must return the same Arc");
@@ -441,6 +454,7 @@ mod tests {
 
     #[test]
     fn fetch_delivers_headers_before_body_and_buffers_result() {
+        let _lock = registry_test_lock();
         clear_registry();
         let body = b"hello-cz-net";
         let resp = format!(
@@ -510,6 +524,7 @@ mod tests {
 
     #[test]
     fn streaming_mode_replays_prefix_then_emits_chunks_and_done() {
+        let _lock = registry_test_lock();
         clear_registry();
         let body = b"partA-";
         let head = format!(
@@ -550,6 +565,7 @@ mod tests {
 
     #[test]
     fn cancel_fetch_aborts_a_hanging_stream_quickly() {
+        let _lock = registry_test_lock();
         clear_registry();
         // Server sends headers then never the body; the read blocks until the socket is shut down.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -606,6 +622,7 @@ mod tests {
 
     #[test]
     fn buffered_body_cap_rejects_oversize_response() {
+        let _lock = registry_test_lock();
         clear_registry();
         // 17 MiB of 64 KiB blocks > MAX_BUFFERED_BODY (16 MiB).
         let block = vec![0x41u8; 64 * 1024];
@@ -660,6 +677,7 @@ mod tests {
 
     #[test]
     fn redirects_follow_manual_and_error_modes() {
+        let _lock = registry_test_lock();
         clear_registry();
         // Two-hop redirect chain served on one port: /redirect-1 -> /redirect-2.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -746,6 +764,7 @@ mod tests {
 
     #[test]
     fn concurrency_cap_rejects_the_17th_inflight_fetch() {
+        let _lock = registry_test_lock();
         clear_registry();
         // A listener that accepts connections but never responds -> workers stay in-flight.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -828,6 +847,7 @@ mod tests {
 
     #[test]
     fn post_body_is_sent_to_the_server() {
+        let _lock = registry_test_lock();
         clear_registry();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
