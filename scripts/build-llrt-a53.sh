@@ -186,6 +186,24 @@ patch_llrt_core() {
 }
 
 # ---------------------------------------------------------------------------
+# 6) llrt binary (when present) — wire cz-zpm multicall (`zpm` / `npm` / `cz-llrt zpm`)
+# ---------------------------------------------------------------------------
+patch_llrt_multicall() {
+    local lc="$TARGET_DIR/llrt/Cargo.toml"
+    local lm="$TARGET_DIR/llrt/src/main.rs"
+    local zpm_dir="${CZ_ZPM_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/crates/cz-zpm}"
+    [ -f "$lc" ] && [ -f "$lm" ] && [ -d "$zpm_dir" ] || return 0
+    if ! grep -q '^cz-zpm = ' "$lc"; then
+        insert_after "$lc" '^\[dependencies\]' "cz-zpm = { path = \"$zpm_dir\" }"
+    fi
+    if ! grep -q 'cz_zpm::maybe_run_multicall_async' "$lm"; then
+        if grep -q 'async fn main()' "$lm"; then
+            insert_after "$lm" 'async fn main\(\)' '    if let Some(code) = cz_zpm::maybe_run_multicall_async().await { return Ok(ExitCode::from(code)); }'
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Verification of every patch marker (also proves idempotency when run repeatedly)
 # ---------------------------------------------------------------------------
 verify_apply() {
@@ -232,6 +250,7 @@ apply_patches() {
     patch_llrt_modules_cargo
     patch_module_builder
     patch_llrt_core
+    patch_llrt_multicall
     verify_apply
 }
 

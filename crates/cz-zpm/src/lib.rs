@@ -1,0 +1,1279 @@
+//! `cz-zpm` — native Rust multicall package manager (`zpm` / `npm`) for `cz-llrt`.
+//!
+//! Designed to be linked directly into `cz-llrt` as a multicall binary
+//! (`ln -s cz-llrt zpm`, `ln -s cz-llrt npm`, `ln -s cz-llrt node`) and also built as a
+//! standalone `cz-zpm` binary for fast isolated testing. All networking, TLS, gzip and tar
+//! handling is **pure Rust** (`hyper` + `hyper-rustls`/`rustls` (ring) + `flate2` rust_backend +
+//! `tar` + `sha2`): the external `tar` binary is NEVER spawned and `.tgz` bytes are NEVER written
+//! to disk — tarballs stream in memory (`5 MiB` hard cap), `sha512-<base64>` integrity is
+//! verified BEFORE extraction, zip-slip path traversal and symlinks/hardlinks are rejected,
+//! native addon packages (`gypfile`, `node-gyp`/`prebuild` install scripts, `binding.gyp`,
+//! `*.node`) are rejected, dependency graphs over `20` packages are rejected, and staging dirs
+//! `<ZPM_TMPDIR>/zpm-*` (default `/tmp`, never `TMPDIR`) are ALWAYS cleaned via RAII `Drop`.
+
+use std::collections::{HashSet, VecDeque};
+use std::env;
+use std::fs;
+use std::io::{Cursor, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command as StdCommand;
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use flate2::read::GzDecoder;
+use http::header::{ACCEPT, LOCATION};
+use http_body_util::{BodyExt, Empty};
+use hyper::body::{Bytes, Incoming};
+use hyper::Request;
+use hyper::Uri;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use sha2::{Digest, Sha512};
+use tar::{Archive, EntryType};
+use serde_json::Value as Json;
+
+/// Strict streaming cap for downloaded tarballs: 5 MiB.
+pub const TARBALL_CAP: usize = 5 * 1024 * 1024;
+/// Maximum total packages (root + transitive deps) per install graph.
+pub const MAX_PACKAGES: usize = 20;
+
+const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
+const DEFAULT_ESBUILD: &str = "esbuild";
+const DEFAULT_RUNTIME: &str = "cz-llrt";
+// NOTE: NEVER `TMPDIR` (on-device that defaults to /data/local/tmp).
+const DEFAULT_TMPDIR: &str = "/tmp";
+
+type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
+
+// ---------------------------------------------------------------------------------------------
+// Multicall dispatch
+// ---------------------------------------------------------------------------------------------
+
+/// Pure helper for unit testing multicall dispatch logic:
+/// - `argv[0]` basename == `zpm`/`npm` -> run CLI with `args[1..]`.
+/// - `argv[1] == "zpm"` (e.g. `cz-llrt zpm ...`) -> run CLI with `args[2..]`.
+/// - Otherwise `None` so the JS runtime continues normal startup.
+pub fn parse_multicall_args(args: &[String]) -> Option<Vec<String>> {
+    let argv0 = args.first()?;
+    let base = Path::new(argv0).file_name()?.to_string_lossy().into_owned();
+    if base == "zpm" || base == "npm" {
+        return Some(args[1..].to_vec());
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("zpm") {
+        return Some(args[2..].to_vec());
+    }
+    None
+}
+
+/// Inspect `std::env::args()` for a multicall invocation; returns `Some(exit_code)` when this
+/// binary was invoked as `zpm`/`npm` (symlink) or as `... zpm <cmd>`.
+pub async fn maybe_run_multicall_async() -> Option<u8> {
+    let all: Vec<String> = env::args().collect();
+    let cli = parse_multicall_args(&all)?;
+    Some(run_cli_async(&cli).await)
+}
+
+/// Run the zpm CLI directly with the given arguments (excluding program name).
+pub async fn run_cli_async(args: &[String]) -> u8 {
+    match args.first().map(|s| s.as_str()) {
+        Some("--version") | Some("-v") | Some("version") => {
+            println!("{}", version_line());
+            0
+        }
+        Some("install") | Some("i") | Some("add") => cmd_install(&args[1..]).await,
+        Some("run") => cmd_run(&args[1..]),
+        Some("bundle") => cmd_bundle(&args[1..]),
+        _ => {
+            eprintln!("zpm: unknown or missing command. usage: zpm <install|i|add|run|bundle|--version> ...");
+            1
+        }
+    }
+}
+
+/// Identity line for `--version` / `-v` (contains: zpm, native, shim, esbuild, cardputer:*).
+fn version_line() -> String {
+    format!(
+        "zpm {} \u{2014} native multicall shim for {} \u{2014} esbuild bundler, externals: node:* cardputer:*",
+        env!("CARGO_PKG_VERSION"),
+        DEFAULT_RUNTIME
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Environment helpers
+// ---------------------------------------------------------------------------------------------
+
+fn env_or(key: &str, default: &str) -> String {
+    match env::var(key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => default.to_string(),
+    }
+}
+
+fn registry_base() -> String {
+    env_or("ZPM_REGISTRY", DEFAULT_REGISTRY).trim_end_matches('/').to_string()
+}
+
+fn esbuild_bin() -> String {
+    env_or("ZPM_ESBUILD", DEFAULT_ESBUILD)
+}
+
+fn runtime_bin() -> String {
+    env_or("ZPM_RUNTIME", DEFAULT_RUNTIME)
+}
+
+fn tmp_base() -> PathBuf {
+    // ZPM_TMPDIR only — deliberately NEVER TMPDIR.
+    PathBuf::from(env_or("ZPM_TMPDIR", DEFAULT_TMPDIR))
+}
+
+// ---------------------------------------------------------------------------------------------
+// RAII staging dir (ALWAYS cleaned, even on error / early return)
+// ---------------------------------------------------------------------------------------------
+
+/// RAII guard for `<ZPM_TMPDIR>/zpm-<pid>-<rand>` staging dirs: `Drop` removes the whole tree.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    /// Create a unique `zpm-*` staging dir under `ZPM_TMPDIR` (default `/tmp`, never `TMPDIR`).
+    pub fn new(prefix: &str) -> Result<Self, String> {
+        let base = tmp_base();
+        fs::create_dir_all(&base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
+        let pid = std::process::id();
+        // Cheap entropy from wall-clock nanos + pid for uniqueness across reruns.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        for attempt in 0..32u64 {
+            let name = format!("{prefix}-{pid}-{:x}{:x}", nanos.wrapping_mul(0x9e3779b97f4a7c15), attempt);
+            let candidate = base.join(name);
+            match fs::create_dir(&candidate) {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot create {}: {e}", candidate.display())),
+            }
+        }
+        Err("could not allocate unique zpm-* staging dir".to_string())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // Always clean up staging; ignore missing dirs.
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// URL helpers (redirect + relative resolution)
+// ---------------------------------------------------------------------------------------------
+
+/// Percent-encode a package specifier for use in an HTTP path (keeps `/` and `@` for scopes).
+fn encode_pkg_spec(spec: &str) -> String {
+    let mut out = String::new();
+    for b in spec.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '~' | '@' | '/') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}", b = b));
+        }
+    }
+    out
+}
+
+fn parse_uri(url: &str) -> Result<Uri, String> {
+    url.parse::<Uri>().map_err(|e| format!("invalid uri {url:?}: {e}"))
+}
+
+/// Resolve a possibly-relative `location`/tarball URL against an absolute base URL.
+fn join_url(base: &str, rel: &str) -> Result<String, String> {
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err("empty redirect/target url".to_string());
+    }
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return Ok(rel.to_string());
+    }
+    let bu = parse_uri(base)?;
+    let scheme = bu.scheme().ok_or("base url lacks scheme")?.as_str().to_string();
+    let authority = bu.authority().ok_or("base url lacks authority")?.to_string();
+    let path = bu.path();
+    let target = if rel.starts_with('/') {
+        rel.to_string()
+    } else {
+        // Relative to the base path's directory.
+        let dir = match path.rfind('/') {
+            Some(i) => &path[..i + 1],
+            None => "/",
+        };
+        format!("{dir}{rel}")
+    };
+    Ok(format!("{scheme}://{authority}{target}"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// HTTP fetch (hyper + hyper-rustls ring + webpki-roots; HTTP and HTTPS; <=5 redirects; cap)
+// ---------------------------------------------------------------------------------------------
+
+fn build_client() -> HttpsClient {
+    let connector = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
+/// Read a response body into memory enforcing the strict 5 MiB streaming cap.
+async fn read_capped(mut body: Incoming) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| format!("body stream error: {e}"))?;
+        if let Ok(chunk) = frame.into_data() {
+            if buf.len() + chunk.len() > TARBALL_CAP {
+                return Err(format!(
+                    "download exceeds strict {} MiB streaming cap",
+                    TARBALL_CAP / (1024 * 1024)
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    Ok(buf)
+}
+
+/// GET a URL with optional `Accept` header; follows up to 5 (301/302/307/308) redirects; streams
+/// the body into memory under the 5 MiB cap.
+async fn fetch_bytes(client: &HttpsClient, url: &str, accept: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut uri = parse_uri(url)?;
+    let mut hops = 0usize;
+    loop {
+        let mut builder = Request::get(uri.clone());
+        if let Some(a) = accept {
+            builder = builder.header(ACCEPT, a);
+        }
+        let req = builder
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| format!("bad request: {e}"))?;
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| format!("request failed for {url}: {e}"))?;
+        let status = resp.status().as_u16();
+        if matches!(status, 301 | 302 | 307 | 308) {
+            hops += 1;
+            if hops > 5 {
+                return Err(format!("too many redirects (>5) for {url}"));
+            }
+            let loc = resp
+                .headers()
+                .get(LOCATION)
+                .ok_or(format!("redirect {status} without Location for {url}"))?;
+            let next = join_url(&uri.to_string(), &String::from_utf8_lossy(loc.as_bytes()))?;
+            uri = parse_uri(&next)?;
+            continue; // drop redirect body
+        }
+        if !(200..=299).contains(&status) {
+            return Err(format!("HTTP {status} for {url}"));
+        }
+        return read_capped(resp.into_body()).await;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// sha512-<base64> integrity verification (BEFORE extraction, in memory)
+// ---------------------------------------------------------------------------------------------
+
+/// Verify a `sha512-<base64>` SRI string against in-memory bytes. `Ok(true)` == match.
+pub fn verify_integrity(bytes: &[u8], sri: &str) -> Result<bool, String> {
+    let b64 = match sri.strip_prefix("sha512-") {
+        Some(rest) => rest.trim(),
+        None => return Err(format!("unsupported/missing integrity algorithm: {sri:?}")),
+    };
+    let expected = BASE64
+        .decode(b64)
+        .map_err(|e| format!("bad base64 in integrity {sri:?}: {e}"))?;
+    let got = Sha512::new().chain_update(bytes).finalize();
+    Ok(got.as_slice() == expected.as_slice())
+}
+
+fn sha512_sri(bytes: &[u8]) -> String {
+    let got = Sha512::new().chain_update(bytes).finalize();
+    format!("sha512-{}", BASE64.encode(got.as_slice()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tar safety guards + in-memory extraction (flate2 GzDecoder + tar Archive; NEVER `tar` binary)
+// ---------------------------------------------------------------------------------------------
+
+/// Zip-slip guard: sanitize a tar entry path. Rejects `..` (`ParentDir`), absolute paths
+/// (leading `/` or drive prefix) and collapses to a safe relative path; strips the npm
+/// `package/` prefix.
+pub fn sanitize_tar_path(raw: &str) -> Result<PathBuf, String> {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return Err(format!("absolute tar entry path rejected: {raw:?}"));
+    }
+    for c in p.components() {
+        match c {
+            Component::ParentDir => return Err(format!("zip-slip '..' rejected: {raw:?}")),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("absolute tar entry path rejected: {raw:?}"))
+            }
+            _ => {}
+        }
+    }
+    let comps: Vec<&std::ffi::OsStr> = p
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(seg) => Some(seg),
+            _ => None,
+        })
+        .collect();
+    let mut pb = PathBuf::new();
+    let skip_package = comps.len() > 1 && comps[0] == std::ffi::OsStr::new("package");
+    let segs = if skip_package { &comps[1..] } else { &comps[..] };
+    for seg in segs {
+        pb.push(seg);
+    }
+    if segs.is_empty() {
+        return Err(format!("empty tar entry path: {raw:?}"));
+    }
+    Ok(pb)
+}
+
+/// Native-addon guard on package metadata: rejects `gypfile: true` and `install` /
+/// `preinstall` scripts referencing `node-gyp` or `prebuild`.
+pub fn native_addon_reject(pkg: &Json) -> Option<String> {
+    if pkg.get("gypfile").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("native addon package rejected (gypfile: true)".to_string());
+    }
+    let scripts = pkg.get("scripts");
+    for key in ["install", "preinstall"] {
+        if let Some(s) = scripts.and_then(|sc| sc.get(key)).and_then(|v| v.as_str()) {
+            let lower = s.to_lowercase();
+            if lower.contains("node-gyp") || lower.contains("prebuild") {
+                return Some(format!("native addon install script rejected ({key}: {s:?})"));
+            }
+        }
+    }
+    None
+}
+
+fn entry_is_native_artifact(rel: &Path) -> bool {
+    let name = rel.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    name == "binding.gyp" || name.ends_with(".node")
+}
+
+/// Stream tarball bytes (`gzip` -> `tar`) purely in memory and extract ONLY safe regular files
+/// into `dest`. Enforces zip-slip, symlink/hardlink and native-addon guards; returns the parsed
+/// root `package.json`. NEVER spawns external `tar`; NEVER touches `.tgz` on disk.
+pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<Json, String> {
+    let dec = GzDecoder::new(Cursor::new(bytes.to_vec()));
+    let mut ar = Archive::new(dec);
+    let mut pkg_json: Option<Json> = None;
+    for entry in ar.entries().map_err(|e| format!("tar parse error: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("tar entry error: {e}"))?;
+        let ty = entry.header().entry_type();
+        if matches!(ty, EntryType::Symlink | EntryType::Link) {
+            return Err(format!(
+                "symlink/hardlink tar entry rejected: {:?}",
+                String::from_utf8_lossy(entry.path_bytes().as_ref())
+            ));
+        }
+        let raw = String::from_utf8_lossy(entry.path_bytes().as_ref()).into_owned();
+        let rel = sanitize_tar_path(&raw)?;
+        if entry_is_native_artifact(&rel) {
+            return Err(format!("native addon artifact rejected: {raw:?}"));
+        }
+        let target = dest.join(&rel);
+        if ty.is_dir() {
+            fs::create_dir_all(&target).map_err(|e| format!("mkdir failed: {e}"))?;
+            continue;
+        }
+        if !ty.is_file() {
+            // Skip exotic special files (fifos/devices) entirely.
+            continue;
+        }
+        let size = entry.header().size().map_err(|e| format!("bad tar size: {e}"))?;
+        if size > TARBALL_CAP as u64 {
+            return Err(format!("tar entry {raw:?} exceeds 5 MiB cap"));
+        }
+        let mut content: Vec<u8> = Vec::new();
+        entry
+            .by_ref()
+            .take(TARBALL_CAP as u64 + 1)
+            .read_to_end(&mut content)
+            .map_err(|e| format!("tar read error for {raw:?}: {e}"))?;
+        if content.len() as u64 > size {
+            return Err(format!("tar entry {raw:?} read exceeded declared size", ));
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
+        }
+        let mut f = fs::File::create(&target).map_err(|e| format!("write failed: {e}"))?;
+        f.write_all(&content).map_err(|e| format!("write failed: {e}"))?;
+        if rel == Path::new("package.json") {
+            pkg_json = Some(
+                serde_json::from_slice::<Json>(&content)
+                    .map_err(|e| format!("invalid package.json in tarball: {e}"))?,
+            );
+        }
+    }
+    pkg_json.ok_or("npm tarball is missing package/package.json".to_string())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Version resolution (latest / exact / ^ / ~ / >=)
+// ---------------------------------------------------------------------------------------------
+
+/// Parse `x.y.z` (tolerating a leading `v`; ignoring `-pre`/`+build` suffixes for ordering).
+pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().strip_prefix('v').unwrap_or(s);
+    let core = s.split(['-', '+']).next().unwrap_or("");
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+}
+
+fn is_prerelease(s: &str) -> bool {
+    s.contains('-')
+}
+
+fn satisfies(range: &str, ver: (u64, u64, u64), base: (u64, u64, u64)) -> bool {
+    if range.starts_with('^') {
+        // ^base: same major, version >= base.
+        ver.0 == base.0 && ver >= base
+    } else if range.starts_with('~') {
+        // ~base: same major.minor, patch >= base patch.
+        ver.0 == base.0 && ver.1 == base.1 && ver >= base
+    } else if let Some(rest) = range.strip_prefix(">=") {
+        parse_semver(rest.trim()).map(|b| ver >= b).unwrap_or(false)
+    } else if let Some(rest) = range.strip_prefix('=') {
+        rest.trim().is_empty() || parse_semver(rest.trim()) == Some(ver)
+    } else {
+        false
+    }
+}
+
+/// Pick a concrete version from `versions` honoring `want`: `""`/`latest`/`*` -> latest dist-tag,
+/// exact, `^`, `~`, `>=`. Prereleases are skipped unless they match exactly.
+pub fn select_version(versions: &[String], latest: Option<&str>, want: &str) -> Option<String> {
+    let want = want.trim();
+    if want.is_empty() || want == "latest" || want == "*" || want == ">=0.0.0" {
+        return latest.map(String::from).or_else(|| versions.last().cloned());
+    }
+    // Exact string match first (covers prereleases too).
+    let normalized = want.strip_prefix('v').unwrap_or(want);
+    for v in versions {
+        if v == normalized || v == want {
+            return Some(v.clone());
+        }
+    }
+    // Strip range operators (^ ~ > < =) before parsing the comparator base.
+    let base = parse_semver(want.trim_start_matches(['^', '~', '>', '<', '=', 'v', ' ']))?;
+    versions
+        .iter()
+        .filter(|v| !is_prerelease(v))
+        .filter_map(|v| parse_semver(v).map(|t| (t, v.clone())))
+        .filter(|(t, _)| satisfies(want, *t, base))
+        .max_by_key(|(t, _)| *t)
+        .map(|(_, v)| v)
+}
+
+// ---------------------------------------------------------------------------------------------
+// ESM entry resolution
+// ---------------------------------------------------------------------------------------------
+
+fn clean_rel(s: &str) -> String {
+    s.trim().trim_start_matches("./").to_string()
+}
+
+fn exports_string(v: &Json) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(clean_rel(s));
+    }
+    if let Some(o) = v.as_object() {
+        for key in ["import", "default", "browser"] {
+            if let Some(sub) = o.get(key) {
+                if let Some(s) = sub.as_str() {
+                    return Some(clean_rel(s));
+                }
+                // Nested conditional object: pick a string leaf.
+                if let Some(so) = sub.as_object() {
+                    for k2 in ["import", "default", "require"] {
+                        if let Some(s2) = so.get(k2).and_then(|x| x.as_str()) {
+                            return Some(clean_rel(s2));
+                        }
+                    }
+                    for val in so.values() {
+                        if let Some(s2) = val.as_str() {
+                            return Some(clean_rel(s2));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the ESM entry point: `exports["."]` (`import`/`default`/`browser`/string), then
+/// `module`, then `main`, then `index.js`.
+pub fn resolve_esm_entry(pkg: &Json) -> String {
+    if let Some(exp) = pkg.get("exports").and_then(|e| e.get(".")) {
+        if let Some(s) = exports_string(exp) {
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    for key in ["module", "main"] {
+        if let Some(s) = pkg.get(key).and_then(|v| v.as_str()) {
+            let s = clean_rel(s);
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "index.js".to_string()
+}
+
+// ---------------------------------------------------------------------------------------------
+// install (BFS dep tree, <=20 packages, staged + esbuild bundled)
+// ---------------------------------------------------------------------------------------------
+
+fn split_spec(spec: &str) -> (String, String) {
+    // Scoped names start with '@': search from index 1.
+    match spec.rfind('@') {
+        Some(idx) if idx > 0 => (spec[..idx].to_string(), spec[idx + 1..].to_string()),
+        _ => (spec.to_string(), String::new()),
+    }
+}
+
+/// Fetch the abbreviated install metadata JSON and select `range`'s version.
+fn pick_from_meta(meta: &Json, want: &str) -> Result<(String, Json), String> {
+    let versions_obj = meta
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .ok_or("registry metadata missing versions".to_string())?;
+    let versions: Vec<String> = versions_obj.keys().cloned().collect();
+    let latest = meta
+        .get("dist-tags")
+        .and_then(|d| d.get("latest"))
+        .and_then(|v| v.as_str());
+    let ver = select_version(&versions, latest, want)
+        .ok_or(format!("no version matching {want:?} for package"))?;
+    let vobj = versions_obj.get(&ver).cloned().unwrap_or_else(|| Json::Object(serde_json::Map::new()));
+    Ok((ver, vobj))
+}
+
+fn dep_map(pkg: &Json) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(o) = pkg.get("dependencies").and_then(|v| v.as_object()) {
+        for (k, v) in o {
+            let range = v.as_str().unwrap_or("*").to_string();
+            out.push((k.clone(), range));
+        }
+    }
+    out
+}
+
+struct RootInfo {
+    name: String,
+    version: String,
+    integrity: String,
+    entry_rel: String, // ESM entry relative to the staged root package dir
+}
+
+/// BFS-fetch a package + its transitive pure-JS deps into staging (root at `stage/package`,
+/// deps at `stage/node_modules/<dep>`). Guards: <=20 pkgs, sha512 integrity BEFORE extraction,
+/// zip-slip/native rejection.
+async fn fetch_dep_tree(client: &HttpsClient, registry: &str, stage: &Path, specs: Vec<(String, String)>) -> Result<RootInfo, String> {
+    // Queue items: (name, range, staged dest, is_root).
+    let mut queue: VecDeque<(String, String, PathBuf, bool)> = VecDeque::new();
+    for (n, r) in specs {
+        queue.push_back((n, r, stage.join("package"), true));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut count = 0usize;
+    let mut root: Option<RootInfo> = None;
+    while let Some((name, range, dest, is_root)) = queue.pop_front() {
+        if seen.contains(&name) {
+            continue; // dedupe same-name packages across the graph
+        }
+        seen.insert(name.clone());
+        count += 1;
+        if count > MAX_PACKAGES {
+            return Err(format!("dependency graph exceeds {} packages", MAX_PACKAGES));
+        }
+        fs::create_dir_all(&dest).map_err(|e| format!("mkdir staging failed: {e}"))?;
+
+        let meta_url = format!("{registry}/{}", encode_pkg_spec(&name));
+        let meta_bytes = fetch_bytes(client, &meta_url, Some("application/vnd.npm.install-v1+json")).await?;
+        let meta: Json =
+            serde_json::from_slice(&meta_bytes).map_err(|e| format!("invalid registry metadata for {name}: {e}"))?;
+        let (ver, vobj) = pick_from_meta(&meta, &range)?;
+        // Native addon guard can fire straight from registry metadata too.
+        if let Some(msg) = native_addon_reject(&vobj) {
+            return Err(format!("{name}@{ver}: {msg}"));
+        }
+        let tarball = vobj
+            .get("dist")
+            .and_then(|d| d.get("tarball"))
+            .and_then(|t| t.as_str())
+            .ok_or(format!("{name}@{ver}: metadata missing dist.tarball"))?;
+        let tarball_url = join_url(&format!("{registry}/"), tarball)?;
+        let tb = fetch_bytes(client, &tarball_url, None).await?;
+        let sri = vobj
+            .get("dist")
+            .and_then(|d| d.get("integrity"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("");
+        // Verify sha512 integrity BEFORE extracting anything.
+        if !verify_integrity(&tb, sri)? {
+            return Err(format!("{name}@{ver}: sha512 integrity MISMATCH (refusing to extract)"));
+        }
+        let pkg_json = extract_tarball(&tb, &dest)?;
+        if let Some(msg) = native_addon_reject(&pkg_json) {
+            return Err(format!("{name}@{ver}: {msg}"));
+        }
+        let integrity = sha512_sri(&tb);
+        for (dn, dr) in dep_map(&pkg_json) {
+            let dep_dest = stage.join("node_modules").join(&dn);
+            queue.push_back((dn, dr, dep_dest, false));
+        }
+        if is_root {
+            root = Some(RootInfo {
+                name: name.clone(),
+                version: ver.clone(),
+                integrity: integrity.clone(),
+                entry_rel: resolve_esm_entry(&pkg_json),
+            });
+        }
+    }
+    root.ok_or("root package was not fetched".to_string())
+}
+
+const ESBUILD_BUNDLE_ARGS: &[&str] = &[
+    "--bundle",
+    "--format=esm",
+    "--platform=neutral",
+    "--main-fields=module,main",
+    "--conditions=import,module,default",
+    "--external:node:*",
+    "--external:cardputer:*",
+];
+
+/// Run `esbuild` to bundle into a single ESM file.
+fn run_esbuild(esbuild: &str, cwd: &Path, entry: &str, outfile: &Path, extra: &[&str], minify: bool, capture: bool) -> Result<(), String> {
+    let mut cmd = StdCommand::new(esbuild);
+    cmd.current_dir(cwd).arg(entry).args(extra);
+    if minify {
+        cmd.arg("--minify");
+    }
+    cmd.arg(format!("--outfile={}", outfile.display()));
+    if capture {
+        let out = cmd.output().map_err(|e| format!("failed to spawn esbuild ({esbuild}): {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "esbuild failed with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    } else {
+        let st = cmd.status().map_err(|e| format!("failed to spawn esbuild ({esbuild}): {e}"))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("esbuild exited with {st}"))
+        }
+    }
+}
+
+/// Structured final package manifest written to `node_modules/<pkg>/package.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FinalManifest {
+    name: String,
+    version: String,
+    #[serde(rename = "type")]
+    pkg_type: String,
+    main: String,
+    exports: serde_json::Map<String, Json>,
+}
+
+/// One entry in `./zpm-lock.json` `packages`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LockEntry {
+    version: String,
+    integrity: String,
+    bundled_bytes: u64,
+}
+
+impl LockEntry {
+    fn to_value(&self) -> Result<Json, String> {
+        serde_json::to_value(self).map_err(|e| format!("serialize lock entry: {e}"))
+    }
+}
+
+fn update_root_package_json(cwd: &Path, name: &str, version: &str) -> Result<(), String> {
+    let path = cwd.join("package.json");
+    let mut doc: Json = match fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("invalid ./package.json: {e}"))?,
+        Err(_) => Json::Object(serde_json::Map::new()),
+    };
+    if !doc.is_object() {
+        doc = Json::Object(serde_json::Map::new());
+    }
+    let obj = doc.as_object_mut().unwrap();
+    let deps = obj
+        .entry("dependencies")
+        .or_insert_with(|| Json::Object(serde_json::Map::new()));
+    if !deps.is_object() {
+        *deps = Json::Object(serde_json::Map::new());
+    }
+    deps.as_object_mut()
+        .unwrap()
+        .insert(name.to_string(), Json::String(format!("^{version}")));
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize package.json: {e}"))?;
+    fs::write(&path, text + "\n").map_err(|e| format!("write package.json: {e}"))
+}
+
+fn update_lockfile(cwd: &Path, name: &str, version: &str, integrity: &str, bundled_bytes: u64) -> Result<(), String> {
+    let path = cwd.join("zpm-lock.json");
+    let mut doc: Json = match fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|_| Json::Object(serde_json::Map::new())),
+        Err(_) => Json::Object(serde_json::Map::new()),
+    };
+    if !doc.is_object() {
+        doc = Json::Object(serde_json::Map::new());
+    }
+    let obj = doc.as_object_mut().unwrap();
+    obj.insert("lockfileVersion".to_string(), serde_json::json!(1));
+    let pkgs = obj
+        .entry("packages")
+        .or_insert_with(|| Json::Object(serde_json::Map::new()));
+    if !pkgs.is_object() {
+        *pkgs = Json::Object(serde_json::Map::new());
+    }
+    pkgs.as_object_mut().unwrap().insert(
+        name.to_string(),
+        LockEntry {
+            version: version.to_string(),
+            integrity: integrity.to_string(),
+            bundled_bytes,
+        }
+        .to_value()?,
+    );
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize zpm-lock.json: {e}"))?;
+    fs::write(&path, text + "\n").map_err(|e| format!("write zpm-lock.json: {e}"))
+}
+
+async fn cmd_install(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut minify = true;
+    let mut specs: Vec<String> = Vec::new();
+    for a in args {
+        if a == "--no-minify" {
+            minify = false;
+        } else if a.starts_with("--") {
+            eprintln!("zpm install: ignoring unknown flag {a}");
+        } else {
+            specs.push(a.clone());
+        }
+    }
+    // No positional packages -> install dependencies from ./package.json.
+    if specs.is_empty() {
+        let pj = cwd.join("package.json");
+        let doc: Json = match fs::read(&pj) {
+            Ok(b) => match serde_json::from_slice(&b) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("zpm: invalid ./package.json: {e}");
+                    return 1;
+                }
+            },
+            Err(_) => {
+                eprintln!("zpm: no packages given and no ./package.json to install from");
+                return 1;
+            }
+        };
+        for (n, r) in dep_map(&doc) {
+            specs.push(if r.is_empty() || r == "*" { n } else { format!("{n}@{r}") });
+        }
+        if specs.is_empty() {
+            println!("zpm: nothing to install (no dependencies in ./package.json)");
+            return 0;
+        }
+    }
+
+    let registry = registry_base();
+    let esbuild = esbuild_bin();
+    let client = build_client();
+
+    for spec in specs {
+        let (name, range) = split_spec(&spec);
+        let stage = match TempDir::new("zpm") {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("zpm: staging failed: {e}");
+                return 1;
+            }
+        };
+        let root = match fetch_dep_tree(&client, &registry, stage.path(), vec![(name.clone(), range.clone())]).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("zpm install {spec}: {e}");
+                return 1;
+            }
+        };
+        // Bundle from the staging tree: root entry lives at <stage>/package/<entry>, deps are
+        // resolved by esbuild via <stage>/node_modules (never written to the project dir).
+        let out_rel = PathBuf::from("node_modules").join(name.as_str()).join("index.mjs");
+        let entry_arg = format!("package/{}", root.entry_rel);
+        if let Err(e) = run_esbuild(&esbuild, stage.path(), &entry_arg, &out_rel, ESBUILD_BUNDLE_ARGS, minify, true) {
+            eprintln!("zpm install {spec}: {e}");
+            return 1;
+        }
+        let staged_out = stage.path().join(&out_rel);
+        // finalize into ./node_modules/<pkg>/ (index.mjs + package.json only)
+        let final_dir = cwd.join("node_modules").join(name.as_str());
+        if let Err(e) = fs::create_dir_all(&final_dir) {
+            eprintln!("zpm install {spec}: mkdir failed: {e}");
+            return 1;
+        }
+        match fs::copy(&staged_out, final_dir.join("index.mjs")) {
+            Ok(n) => {
+                let mut exports = serde_json::Map::new();
+                exports.insert(".".to_string(), Json::String("./index.mjs".to_string()));
+                let manifest = FinalManifest {
+                    name: root.name.clone(),
+                    version: root.version.clone(),
+                    pkg_type: "module".to_string(),
+                    main: "./index.mjs".to_string(),
+                    exports,
+                };
+                let text = match serde_json::to_string_pretty(&manifest) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("zpm: serialize manifest: {e}");
+                        return 1;
+                    }
+                };
+                if let Err(e) = fs::write(final_dir.join("package.json"), text + "\n") {
+                    eprintln!("zpm: write manifest: {e}");
+                    return 1;
+                }
+                if let Err(e) = update_root_package_json(&cwd, &name, &root.version) {
+                    eprintln!("zpm: {e}");
+                    return 1;
+                }
+                if let Err(e) = update_lockfile(&cwd, &name, &root.version, &root.integrity, n) {
+                    eprintln!("zpm: {e}");
+                    return 1;
+                }
+                println!(
+                    "zpm: installed {name}@{} -> node_modules/{name}/index.mjs ({n} bytes)",
+                    root.version
+                );
+            }
+            Err(e) => {
+                eprintln!("zpm install {spec}: copy bundle failed: {e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Rewrite a leading `node `/`node\t` invocation to `<runtime> ` (pure helper, unit-tested).
+pub fn rewrite_node_prefix(cmd: &str, runtime: &str) -> String {
+    let t = cmd.trim_start();
+    if t.starts_with("node ") || t.starts_with("node\t") {
+        format!("{runtime}{}", &t[4..])
+    } else {
+        cmd.to_string()
+    }
+}
+
+/// `zpm run <script>`: look up `scripts[script]`, rewrite a leading `node ` to `<ZPM_RUNTIME> `,
+/// execute via `sh -c` inheriting stdio.
+fn cmd_run(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let script = match args.first() {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: zpm run <script>");
+            return 1;
+        }
+    };
+    let pj = cwd.join("package.json");
+    let doc: Json = match fs::read(&pj) {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zpm run: invalid ./package.json: {e}");
+                return 1;
+            }
+        },
+        Err(_) => {
+            eprintln!("zpm run: no ./package.json in {}", cwd.display());
+            return 1;
+        }
+    };
+    let cmd_str = doc
+        .get("scripts")
+        .and_then(|s| s.get(script.as_str()))
+        .and_then(|v| v.as_str())
+        .map(|c| rewrite_node_prefix(c, &runtime_bin()));
+    let cmd_str = match cmd_str {
+        Some(c) => c,
+        None => {
+            eprintln!("zpm run: script {script:?} not found in ./package.json");
+            return 1;
+        }
+    };
+    match StdCommand::new("sh").arg("-c").arg(cmd_str).current_dir(&cwd).status() {
+        Ok(st) => st.code().map(|c| c as u8).unwrap_or(1),
+        Err(e) => {
+            eprintln!("zpm run: failed to spawn sh: {e}");
+            1
+        }
+    }
+}
+
+/// `zpm bundle <entry> -o <out.mjs> [--no-minify]`
+fn cmd_bundle(args: &[String]) -> u8 {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut minify = true;
+    let mut entry: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--no-minify" => minify = false,
+            "-o" | "--outfile" => out = iter.next().cloned(),
+            s if s.starts_with("--outfile=") => out = Some(s.split_once('=').map(|(_, v)| v.to_string()).unwrap_or_default()),
+            s if s.starts_with("--") => eprintln!("zpm bundle: ignoring unknown flag {s}"),
+            s if entry.is_none() => entry = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    let (entry, out) = match (entry, out) {
+        (Some(e), Some(o)) => (e, o),
+        _ => {
+            eprintln!("usage: zpm bundle <entry> -o <out.mjs> [--no-minify]");
+            return 1;
+        }
+    };
+    let extra: Vec<&str> = vec![
+        "--bundle",
+        "--format=esm",
+        "--platform=neutral",
+        "--external:node:*",
+        "--external:cardputer:*",
+    ];
+    if let Err(e) = run_esbuild(&esbuild_bin(), &cwd, &entry, &PathBuf::from(out), &extra, minify, false) {
+        eprintln!("zpm bundle: {e}");
+        return 1;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn multicall_zpm_basename_dispatch() {
+        assert_eq!(parse_multicall_args(&s(&["zpm", "install", "hono"])), Some(s(&["install", "hono"])));
+    }
+
+    #[test]
+    fn multicall_npm_basename_dispatch() {
+        assert_eq!(
+            parse_multicall_args(&s(&["/usr/local/bin/npm", "--version"])),
+            Some(s(&["--version"]))
+        );
+    }
+
+    #[test]
+    fn multicall_subcommand_dispatch() {
+        assert_eq!(parse_multicall_args(&s(&["cz-llrt", "zpm", "run", "dev"])), Some(s(&["run", "dev"])));
+    }
+
+    #[test]
+    fn multicall_passthrough_for_js_runtime() {
+        assert_eq!(parse_multicall_args(&s(&["cz-llrt", "app.mjs"])), None);
+        assert_eq!(parse_multicall_args(&[]), None);
+    }
+
+    #[test]
+    fn version_line_has_all_identity_tokens() {
+        let line = version_line();
+        for tok in ["zpm", "native", "shim", "esbuild", "cardputer:*"] {
+            assert!(line.contains(tok), "version line missing token {tok}: {line}");
+        }
+    }
+
+    #[test]
+    fn zipslip_paths_rejected_and_safe_paths_stripped() {
+        assert!(sanitize_tar_path("package/../../evil.txt").is_err());
+        assert!(sanitize_tar_path("../../secret").is_err());
+        assert!(sanitize_tar_path("/etc/passwd").is_err());
+        assert!(sanitize_tar_path("a/b/../c").is_err());
+        let ok = sanitize_tar_path("package/src/main.js").unwrap();
+        assert_eq!(ok, PathBuf::from("src/main.js"));
+        let ok2 = sanitize_tar_path("./pkg/./index.js").unwrap();
+        assert_eq!(ok2, PathBuf::from("pkg/index.js"));
+    }
+
+    fn gzip_tar(entries: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut ar = Builder::new(&mut enc);
+            for (name, data) in entries {
+                let mut h = Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_mtime(0);
+                h.set_entry_type(EntryType::file());
+                ar.append_data(&mut h, name.as_str(), Cursor::new(data)).unwrap();
+            }
+            ar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    /// Hand-craft a raw ustar entry (the `tar` Builder itself refuses `..` paths, so malicious
+    /// fixtures must be built byte-by-byte like the verifier does).
+    fn raw_ustar(name: &str, content: &str) -> Vec<u8> {
+        let data = content.as_bytes();
+        let mut hdr = [0u8; 512];
+        hdr[..name.len().min(100)].copy_from_slice(name.as_bytes());
+        hdr[100..108].copy_from_slice(b"0000644\0");
+        hdr[108..116].copy_from_slice(b"0000000\0");
+        hdr[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", data.len());
+        hdr[124..136].copy_from_slice(size.as_bytes());
+        let mtime = format!("{:011o}\0", 0);
+        hdr[136..148].copy_from_slice(mtime.as_bytes());
+        hdr[148..156].fill(b' ');
+        hdr[156] = b'0';
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263..265].copy_from_slice(b"00");
+        let sum: u32 = hdr.iter().map(|b| *b as u32).sum();
+        let chk = format!("{:06o}\0 ", sum);
+        hdr[148..156].copy_from_slice(chk.as_bytes());
+        let pad = (512 - data.len() % 512) % 512;
+        let mut out = hdr.to_vec();
+        out.extend_from_slice(data);
+        out.extend(std::iter::repeat(0u8).take(pad));
+        out
+    }
+
+    fn gzip_raw(tar_bytes: Vec<u8>) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&tar_bytes).unwrap();
+        enc.write_all(&[0u8; 1024]).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_rejects_zip_slip_tarball() {
+        let tar_bytes = [
+            raw_ustar("package/package.json", "{\"name\":\"bad\",\"version\":\"1.0.0\"}"),
+            raw_ustar("package/../../evil.txt", "pwned\n"),
+        ]
+        .concat();
+        let tgz = gzip_raw(tar_bytes);
+        let dir = TempDir::new("zpm-test").unwrap();
+        assert!(extract_tarball(&tgz, dir.path()).is_err());
+        // nothing escaped the staging dir
+        assert!(!dir.path().join("evil.txt").exists());
+        assert!(!dir.path().join("package").join("../../evil.txt").exists());
+    }
+
+    #[test]
+    fn extract_rejects_symlink_entries() {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut ar = Builder::new(&mut enc);
+            let data = b"{\"name\":\"s\",\"version\":\"1.0.0\"}".to_vec();
+            let mut h = Header::new_gnu();
+            h.set_size(data.len() as u64);
+            ar.append_data(&mut h, "package/package.json", Cursor::new(data)).unwrap();
+            let mut lh = Header::new_gnu();
+            lh.set_size(0);
+            lh.set_entry_type(EntryType::Symlink);
+            ar.append_link(&mut lh, "package/escape", "package/package.json").unwrap();
+            ar.finish().unwrap();
+        }
+        let tgz = enc.finish().unwrap();
+        let dir = TempDir::new("zpm-test").unwrap();
+        assert!(extract_tarball(&tgz, dir.path()).is_err());
+    }
+
+    #[test]
+    fn extract_rejects_native_artifacts_and_gypfile() {
+        let tgz_gyp = gzip_tar(vec![
+            ("package/package.json".into(), b"{\"name\":\"bad-native\",\"version\":\"1.0.0\",\"gypfile\":true}".to_vec()),
+            ("package/binding.gyp".into(), b"{}\n".to_vec()),
+        ]);
+        let dir = TempDir::new("zpm-test").unwrap();
+        assert!(extract_tarball(&tgz_gyp, dir.path()).is_err());
+
+        let tgz_node = gzip_tar(vec![
+            ("package/package.json".into(), b"{\"name\":\"x\",\"version\":\"1.0.0\"}".to_vec()),
+            ("package/build/x.node".into(), b"\x7fELF".to_vec()),
+        ]);
+        let dir2 = TempDir::new("zpm-test").unwrap();
+        assert!(extract_tarball(&tgz_node, dir2.path()).is_err());
+
+        let meta: Json = serde_json::json!({"scripts": {"install": "node-gyp rebuild"}});
+        assert!(native_addon_reject(&meta).is_some());
+        let meta2: Json = serde_json::json!({"scripts": {"preinstall": "prebuild-install || source ./env"}});
+        assert!(native_addon_reject(&meta2).is_some());
+        let okmeta: Json = serde_json::json!({"scripts": {"build": "echo hi"}});
+        assert!(native_addon_reject(&okmeta).is_none());
+    }
+
+    #[test]
+    fn extract_clean_package_roundtrip() {
+        let tgz = gzip_tar(vec![
+            ("package/package.json".into(), b"{\"name\":\"mini\",\"version\":\"1.0.0\",\"main\":\"index.js\"}".to_vec()),
+            ("package/index.js".into(), b"export const x=1;\n".to_vec()),
+        ]);
+        let dir = TempDir::new("zpm-test").unwrap();
+        let pj = extract_tarball(&tgz, dir.path()).unwrap();
+        assert_eq!(pj.get("name").and_then(|v| v.as_str()), Some("mini"));
+        assert!(dir.path().join("index.js").is_file());
+    }
+
+    #[test]
+    fn integrity_verify_match_mismatch_and_format() {
+        let data = b"tarball-bytes".to_vec();
+        let sri = sha512_sri(&data);
+        assert!(verify_integrity(&data, &sri).unwrap());
+        assert!(!verify_integrity(b"other", &sri).unwrap());
+        // base64 sanity: decoded digest must be 64 bytes (SHA-512)
+        let b64 = sri.strip_prefix("sha512-").unwrap();
+        assert_eq!(BASE64.decode(b64).unwrap().len(), 64);
+        assert!(verify_integrity(&data, "md5-abc=").is_err());
+        assert!(verify_integrity(&data, "").is_err());
+    }
+
+    #[test]
+    fn semver_selection_rules() {
+        let vers = s(&["0.9.0", "1.0.0", "1.2.3", "1.5.9", "2.0.0", "1.3.0-beta.1"]);
+        assert_eq!(select_version(&vers, Some("2.0.0"), "").unwrap(), "2.0.0");
+        assert_eq!(select_version(&vers, Some("2.0.0"), "latest").unwrap(), "2.0.0");
+        assert_eq!(select_version(&vers, None, "^1.0.0").unwrap(), "1.5.9");
+        assert_eq!(select_version(&vers, None, "~1.2.0").unwrap(), "1.2.3");
+        assert_eq!(select_version(&vers, None, "1.0.0").unwrap(), "1.0.0");
+        assert_eq!(select_version(&vers, None, "^3.0.0"), None);
+        // exact prerelease is allowed; caret ranges skip it
+        assert_eq!(select_version(&vers, None, "1.3.0-beta.1").unwrap(), "1.3.0-beta.1");
+        assert_eq!(parse_semver("v2.1.0+build").unwrap(), (2, 1, 0));
+    }
+
+    #[test]
+    fn esm_entry_resolution_order() {
+        let hono_like: Json = serde_json::json!({
+            "exports": { ".": {"types": "./dist/types/index.d.ts", "import": "./dist/index.js", "require": "./dist/cjs/index.js"} },
+            "main": "dist/cjs/index.js",
+        });
+        assert_eq!(resolve_esm_entry(&hono_like), "dist/index.js");
+        let str_export: Json = serde_json::json!({"exports": {".": "./lib/mod.mjs"}});
+        assert_eq!(resolve_esm_entry(&str_export), "lib/mod.mjs");
+        let default_only: Json = serde_json::json!({"exports": {".": {"browser": "./b.js", "default": "./d.js"}}});
+        assert_eq!(resolve_esm_entry(&default_only), "d.js"); // lookup order: import, default, browser
+        let module_main: Json = serde_json::json!({"module": "esm/main.js", "main": "cjs/main.js"});
+        assert_eq!(resolve_esm_entry(&module_main), "esm/main.js");
+        let bare: Json = serde_json::json!({});
+        assert_eq!(resolve_esm_entry(&bare), "index.js");
+    }
+
+    #[test]
+    fn raii_tempdir_always_cleaned() {
+        let p = {
+            let t = TempDir::new("zpm").unwrap();
+            fs::write(t.path().join("marker.txt"), b"x").unwrap();
+            assert!(t.path().is_dir());
+            t.path().to_path_buf()
+        }; // Drop fires here
+        assert!(!p.exists(), "RAII TempDir must clean up on drop");
+    }
+
+    #[test]
+    fn limit_constants_match_spec() {
+        assert_eq!(MAX_PACKAGES, 20);
+        assert_eq!(TARBALL_CAP, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn node_prefix_rewrite() {
+        assert_eq!(
+            rewrite_node_prefix("node -e \"console.log(1)\"", "cz-llrt"),
+            "cz-llrt -e \"console.log(1)\""
+        );
+        assert_eq!(rewrite_node_prefix("echo hi", "cz-llrt"), "echo hi");
+    }
+
+    #[test]
+    fn url_helpers_encode_and_join() {
+        assert_eq!(encode_pkg_spec("@scope/pkg"), "@scope/pkg");
+        assert_eq!(encode_pkg_spec("has space"), "has%20space");
+        assert_eq!(join_url("http://127.0.0.1:8080/x", "/tgz/a.tgz").unwrap(), "http://127.0.0.1:8080/tgz/a.tgz");
+        assert_eq!(join_url("http://127.0.0.1:8080/a/b", "c.tgz").unwrap(), "http://127.0.0.1:8080/a/c.tgz");
+        assert_eq!(join_url("http://x/y", "https://other/z").unwrap(), "https://other/z");
+    }
+
+    #[tokio::test]
+    async fn cli_shape_no_network() {
+        // run_cli_async on unknown command returns a non-zero code without touching network.
+        let code = run_cli_async(&s(&["definitely-not-a-command"])).await;
+        assert_ne!(code, 0);
+        assert_eq!(run_cli_async(&s(&["--version"])).await, 0);
+    }
+
+    #[tokio::test]
+    async fn install_rejects_unreachable_registry_cleanly() {
+        // Connection to a closed port must fail (exit != 0) and never panic.
+        let saved = std::env::var("ZPM_REGISTRY").ok();
+        std::env::set_var("ZPM_REGISTRY", "http://127.0.0.1:1");
+        let code = run_cli_async(&s(&["install", "definitely-missing-pkg"])).await;
+        match saved {
+            Some(v) => std::env::set_var("ZPM_REGISTRY", v),
+            None => std::env::remove_var("ZPM_REGISTRY"),
+        }
+        assert_ne!(code, 0);
+    }
+}

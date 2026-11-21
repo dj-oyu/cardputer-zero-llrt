@@ -6,6 +6,7 @@ members = [
     "crates/cz-gfx",
     "crates/cz-modules",
     "crates/cz-runner",
+    "crates/cz-zpm",
 ]
 
 [workspace.package]
