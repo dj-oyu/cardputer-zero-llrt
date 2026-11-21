@@ -358,13 +358,13 @@ fn client_worker(
     };
     // Node-like SNI: rustls maps DNS names to the SNI extension and IP addresses to NO SNI
     // (`ServerName::IpAddress`). A non-DNS, non-IP servername is a descriptive configuration error.
-    let sni_name = servername.clone().unwrap_or_else(|| host.clone());
+    let sni_name = servername.unwrap_or(host);
     // `ClientConnection::new` needs `ServerName<'static>`: IPs convert losslessly, DNS names
-    // come from the owned `String`; anything else is a descriptive configuration error.
+    // move out of the owned `String`; anything else is a descriptive configuration error.
     let name = match sni_name.parse::<std::net::IpAddr>() {
         Ok(ip) => ServerName::from(ip),
-        Err(_) => match ServerName::try_from(sni_name.clone()) {
-            Ok(n) => n,
+        Err(_) => match ServerName::try_from(sni_name.as_str()) {
+            Ok(_) => ServerName::try_from(sni_name).expect("validated dns name"),
             Err(_) => {
                 push_event(TlsEngineEvent::Error {
                     socket_id,
@@ -467,10 +467,10 @@ pub fn create_tls_server(
 ) -> Result<(u64, String, u16), String> {
     let cfg = build_server_config(opts)?;
     let normalized = match host.trim() {
-        "" | "*" | "any" => "0.0.0.0".to_string(),
-        other => other.to_string(),
+        "" | "*" | "any" => "0.0.0.0",
+        other => other,
     };
-    let listener = TcpListener::bind((normalized.as_str(), port))
+    let listener = TcpListener::bind((normalized, port))
         .map_err(|e| format!("tls listen {normalized}:{port} failed: {e}"))?;
     set_reuseaddr(&listener);
     let bound = listener

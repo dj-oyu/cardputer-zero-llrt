@@ -334,17 +334,17 @@ impl fmt::Debug for CzConnector {
 }
 
 /// Extract the bare host from a URI authority (handles bracketed IPv6 and ports).
-fn bare_host(uri: &ureq::http::Uri) -> Option<String> {
-    let auth = uri.authority()?.as_str().to_string();
+fn bare_host(uri: &ureq::http::Uri) -> Option<&str> {
+    let auth = uri.authority()?.as_str();
     if auth.starts_with('[') {
         // [::1]:port
-        return Some(auth.trim_start_matches('[').trim_end_matches(']').to_string());
+        return Some(auth.trim_start_matches('[').trim_end_matches(']'));
     }
-    let host = auth.rsplit_once(':').map(|(h, _)| h).unwrap_or(&auth[..]);
+    let host = auth.rsplit_once(':').map(|(h, _)| h).unwrap_or(auth);
     if host.is_empty() {
         return None;
     }
-    Some(host.to_string())
+    Some(host)
 }
 
 impl Connector for CzConnector {
@@ -426,7 +426,8 @@ impl Connector for CzConnector {
             .clone()
             .ok_or_else(|| Error::Tls("TLS requested without a client config"))?;
         let host = bare_host(details.uri).ok_or(Error::Tls("missing uri host"))?;
-        let name = ServerName::try_from(host.to_string())
+        let name = ServerName::try_from(host)
+            .map(|n| n.to_owned())
             .map_err(|_| Error::Tls("invalid tls dns name"))?;
 
         let handshake_timeout = details
@@ -482,10 +483,13 @@ pub enum RedirectMode {
 
 /// Parse the JS `redirect` option (unknown values behave like `"follow"`, per spec).
 pub fn parse_redirect_mode(value: &str) -> RedirectMode {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "manual" => RedirectMode::Manual,
-        "error" => RedirectMode::Error,
-        _ => RedirectMode::Follow,
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("manual") {
+        RedirectMode::Manual
+    } else if trimmed.eq_ignore_ascii_case("error") {
+        RedirectMode::Error
+    } else {
+        RedirectMode::Follow
     }
 }
 
@@ -909,7 +913,7 @@ fn build_config(redirect: RedirectMode) -> Config {
 }
 
 fn header_pairs(res: &ureq::http::Response<ureq::Body>) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(res.headers().len());
     // HeaderMap::iter yields a key once per associated value (duplicates included), which the JS
     // `Headers` object joins with ", ".
     for (name, value) in res.headers().iter() {
@@ -919,7 +923,7 @@ fn header_pairs(res: &ureq::http::Response<ureq::Body>) -> Vec<(String, String)>
     out
 }
 
-fn worker_main(spec: FetchSpec, slot: Arc<Slot>, abort: Arc<AbortHandle>) {
+fn worker_main(mut spec: FetchSpec, slot: Arc<Slot>, abort: Arc<AbortHandle>) {
     // 1. Build the agent with the per-request TLS config + our abortable connector.
     let tls_config = if spec.url.starts_with("https") {
         match build_client_config(&spec.tls) {
@@ -943,7 +947,7 @@ fn worker_main(spec: FetchSpec, slot: Arc<Slot>, abort: Arc<AbortHandle>) {
     for (k, v) in &spec.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let http_req = match builder.body(spec.body.clone().unwrap_or_default()) {
+    let http_req = match builder.body(spec.body.take().unwrap_or_default()) {
         Ok(r) => r,
         Err(e) => {
             slot.fail(FailKind::Network, format!("invalid request: {e}"));

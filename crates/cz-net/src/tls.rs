@@ -83,7 +83,7 @@ pub fn parse_certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, St
     let mut certs = Vec::new();
     for item in rustls_pemfile::certs(&mut Cursor::new(pem)) {
         match item {
-            Ok(c) => certs.push(CertificateDer::from(c.to_vec())),
+            Ok(c) => certs.push(c),
             Err(e) => return Err(format!("TLS error: invalid PEM certificate: {e}")),
         }
     }
@@ -321,9 +321,9 @@ pub fn build_client_config(opts: &TlsClientOptions) -> Result<Arc<ClientConfig>,
                     )))
             }
             None => {
-                // Clone the cached system roots into a fresh store (RootCertStore::roots is public).
+                // Share the cached Arc<RootCertStore> directly (avoids cloning every TrustAnchor).
                 let cached = system_root_store()?;
-                builder.with_root_certificates(RootCertStore { roots: cached.roots.clone() })
+                builder.with_root_certificates(cached)
             }
         }
     };

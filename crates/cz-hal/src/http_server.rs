@@ -24,8 +24,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::http::{
-    chunk_frame, error_response, serialize_response, serialize_stream_head, LAST_CHUNK_FRAME,
-    ParsedRequest, RequestParser, ResponseFrame,
+    chunk_frame, error_response, serialize_response, serialize_stream_head, CONTINUE_FRAME,
+    LAST_CHUNK_FRAME, ParsedRequest, RequestParser, ResponseFrame,
 };
 
 /// Abstract per-connection byte stream: a plain TCP socket OR a TLS-wrapped one.
@@ -528,10 +528,10 @@ fn spawn_listener_impl(
 pub fn bind_socket(host: &str, port: u16) -> std::io::Result<TcpListener> {
     // Normalize bare hosts / localhost-ish aliases Node users pass to listen().
     let normalized = match host.trim() {
-        "" | "*" | "any" => "0.0.0.0".to_string(),
-        other => other.to_string(),
+        "" | "*" | "any" => "0.0.0.0",
+        other => other,
     };
-    let listener = TcpListener::bind((normalized.as_str(), port))?;
+    let listener = TcpListener::bind((normalized, port))?;
     // SO_REUSEADDR avoids TIME_WAIT bind failures when tests restart servers on a fixed port.
     set_reuseaddr(&listener);
     Ok(listener)
@@ -643,7 +643,7 @@ fn spawn_connection(
                     match parser.step() {
                         Ok(crate::http::ParseStep::Request(r)) => break r,
                         Ok(crate::http::ParseStep::InterimContinue) => {
-                            if write_all_eof_free(&mut conn, crate::http::continue_frame()).is_err() {
+                            if write_all_eof_free(&mut conn, CONTINUE_FRAME).is_err() {
                                 return;
                             }
                         }
@@ -657,7 +657,7 @@ fn spawn_connection(
                         }
                         Err(err) => {
                             // Malformed (400) / oversized (413): answer, then drop only THIS socket.
-                            let _ = write_all_eof_free(&mut conn, error_response(&err));
+                            let _ = write_all_eof_free(&mut conn, &error_response(&err));
                             conn.shutdown_both();
                             return;
                         }
@@ -703,7 +703,7 @@ fn spawn_connection(
                             match action {
                                 ResponseAction::Buffered(frame) => {
                                     let bytes = frame.encode();
-                                    if write_all_eof_free(&mut conn, bytes).is_err() {
+                                    if write_all_eof_free(&mut conn, &bytes).is_err() {
                                         mark_client_closed(conn_id);
                                         conn.shutdown_both();
                                         return;
@@ -722,7 +722,7 @@ fn spawn_connection(
                                 } => {
                                     let bytes =
                                         serialize_stream_head(status, reason.as_deref(), &headers, keep_alive);
-                                    if write_all_eof_free(&mut conn, bytes).is_err() {
+                                    if write_all_eof_free(&mut conn, &bytes).is_err() {
                                         mark_client_closed(conn_id);
                                         conn.shutdown_both();
                                         return;
@@ -733,7 +733,7 @@ fn spawn_connection(
                                     if !streaming || data.is_empty() {
                                         continue 'reply; // nothing to frame
                                     }
-                                    if write_all_eof_free(&mut conn, chunk_frame(&data)).is_err() {
+                                    if write_all_eof_free(&mut conn, &chunk_frame(&data)).is_err() {
                                         mark_client_closed(conn_id);
                                         conn.shutdown_both();
                                         return;
@@ -749,7 +749,7 @@ fn spawn_connection(
                                 }
                                 ResponseAction::StreamEnd { keep_alive } => {
                                     if streaming {
-                                        if write_all_eof_free(&mut conn, LAST_CHUNK_FRAME.to_vec()).is_err() {
+                                        if write_all_eof_free(&mut conn, LAST_CHUNK_FRAME).is_err() {
                                             mark_client_closed(conn_id);
                                             conn.shutdown_both();
                                             return;
@@ -770,7 +770,7 @@ fn spawn_connection(
                             // JS dropped the response object without finalizing it.
                             if !streaming {
                                 let body = ResponseFrame::error(500, "request handler did not respond", false);
-                                let _ = write_all_eof_free(&mut conn, body.encode());
+                                let _ = write_all_eof_free(&mut conn, &body.encode());
                             }
                             // Headers already went out mid-stream: just close that socket.
                             conn.shutdown_both();
@@ -791,7 +791,7 @@ fn spawn_connection(
                                 } else {
                                     let body =
                                         ResponseFrame::error(500, "request handler did not respond", false);
-                                    let _ = write_all_eof_free(&mut conn, body.encode());
+                                    let _ = write_all_eof_free(&mut conn, &body.encode());
                                 }
                                 conn.shutdown_both();
                                 return;
@@ -812,7 +812,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn write_all_eof_free(stream: &mut dyn ConnStream, bytes: Vec<u8>) -> std::io::Result<()> {
+fn write_all_eof_free(stream: &mut dyn ConnStream, bytes: &[u8]) -> std::io::Result<()> {
     // H27: offset advance instead of drain(..n) — drain memmoves the shrinking tail on every
     // partial write (O(remaining)); an index is O(1). Byte-for-byte identical wire semantics.
     let len = bytes.len();

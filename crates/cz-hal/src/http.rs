@@ -13,7 +13,9 @@
 //!   connection while the server keeps running.
 //! - **No panics** on hostile input.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::io::Write as _;
 
 /// Hard cap on decoded request body bytes (1 MiB) — protects the 512MB CardputerZero.
 pub const MAX_BODY_BYTES: usize = 1_048_576;
@@ -93,19 +95,35 @@ pub struct RequestHead {
 }
 
 impl RequestHead {
+    /// Case-insensitive iterator over all values for `name` in wire order (zero allocations).
+    pub fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.headers
+            .iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Case-insensitive lookup; duplicate fields are joined with `", "` like Node.js.
-    pub fn header(&self, name: &str) -> Option<String> {
-        let want = name.to_ascii_lowercase();
-        let mut found: Vec<&str> = Vec::new();
-        for (k, v) in &self.headers {
-            if *k == want {
-                found.push(v.as_str());
+    pub fn header(&self, name: &str) -> Option<Cow<'_, str>> {
+        let mut vals = self
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str());
+        let first = vals.next()?;
+        match vals.next() {
+            None => Some(Cow::Borrowed(first)),
+            Some(second) => {
+                let mut joined = String::with_capacity(first.len() + 2 + second.len());
+                joined.push_str(first);
+                joined.push_str(", ");
+                joined.push_str(second);
+                for v in vals {
+                    joined.push_str(", ");
+                    joined.push_str(v);
+                }
+                Some(Cow::Owned(joined))
             }
-        }
-        if found.is_empty() {
-            None
-        } else {
-            Some(found.join(", "))
         }
     }
 
@@ -117,10 +135,16 @@ impl RequestHead {
     /// Whether this connection should stay open after the response (HTTP/1.1 default keep-alive,
     /// HTTP/1.0 default close unless the client asks for keep-alive).
     pub fn keep_alive(&self) -> bool {
-        let conn = self.header("connection").unwrap_or_default().to_ascii_lowercase();
-        if conn.contains("close") {
-            false
-        } else if conn.contains("keep-alive") {
+        let mut saw_keep_alive = false;
+        for v in self.header_values("connection") {
+            if contains_ascii_ignore_case(v, "close") {
+                return false;
+            }
+            if contains_ascii_ignore_case(v, "keep-alive") {
+                saw_keep_alive = true;
+            }
+        }
+        if saw_keep_alive {
             true
         } else {
             !self.is_http10()
@@ -129,23 +153,37 @@ impl RequestHead {
 
     /// Client asked for `Expect: 100-continue` before the body is transmitted.
     pub fn expects_continue(&self) -> bool {
-        self.header("expect")
-            .map(|v| v.to_ascii_lowercase().trim() == "100-continue")
-            .unwrap_or(false)
+        let mut vals = self.header_values("expect");
+        let Some(first) = vals.next() else {
+            return false;
+        };
+        vals.next().is_none() && first.trim().eq_ignore_ascii_case("100-continue")
     }
 
     /// `Transfer-Encoding: chunked` present?
     pub fn chunked(&self) -> bool {
-        self.header("transfer-encoding")
-            .map(|v| v.to_ascii_lowercase().contains("chunked"))
-            .unwrap_or(false)
+        self.header_values("transfer-encoding")
+            .any(|v| contains_ascii_ignore_case(v, "chunked"))
     }
 
     /// Declared `Content-Length` when present and numeric.
     pub fn content_length(&self) -> Option<u64> {
-        self.header("content-length")
-            .and_then(|v| v.trim().parse::<u64>().ok())
+        let mut vals = self.header_values("content-length");
+        let first = vals.next()?;
+        if vals.next().is_some() {
+            return None;
+        }
+        first.trim().parse::<u64>().ok()
     }
+}
+
+fn contains_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// A fully parsed request (head + complete decoded body).
@@ -196,7 +234,7 @@ pub enum ParseStep {
     Request(ParsedRequest),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum State {
     Head,
     /// Waiting for exactly `n` body bytes.
@@ -204,7 +242,7 @@ enum State {
     Chunked(ChunkPhase),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ChunkPhase {
     SizeLine,
     Data(u64),
@@ -281,9 +319,7 @@ impl RequestParser {
 
     fn step_inner(&mut self) -> Result<ParseStep, HttpError> {
         loop {
-            // Clone the current state so we can mutate `self` while dispatching on it.
-            let cur = self.state.clone();
-            match cur {
+            match self.state {
                 State::Head => match self.try_head()? {
                     Some(mode) => {
                         let wants_body = !matches!(mode, State::Length(0));
@@ -362,9 +398,9 @@ impl RequestParser {
         if end > MAX_HEAD_BYTES {
             return Err(HttpError::BadRequest("header section too large".into()));
         }
-        let head_bytes: Vec<u8> = self.buf.make_contiguous()[..end].to_vec();
+        let head_res = parse_head_lines(&self.buf.make_contiguous()[..end]);
         self.buf.drain(..end + term_len);
-        let head = parse_head_lines(&head_bytes)?;
+        let head = head_res?;
 
         // Chunked transfer-encoding wins over Content-Length per RFC 9112 / Node.js behavior.
         let mode = if head.chunked() {
@@ -402,9 +438,14 @@ impl RequestParser {
                 MAX_BODY_BYTES
             )));
         }
-        let slice: Vec<u8> = self.buf.make_contiguous()[..take].to_vec();
+        let (front, back) = self.buf.as_slices();
+        let n1 = take.min(front.len());
+        self.body.extend_from_slice(&front[..n1]);
+        let n2 = take - n1;
+        if n2 > 0 {
+            self.body.extend_from_slice(&back[..n2]);
+        }
         self.buf.drain(..take);
-        self.body.extend(slice);
         self.body_read = next;
         Ok(())
     }
@@ -412,8 +453,8 @@ impl RequestParser {
     fn step_chunked(&mut self, phase: ChunkPhase) -> Result<ChunkMove, HttpError> {
         match phase {
             ChunkPhase::SizeLine => {
-                let line = match take_line(&mut self.buf) {
-                    Some(l) => l,
+                let (line_len, drain_len) = match peek_line_len(&mut self.buf) {
+                    Some(v) => v,
                     None => {
                         if self.buf.len() > MAX_CHUNK_LINE_BYTES {
                             return Err(HttpError::BadRequest("chunk-size line too long".into()));
@@ -421,10 +462,15 @@ impl RequestParser {
                         return Ok(ChunkMove::NeedMore(ChunkPhase::SizeLine));
                     }
                 };
-                let token = String::from_utf8_lossy(&line);
-                let hex = token.split(';').next().unwrap_or("").trim();
-                let size = u64::from_str_radix(hex, 16)
-                    .map_err(|_| HttpError::BadRequest(format!("invalid chunk size {hex:?}")))?;
+                let size_res = {
+                    let line = &self.buf.make_contiguous()[..line_len];
+                    let token = String::from_utf8_lossy(line);
+                    let hex = token.split(';').next().unwrap_or("").trim();
+                    u64::from_str_radix(hex, 16)
+                        .map_err(|_| HttpError::BadRequest(format!("invalid chunk size {hex:?}")))
+                };
+                self.buf.drain(..drain_len);
+                let size = size_res?;
                 if self.body_read + size > MAX_BODY_BYTES as u64 {
                     return Err(HttpError::PayloadTooLarge(format!(
                         "chunked body exceeds {} bytes",
@@ -453,8 +499,11 @@ impl RequestParser {
                     Ok(ChunkMove::Advanced(ChunkPhase::Data(remaining)))
                 }
             }
-            ChunkPhase::DataEol => match take_line(&mut self.buf) {
-                Some(_) => Ok(ChunkMove::Advanced(ChunkPhase::SizeLine)),
+            ChunkPhase::DataEol => match peek_line_len(&mut self.buf) {
+                Some((_, drain_len)) => {
+                    self.buf.drain(..drain_len);
+                    Ok(ChunkMove::Advanced(ChunkPhase::SizeLine))
+                }
                 None => {
                     if self.buf.len() > MAX_CHUNK_LINE_BYTES {
                         return Err(HttpError::BadRequest("chunk framing error: missing CRLF".into()));
@@ -462,9 +511,15 @@ impl RequestParser {
                     Ok(ChunkMove::NeedMore(ChunkPhase::DataEol))
                 }
             },
-            ChunkPhase::Trailers => match take_line(&mut self.buf) {
-                Some(l) if l.is_empty() => Ok(ChunkMove::Done),
-                Some(_) => Ok(ChunkMove::Advanced(ChunkPhase::Trailers)),
+            ChunkPhase::Trailers => match peek_line_len(&mut self.buf) {
+                Some((line_len, drain_len)) => {
+                    self.buf.drain(..drain_len);
+                    if line_len == 0 {
+                        Ok(ChunkMove::Done)
+                    } else {
+                        Ok(ChunkMove::Advanced(ChunkPhase::Trailers))
+                    }
+                }
                 None => {
                     if self.buf.len() > MAX_HEAD_BYTES {
                         return Err(HttpError::BadRequest("trailer section too large".into()));
@@ -631,8 +686,18 @@ fn scan_newline(bytes: &[u8], start: usize) -> Option<usize> {
     }
 }
 
+/// Inspect the next `\r\n` or `\n` terminated line at the front of `buf` without allocating.
+/// Returns `(content_len_without_cr, drain_len_including_lf)` when a full line has arrived.
+fn peek_line_len(buf: &mut VecDeque<u8>) -> Option<(usize, usize)> {
+    let contig = buf.make_contiguous();
+    let nl = scan_newline(contig, 0)?;
+    let content_len = if nl > 0 && contig[nl - 1] == b'\r' { nl - 1 } else { nl };
+    Some((content_len, nl + 1))
+}
+
 /// Remove one header/trailer line (`\r\n` or `\n` terminated) from the front of `buf`.
 /// Returns `None` when the terminator has not arrived yet.
+#[cfg(test)]
 fn take_line(buf: &mut VecDeque<u8>) -> Option<Vec<u8>> {
     let contig = buf.make_contiguous();
     let nl = scan_newline(contig, 0)?;
@@ -651,13 +716,19 @@ fn parse_head_lines(head_bytes: &[u8]) -> Result<RequestHead, HttpError> {
     let req_line = lines
         .next()
         .ok_or_else(|| HttpError::BadRequest("missing request line".into()))?;
-    let parts: Vec<&str> = req_line.split_whitespace().collect();
-    if parts.len() != 3 {
+    let mut parts = req_line.split_whitespace();
+    let (Some(raw_method), Some(raw_target), Some(version_token)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(HttpError::BadRequest(format!(
+            "invalid request line {req_line:?}"
+        )));
+    };
+    if parts.next().is_some() {
         return Err(HttpError::BadRequest(format!(
             "invalid request line {req_line:?}"
         )));
     }
-    let version_token = parts[2];
     if !version_token.starts_with("HTTP/1.") || version_token.len() < 8 {
         return Err(HttpError::BadRequest(format!(
             "unsupported http version {version_token:?}"
@@ -669,15 +740,15 @@ fn parse_head_lines(head_bytes: &[u8]) -> Result<RequestHead, HttpError> {
             "unsupported http version {version_token:?}"
         )));
     }
-    let method = parts[0].to_ascii_uppercase();
+    let method = raw_method.to_ascii_uppercase();
     if method.is_empty() || !method.chars().all(|c| c.is_ascii_graphic()) {
         return Err(HttpError::BadRequest("invalid method token".into()));
     }
-    if parts[1].is_empty() {
+    if raw_target.is_empty() {
         return Err(HttpError::BadRequest("empty request target".into()));
     }
 
-    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
     for line in lines {
         if line.is_empty() {
             break;
@@ -702,10 +773,14 @@ fn parse_head_lines(head_bytes: &[u8]) -> Result<RequestHead, HttpError> {
         headers.push((name, value));
     }
 
+    let mut version = String::with_capacity(2 + minor.len());
+    version.push_str("1.");
+    version.push_str(minor);
+
     Ok(RequestHead {
         method,
-        target: parts[1].to_string(),
-        version: format!("1.{minor}"),
+        target: raw_target.to_string(),
+        version,
         headers,
     })
 }
@@ -742,6 +817,40 @@ impl ResponseFrame {
     }
 }
 
+fn write_filtered_headers(
+    out: &mut Vec<u8>,
+    headers: &[(String, String)],
+    skip_content_length: bool,
+) -> bool {
+    let mut has_len = false;
+    let mut seen: Vec<&str> = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || (skip_content_length && name.eq_ignore_ascii_case("content-length"))
+            || seen.iter().any(|s| s.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        seen.push(name.as_str());
+        // Header names must be field-content safe; skip anything hostile instead of crashing.
+        if name.chars().all(|c| c.is_ascii_graphic() && c != ':')
+            && !value.contains('\n')
+            && !value.contains('\r')
+        {
+            out.reserve(name.len() + value.len() + 4);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            has_len = true;
+        }
+    }
+    has_len
+}
+
 /// Serialize a complete HTTP/1.1 response. `Content-Length` is added when absent and any
 /// caller-supplied `Connection` / duplicated reserved headers are dropped in favor of the engine
 /// decision (`Connection: keep-alive` or `Connection: close`).
@@ -756,50 +865,17 @@ pub fn serialize_response(
     // H23 (semantics-identical): exact-capacity reserve and direct byte emission instead of a
     // format! allocation per line. Dedup/skip rules are byte-for-byte the original logic.
     let mut out: Vec<u8> = Vec::with_capacity(64 + headers.len() * 40 + body.len());
-    {
-        let st = status.to_string();
-        out.reserve(12 + st.len() + phrase.len() + 4);
-        out.extend_from_slice(b"HTTP/1.1 ");
-        out.extend_from_slice(st.as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(phrase.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
+    let _ = write!(out, "HTTP/1.1 {status} {phrase}\r\n");
 
-    let mut has_len = false;
-    let mut seen: Vec<String> = Vec::with_capacity(headers.len());
-    for (name, value) in headers {
-        let lower = name.to_ascii_lowercase();
-        if lower == "connection" || lower == "transfer-encoding" || seen.contains(&lower) {
-            continue;
-        }
-        seen.push(lower.clone());
-        // Header names must be field-content safe; skip anything hostile instead of crashing.
-        if lower.chars().all(|c| c.is_ascii_graphic() && c != ':') && !value.contains('\n') && !value.contains('\r') {
-            out.reserve(name.len() + value.len() + 4);
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        if lower == "content-length" {
-            has_len = true;
-        }
-    }
+    let has_len = write_filtered_headers(&mut out, headers, false);
     if !has_len {
-        let cl = body.len().to_string();
-        out.reserve(20 + cl.len() + 4);
-        out.extend_from_slice(b"Content-Length: ");
-        out.extend_from_slice(cl.as_bytes());
-        out.extend_from_slice(b"\r\n");
+        let _ = write!(out, "Content-Length: {}\r\n", body.len());
     }
-    {
-        let conn = if keep_alive { "keep-alive" } else { "close" };
-        out.reserve(13 + conn.len() + 4);
-        out.extend_from_slice(b"Connection: ");
-        out.extend_from_slice(conn.as_bytes());
-        out.extend_from_slice(b"\r\n\r\n");
-    }
+    out.extend_from_slice(if keep_alive {
+        b"Connection: keep-alive\r\n\r\n"
+    } else {
+        b"Connection: close\r\n\r\n"
+    });
     out.extend_from_slice(body);
     out
 }
@@ -818,44 +894,21 @@ pub fn serialize_stream_head(
     // H23 idiom mirrored to the streaming head: capacity reserve + direct emission, no format!
     // per line; skip/dedup semantics unchanged.
     let mut out: Vec<u8> = Vec::with_capacity(72 + headers.len() * 40);
-    {
-        let st = status.to_string();
-        out.reserve(12 + st.len() + phrase.len() + 4);
-        out.extend_from_slice(b"HTTP/1.1 ");
-        out.extend_from_slice(st.as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(phrase.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    let mut seen: Vec<String> = Vec::with_capacity(headers.len());
-    for (name, value) in headers {
-        let lower = name.to_ascii_lowercase();
-        if lower == "connection"
-            || lower == "transfer-encoding"
-            || lower == "content-length"
-            || seen.contains(&lower)
-        {
-            continue;
-        }
-        seen.push(lower.clone());
-        if lower.chars().all(|c| c.is_ascii_graphic() && c != ':') && !value.contains('\n') && !value.contains('\r') {
-            out.reserve(name.len() + value.len() + 4);
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-    }
+    let _ = write!(out, "HTTP/1.1 {status} {phrase}\r\n");
+    write_filtered_headers(&mut out, headers, true);
     out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-    out.extend_from_slice(
-        format!("Connection: {}\r\n\r\n", if keep_alive { "keep-alive" } else { "close" }).as_bytes(),
-    );
+    out.extend_from_slice(if keep_alive {
+        b"Connection: keep-alive\r\n\r\n"
+    } else {
+        b"Connection: close\r\n\r\n"
+    });
     out
 }
 
 /// Encode one HTTP/1.1 chunk frame: `<hex-size>\r\n<data>\r\n`.
 pub fn chunk_frame(data: &[u8]) -> Vec<u8> {
-    let mut out = format!("{:x}\r\n", data.len()).into_bytes();
+    let mut out = Vec::with_capacity(18 + data.len());
+    let _ = write!(out, "{:x}\r\n", data.len());
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
     out
@@ -864,9 +917,12 @@ pub fn chunk_frame(data: &[u8]) -> Vec<u8> {
 /// The terminating zero-length chunk plus empty trailer section (`0\r\n\r\n`).
 pub const LAST_CHUNK_FRAME: &[u8] = b"0\r\n\r\n";
 
+/// Interim `HTTP/1.1 100 Continue` wire bytes for `Expect: 100-continue` clients.
+pub const CONTINUE_FRAME: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
 /// Build an interim `HTTP/1.1 100 Continue` frame for `Expect: 100-continue` clients.
 pub fn continue_frame() -> Vec<u8> {
-    b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()
+    CONTINUE_FRAME.to_vec()
 }
 
 /// Convenience: turn a protocol error into the bytes that must be written before closing.
@@ -1219,6 +1275,20 @@ mod http_tests {
         .expect("parse");
         assert_eq!(r.head.header("host").as_deref(), Some("a, b"));
         assert_eq!(r.body, b"abc".to_vec());
+    }
+
+    #[test]
+    fn header_lookup_borrows_single_match_and_iterates_values_zero_alloc() {
+        let r = one_request(
+            "GET /x HTTP/1.1\r\nHost: cz0\r\nX-Dup: one\r\nX-Dup: two\r\nX-Dup: three\r\nExpect:  100-CONTINUE \r\n\r\n",
+        )
+        .expect("parse");
+        assert!(r.head.header("missing").is_none());
+        assert!(matches!(r.head.header("HOST"), Some(Cow::Borrowed("cz0"))));
+        assert!(matches!(r.head.header("x-dup"), Some(Cow::Owned(ref s)) if s == "one, two, three"));
+        let dups: Vec<&str> = r.head.header_values("X-DUP").collect();
+        assert_eq!(dups, vec!["one", "two", "three"]);
+        assert!(r.head.expects_continue());
     }
 
     #[test]
