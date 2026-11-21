@@ -319,8 +319,39 @@ pub fn encode_frame_header(
 
 /// XOR a client payload with its 4-byte mask key IN PLACE (RFC 6455 §5.3). **0 heap allocations.**
 pub fn apply_mask_in_place(buf: &mut [u8], mask_key: [u8; 4]) {
-    // 4-byte chunks keep the hot loop branch-free on Cortex-A53; only the tail masks individually.
-    let mut chunks = buf.chunks_exact_mut(4);
+    #[allow(unused_mut)]
+    let mut offset = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{vdupq_n_u32, veorq_u8, vld1q_u8, vreinterpretq_u8_u32, vst1q_u8};
+        let n = buf.len();
+        if n >= 16 {
+            unsafe {
+                let mask_v = vreinterpretq_u8_u32(vdupq_n_u32(u32::from_ne_bytes(mask_key)));
+                let p = buf.as_mut_ptr();
+                while offset + 64 <= n {
+                    let v0 = vld1q_u8(p.add(offset));
+                    let v1 = vld1q_u8(p.add(offset + 16));
+                    let v2 = vld1q_u8(p.add(offset + 32));
+                    let v3 = vld1q_u8(p.add(offset + 48));
+                    vst1q_u8(p.add(offset), veorq_u8(v0, mask_v));
+                    vst1q_u8(p.add(offset + 16), veorq_u8(v1, mask_v));
+                    vst1q_u8(p.add(offset + 32), veorq_u8(v2, mask_v));
+                    vst1q_u8(p.add(offset + 48), veorq_u8(v3, mask_v));
+                    offset += 64;
+                }
+                while offset + 16 <= n {
+                    let v = vld1q_u8(p.add(offset));
+                    vst1q_u8(p.add(offset), veorq_u8(v, mask_v));
+                    offset += 16;
+                }
+            }
+        }
+    }
+
+    // 4-byte chunks keep the hot loop branch-free on non-aarch64 and <16B tails.
+    let mut chunks = buf[offset..].chunks_exact_mut(4);
     for c in &mut chunks {
         c[0] ^= mask_key[0];
         c[1] ^= mask_key[1];

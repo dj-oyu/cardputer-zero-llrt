@@ -92,30 +92,124 @@ fn js_bytes<'js>(v: &Value<'js>) -> Result<Vec<u8>> {
     crate::bytes_from_value(v)
 }
 
+const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
+const B64_STD_TABLE: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL_TABLE: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
 pub(crate) fn hex_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len() * 2);
-    for b in data {
-        out.push_str(&format!("{b:02x}"));
+    let n = data.len();
+    let mut out = Vec::<u8>::with_capacity(n * 2);
+    #[allow(unused_mut)]
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{
+            uint8x16x2_t, vandq_u8, vdupq_n_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst2q_u8,
+        };
+        if n >= 16 {
+            unsafe {
+                let lut = vld1q_u8(HEX_LUT.as_ptr());
+                let mask_lo = vdupq_n_u8(0x0F);
+                let src = data.as_ptr();
+                let dst = out.as_mut_ptr();
+                while i + 16 <= n {
+                    let v = vld1q_u8(src.add(i));
+                    let hi = vqtbl1q_u8(lut, vshrq_n_u8(v, 4));
+                    let lo = vqtbl1q_u8(lut, vandq_u8(v, mask_lo));
+                    vst2q_u8(dst.add(i * 2), uint8x16x2_t(hi, lo));
+                    i += 16;
+                }
+                out.set_len(i * 2);
+            }
+        }
     }
-    out
+
+    for &b in &data[i..] {
+        out.push(HEX_LUT[(b >> 4) as usize]);
+        out.push(HEX_LUT[(b & 0x0F) as usize]);
+    }
+    // SAFETY: every byte comes from HEX_LUT (pure ASCII).
+    unsafe { String::from_utf8_unchecked(out) }
 }
 
-/// Minimal standard-alphabet base64 (no new crates; ring keeps its Base64 Ring-internal only).
-pub(crate) fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
+/// ARMv8.0 NEON + portable Base64 / Base64URL encoder (48B -> 64B via `vld3q_u8` + `vqtbl4q_u8` + `vst4q_u8`).
+pub(crate) fn base64_encode_with_options(data: &[u8], url_safe: bool, pad: bool) -> String {
+    let table = if url_safe { B64_URL_TABLE } else { B64_STD_TABLE };
+    let n = data.len();
+    let cap = if pad {
+        ((n + 2) / 3) * 4
+    } else {
+        (n / 3) * 4 + match n % 3 { 0 => 0, 1 => 2, _ => 3 }
+    };
+    let mut out = Vec::<u8>::with_capacity(cap);
+    #[allow(unused_mut)]
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{
+            uint8x16x4_t, vandq_u8, vdupq_n_u8, vld1q_u8, vld3q_u8, vorrq_u8, vqtbl4q_u8,
+            vshlq_n_u8, vshrq_n_u8, vst4q_u8,
+        };
+        if n >= 48 {
+            unsafe {
+                let mut o = 0usize;
+                let lut = uint8x16x4_t(
+                    vld1q_u8(table.as_ptr()),
+                    vld1q_u8(table.as_ptr().add(16)),
+                    vld1q_u8(table.as_ptr().add(32)),
+                    vld1q_u8(table.as_ptr().add(48)),
+                );
+                let mask6 = vdupq_n_u8(0x3F);
+                let src = data.as_ptr();
+                let dst = out.as_mut_ptr();
+                while i + 48 <= n {
+                    let raw = vld3q_u8(src.add(i));
+                    let idx0 = vshrq_n_u8(raw.0, 2);
+                    let idx1 = vandq_u8(vorrq_u8(vshlq_n_u8(raw.0, 4), vshrq_n_u8(raw.1, 4)), mask6);
+                    let idx2 = vandq_u8(vorrq_u8(vshlq_n_u8(raw.1, 2), vshrq_n_u8(raw.2, 6)), mask6);
+                    let idx3 = vandq_u8(raw.2, mask6);
+                    let c0 = vqtbl4q_u8(lut, idx0);
+                    let c1 = vqtbl4q_u8(lut, idx1);
+                    let c2 = vqtbl4q_u8(lut, idx2);
+                    let c3 = vqtbl4q_u8(lut, idx3);
+                    vst4q_u8(dst.add(o), uint8x16x4_t(c0, c1, c2, c3));
+                    i += 48;
+                    o += 64;
+                }
+                out.set_len(o);
+            }
+        }
+    }
+
+    for chunk in data[i..].chunks(3) {
         let b0 = chunk[0];
         let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
         let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
         let v = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
-        out.push(TABLE[((v >> 18) & 63) as usize] as char);
-        out.push(TABLE[((v >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((v >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(v & 63) as usize] as char } else { '=' });
+        out.push(table[((v >> 18) & 63) as usize]);
+        out.push(table[((v >> 12) & 63) as usize]);
+        if chunk.len() > 1 {
+            out.push(table[((v >> 6) & 63) as usize]);
+        } else if pad {
+            out.push(b'=');
+        }
+        if chunk.len() > 2 {
+            out.push(table[(v & 63) as usize]);
+        } else if pad {
+            out.push(b'=');
+        }
     }
-    out
+    // SAFETY: every byte comes from table or '=' (pure ASCII).
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Minimal standard-alphabet base64 (no new crates; ring keeps its Base64 Ring-internal only).
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    base64_encode_with_options(data, false, true)
 }
 
 /// Pure-Rust SHA-256 hex (used by unit tests + available for embedders).
@@ -206,7 +300,116 @@ pub(crate) fn system_rng() -> &'static ring::rand::SystemRandom {
 /// semantics: whitespace is skipped and everything from the first `=` onward terminates the
 /// stream, so unpadded JWK (`k`) values decode cleanly; a lone dangling sextet yields no byte.
 /// `None` marks an invalid character (HTML `InvalidCharacterError` / JWK parse failure).
+///
+/// On `aarch64`, clean 64-char blocks take an ARMv8.0 baseline NEON fast path (`vld4q_u8` ->
+/// disjoint range decode + single `vminvq_u8` validation -> `vst3q_u8`, 64B -> 48B) and break
+/// cleanly to the exact scalar state machine on any whitespace, `'='`, or invalid byte.
 pub(crate) fn base64_decode(text: &str, url_safe: bool) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut out = Vec::<u8>::with_capacity((n / 4) * 3 + 3);
+    #[allow(unused_mut)]
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::{
+            uint8x16_t, uint8x16x3_t, vaddq_u8, vandq_u8, vceqq_u8, vcgeq_u8, vcleq_u8,
+            vdupq_n_u8, vld4q_u8, vminvq_u8, vorrq_u8, vshlq_n_u8, vshrq_n_u8, vst3q_u8,
+        };
+        if n >= 64 {
+            unsafe {
+                let c_cap_a = vdupq_n_u8(b'A');
+                let c_cap_z = vdupq_n_u8(b'Z');
+                let c_low_a = vdupq_n_u8(b'a');
+                let c_low_z = vdupq_n_u8(b'z');
+                let c_dig_0 = vdupq_n_u8(b'0');
+                let c_dig_9 = vdupq_n_u8(b'9');
+                let c_62 = vdupq_n_u8(if url_safe { b'-' } else { b'+' });
+                let c_63 = vdupq_n_u8(if url_safe { b'_' } else { b'/' });
+
+                // Wrapping add offsets (proven exact for each disjoint ASCII interval):
+                // 'A'..'Z' (-65 = 191), 'a'..'z' (-71 = 185), '0'..'9' (+4),
+                // '+' (+19) / '/' (+16), '-' (+17) / '_' (-32 = 224).
+                let off_upper = vdupq_n_u8(191);
+                let off_lower = vdupq_n_u8(185);
+                let off_digit = vdupq_n_u8(4);
+                let off_62 = vdupq_n_u8(if url_safe { 17 } else { 19 });
+                let off_63 = vdupq_n_u8(if url_safe { 224 } else { 16 });
+
+                #[inline(always)]
+                unsafe fn decode_vec(
+                    v: uint8x16_t,
+                    c_cap_a: uint8x16_t,
+                    c_cap_z: uint8x16_t,
+                    c_low_a: uint8x16_t,
+                    c_low_z: uint8x16_t,
+                    c_dig_0: uint8x16_t,
+                    c_dig_9: uint8x16_t,
+                    c_62: uint8x16_t,
+                    c_63: uint8x16_t,
+                    off_upper: uint8x16_t,
+                    off_lower: uint8x16_t,
+                    off_digit: uint8x16_t,
+                    off_62: uint8x16_t,
+                    off_63: uint8x16_t,
+                ) -> (uint8x16_t, uint8x16_t) {
+                    let m_up = vandq_u8(vcgeq_u8(v, c_cap_a), vcleq_u8(v, c_cap_z));
+                    let m_lo = vandq_u8(vcgeq_u8(v, c_low_a), vcleq_u8(v, c_low_z));
+                    let m_dg = vandq_u8(vcgeq_u8(v, c_dig_0), vcleq_u8(v, c_dig_9));
+                    let m_62 = vceqq_u8(v, c_62);
+                    let m_63 = vceqq_u8(v, c_63);
+                    let valid = vorrq_u8(
+                        vorrq_u8(vorrq_u8(m_up, m_lo), vorrq_u8(m_dg, m_62)),
+                        m_63,
+                    );
+                    let off = vorrq_u8(
+                        vorrq_u8(vandq_u8(m_up, off_upper), vandq_u8(m_lo, off_lower)),
+                        vorrq_u8(
+                            vandq_u8(m_dg, off_digit),
+                            vorrq_u8(vandq_u8(m_62, off_62), vandq_u8(m_63, off_63)),
+                        ),
+                    );
+                    (vaddq_u8(v, off), valid)
+                }
+
+                let src = bytes.as_ptr();
+                let dst = out.as_mut_ptr();
+                let mut o = 0usize;
+                while i + 64 <= n {
+                    let raw = vld4q_u8(src.add(i));
+                    let (s0, ok0) = decode_vec(
+                        raw.0, c_cap_a, c_cap_z, c_low_a, c_low_z, c_dig_0, c_dig_9, c_62, c_63,
+                        off_upper, off_lower, off_digit, off_62, off_63,
+                    );
+                    let (s1, ok1) = decode_vec(
+                        raw.1, c_cap_a, c_cap_z, c_low_a, c_low_z, c_dig_0, c_dig_9, c_62, c_63,
+                        off_upper, off_lower, off_digit, off_62, off_63,
+                    );
+                    let (s2, ok2) = decode_vec(
+                        raw.2, c_cap_a, c_cap_z, c_low_a, c_low_z, c_dig_0, c_dig_9, c_62, c_63,
+                        off_upper, off_lower, off_digit, off_62, off_63,
+                    );
+                    let (s3, ok3) = decode_vec(
+                        raw.3, c_cap_a, c_cap_z, c_low_a, c_low_z, c_dig_0, c_dig_9, c_62, c_63,
+                        off_upper, off_lower, off_digit, off_62, off_63,
+                    );
+                    let all_ok = vandq_u8(vandq_u8(ok0, ok1), vandq_u8(ok2, ok3));
+                    if vminvq_u8(all_ok) == 0 {
+                        break;
+                    }
+                    let b0 = vorrq_u8(vshlq_n_u8(s0, 2), vshrq_n_u8(s1, 4));
+                    let b1 = vorrq_u8(vshlq_n_u8(s1, 4), vshrq_n_u8(s2, 2));
+                    let b2 = vorrq_u8(vshlq_n_u8(s2, 6), s3);
+                    vst3q_u8(dst.add(o), uint8x16x3_t(b0, b1, b2));
+                    i += 64;
+                    o += 48;
+                }
+                out.set_len(o);
+            }
+        }
+    }
+
     let sextet = |b: u8| -> Option<u32> {
         match b {
             b'A'..=b'Z' => Some((b - b'A') as u32),
@@ -219,17 +422,16 @@ pub(crate) fn base64_decode(text: &str, url_safe: bool) -> Option<Vec<u8>> {
             _ => None,
         }
     };
-    let mut out = Vec::new();
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
-    for b in text.as_bytes() {
-        if *b == b'=' {
+    for &b in &bytes[i..] {
+        if b == b'=' {
             break; // padding terminates the stream (trailing junk is ignored, per HTML)
         }
-        if matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
             continue; // WHATWG/HTML whitespace filtering
         }
-        let v = sextet(*b)?;
+        let v = sextet(b)?;
         acc = (acc << 6) | v;
         bits += 6;
         if bits >= 8 {

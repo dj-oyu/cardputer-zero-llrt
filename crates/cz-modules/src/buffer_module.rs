@@ -16,43 +16,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rquickjs::function::Opt;
 use rquickjs::{Ctx, Exception, Function, Result, String as JsString, Value};
 
-use crate::crypto_module::{base64_decode, base64_encode};
+use crate::crypto_module::{base64_decode, base64_encode, base64_encode_with_options, hex_encode};
 use crate::{vec_to_uint8array, with_borrowed_bytes};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-const B64URL_TABLE: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
 /// URL-safe Base64 WITHOUT padding (`-`/`_` alphabet) — the shape Node's `base64url` emits.
 fn base64url_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
-        let v = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
-        out.push(B64URL_TABLE[((v >> 18) & 63) as usize] as char);
-        out.push(B64URL_TABLE[((v >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(B64URL_TABLE[((v >> 6) & 63) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(B64URL_TABLE[(v & 63) as usize] as char);
-        }
-    }
-    out
+    base64_encode_with_options(data, true, false)
 }
 
-/// Lowercase hex via a stack nibble table (faster than `format!("{b:02x}")` per byte).
+/// Lowercase hex via the shared ARMv8.0 NEON + LUT encoder.
 fn hex_encode_fast(data: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(data.len() * 2);
-    for b in data {
-        out.push(DIGITS[(b >> 4) as usize] as char);
-        out.push(DIGITS[(b & 15) as usize] as char);
-    }
-    out
+    hex_encode(data)
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
