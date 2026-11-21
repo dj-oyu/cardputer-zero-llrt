@@ -81,3 +81,12 @@ git worked WITHOUT `-c safe.directory=/workspace` here (status/commit/reset rc=0
 
 ### [Note] D35 — Post-Phase-11 re-validation of D15 + D13 remnant
 cz-json lazy passthrough STILL intact beside the new URL/WS installs: mutating a dirty nested parent (`c.d=true`) keeps sibling scalar bytes `"a":true`/`"b":null` intact (probe rc=0) — D15's render-scalars-from-tape rule unchanged. D13's remaining halves that MATTER today: pure-JS URL/utf8 fallbacks are only needed for ESM shared with plain Node, not inside cz-js realms (global URL/TextDecoder/WebSocket/fetch all present); do not re-add shims in runner-side scripts.
+
+### [Principle] D36 — New-engine loop wiring: extend liveness in EVERY consumer + register JS objects BEFORE connect
+Adding WebSocket liveness broke compile at cz-runner/src/main.rs:275 because `loop_liveness` returns a tuple destructured in TWO places (run_event_loop AND settle_module) — update BOTH, else module settlement exits while an open socket still awaits its Close event. In JS glue, insert the id->object map entry IMMEDIATELY after the connect native returns and BEFORE yielding: an Open event that arrives first is otherwise silently dropped by the dispatcher (`__czWsDispatchOne` returns false for unknown ids).
+
+### [Dead End] D37 — `"#` inside an embedded JS shim kills r#"…"# raw strings
+The URL hash setter (`s !== "#"` / `"#" + s`) terminated URL_SHIM early -> cryptic `prefix custom is unknown` + cascading parse errors in Rust, not JS. Rule: any shim containing `#` string literals MUST use r##"…"## delimiters; grep the shim for `"#` before trusting r#"…"# (fetch/tls shims pass only because they never contain `#`).
+
+### [Note] Cross-check — D29 vectored-TX rule HELD on the new WS path; D2's safe.directory half stays obsolete
+`write_pieces_vectored` follows D29 exactly: empty payload takes a single `write_resilient+flush` (never a leading zero-length IoSlice), mask key rides in the header slice, retry maps ONE global offset via `IoSlice::advance_slices(&mut slices, n)` on a `&mut [IoSlice]` SLICE (an ARRAY fails borrowck), flush ONCE — proven wire-identical by gate 3 (300 B 16-bit + 70 KB 64-bit echoes byte-exact, Phase 8A/8B/8C still green). git needed no `-c safe.directory` this round either (rc=0 as owner uid).
