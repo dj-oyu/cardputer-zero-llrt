@@ -188,18 +188,28 @@ Guided by Cortex-A53 hardware PMU counters (`0x11 CPU_CYCLES`, `0x08 INST_RETIRE
 - `JS_CallInternal`: `47,764 B` -> **`37,572 B` (-10,192 B / -21.3%)**, total binary **-1,172 B**, hot 66-opcode span `23.9 KiB` -> **`18.3 KiB`**.
 - Cortex-A53 Hardware PMU A/B (no PGO, vs. PR #7): `w_interp` **`L1I_REFILL` -25.8%, `CPU_CYCLES` -4.8%**; `w_lexer` **`CPU_CYCLES` -1.15%, `BR_MIS_PRED` -3.8%**.
 
-### 4C. `cz-js` AArch64 GCC PGO (`vendor/rquickjs-sys/build.rs` + `scripts/pgo-train.mjs`)
-- Optional `CZ_QJS_PGO_GEN=<dir>` / `CZ_QJS_PGO_USE=<dir>` flags in `vendor/rquickjs-sys/build.rs` using `-fno-reorder-blocks-and-partition` (required on AArch64 GCC for computed-goto / switch jump tables).
-- Binary size: `5.8 MB` -> **`5.6 MB`** (`CZ_JS_LSE=40`, `CZ_JS_RCPC=0`).
-- Real Cortex-A53 hardware A/B (2x back-to-back average, on top of PR #6 + #7 + #8):
+### 4C. Inline TypedArray & `charCodeAt` Fast Paths (`dj-oyu/quickjs` PR #9)
+- Inline in-bounds `Int32Array`/`Uint8Array` read/write in `OP_get_array_el`/`OP_put_array_el` (checking `!typed_array_is_immutable(p)`) and inline `String.prototype.charCodeAt` in `OP_call_method` (+50 lines, `JS_CallInternal` +556 B, `quickjs.o` `.text` +832 B / +0.089%).
+- Cortex-A53 Hardware PMU A/B (no PGO, vs. PR #8): `w_lexer` **-22.6% cycles (1.29x), -26.0% inst (-37.5M inst)**; `w_interp` **-2.1% cycles, -10.2% branch misses, -46% L1D refills**; `w_arith` 0.00% instruction overhead.
 
-| Benchmark | `cz-js` NO-PGO | `cz-js` **PGO** | Speedup |
+### 4D. `cz-js` AArch64 GCC PGO (`vendor/rquickjs-sys/build.rs` + `scripts/pgo-train.mjs`)
+- Optional `CZ_QJS_PGO_GEN=<dir>` / `CZ_QJS_PGO_USE=<dir>` flags in `vendor/rquickjs-sys/build.rs` using `-fno-reorder-blocks-and-partition` (required on AArch64 GCC for computed-goto / switch jump tables), trained with VM loops, calls, JSON/RegExp, and CJK UTF-8 (`w_utf8_cjk`).
+- Binary size: `5.8 MB` -> **`5.6 MB`** (`CZ_JS_LSE=40`, `CZ_JS_RCPC=0`), Peak RSS `6.08 MB` -> **`5.82 MB`**.
+- Real Cortex-A53 hardware A/B (on top of PR #6 + #7 + #8 + #9):
+
+| Benchmark | `cz-js` NO-PGO | `cz-js` **PGO (CJK-inclusive)** | Speedup |
 |---|---:|---:|---:|
-| `w_interp` (bytecode VM + TypedArray) | 34.97 ms | **28.52 ms** | **-18.4% (1.23x)** |
-| `w_arith` (float arithmetic loop) | 77.25 ms | **68.07 ms** | **-11.9% (1.13x)** |
-| `w_lexer` (short-circuit string lexer) | 179.68 ms | **153.61 ms** | **-14.5% (1.17x)** |
-| `w_fib28` (recursive JS calls) | 538.72 ms | **505.56 ms** | **-6.2% (1.07x)** |
-| `w_json` (JSON.stringify + parse) | 77.10 ms | **73.80 ms** | **-4.3% (1.04x)** |
+| `w_lexer` (vs. pre-PR #9 `174.8 ms`) | 130.17 ms | **115.59 ms** | **-11.2% (1.51x vs. pre-PR #9)** |
+| `w_interp` (bytecode VM + TypedArray) | 33.30 ms | **27.00 ms** | **-18.9% (1.23x)** |
+| `w_arith` (float arithmetic loop) | 76.73 ms | **67.07 ms** | **-12.6% (1.14x)** |
+| `w_fib28` (recursive JS calls) | 530.28 ms | **496.01 ms** | **-6.5% (1.07x)** |
+| `w_json` (JSON.stringify + parse) | 76.17 ms | **70.76 ms** | **-7.1% (1.08x)** |
+| `JS: 2M integer loop` | 510.9 ms | **444.5 ms** | **-13.0% (1.57x vs. LLRT)** |
+| `LazyJSON field lookup (50k)` | 2680.7 ms | **2211.7 ms** | **-17.5%** |
+| `JSON.stringify (7KB eager / lazy)` | 430.6 / 69.1 ms | **376.3 / 61.1 ms** | **-12.6% / -11.6%** |
+| `TextDecoder CJK (17KB)` | 532.0 ms | **504.4 ms** | **-5.2%** |
+| `cardputer:kv set / get` | 32.9 / 61.5 ms | **27.7 / 51.1 ms** | **-15.8% / -16.9%** |
+| `new URL() parse (5k)` | 310.1 ms | **282.8 ms** | **-8.8%** |
 
 
 

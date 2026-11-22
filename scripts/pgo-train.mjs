@@ -100,9 +100,23 @@ function w_calls() {
   return s;
 }
 
+function w_utf8_cjk() {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const cjk = '日本語のテキスト処理とUTF-8デコード性能の学習データ1234567890。'.repeat(60);
+  const bytes = enc.encode(cjk);
+  let total = 0;
+  for (let i = 0; i < 150; i++) {
+    const s = dec.decode(bytes);
+    total += s.length + s.charCodeAt(i & 31);
+  }
+  return total;
+}
+
 const r1 = w_interp();
 const r2 = w_arith();
 const r3 = w_lexer();
 const r4 = w_objects_json();
 const r5 = w_calls();
-console.log('PGO_TRAIN_OK', r1, r2.toFixed(3), r3, r4, r5);
+const r6 = w_utf8_cjk();
+console.log('PGO_TRAIN_OK', r1, r2.toFixed(3), r3, r4, r5, r6);
