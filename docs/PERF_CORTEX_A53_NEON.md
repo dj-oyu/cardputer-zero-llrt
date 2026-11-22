@@ -110,5 +110,63 @@ Method: same device, back-to-back A vs B, 15 warmup iterations, median of 5 tria
 
 *(Note: the remaining +88.9 us delta between ASCII and CJK-containing 5.7 KB payloads is `JS_NewStringLen` in QuickJS C, matching the Round 2 PMU profile.)*
 
+---
+
+## Round 3 — Forked `dj-oyu/quickjs` Engine Optimizations (PR #2, #3, #4)
+
+All engine optimizations live in `vendor/quickjs` (`dj-oyu/quickjs`), verified back-to-back A/B on CardputerZero Cortex-A53 @ 1.0 GHz with `LSE=26, RCPC=0` and zero impact on ESP32-S3 / non-NEON targets.
+
+### 3A. AArch64 NEON UTF-8 / String Ops & 128-bit Schubfach/Eisel-Lemire `dtoa`/`atod` (PR #2)
+- `cutils.h` / `quickjs.c`: 16-byte NEON ASCII fast paths in `utf8_scan`, `utf8_decode_buf8`, `utf8_decode_buf16`, `JS_ToCStringLen2` (placed in `else` branch with `(p[7]|p[15]) < 0x80` pre-probe so dense CJK has 0 extra branches).
+- `quickjs.c`: 16-byte NEON `toUpperCase`/`toLowerCase` (`js_string_toLowerCase`) and 8-bit/16-bit NEON `string_indexof_char` (routed from `js_string_indexOf` / `js_string_includes`).
+- `dtoa.c` + `dtoa_schubfach_table.h`: shared 10.7 KB 128-bit normalized `10^e` table (`e ∈ [-342..324]`) powering both 128-bit **Schubfach** (`js_dtoa`, 26,332 floats verified round-trip 0 failures + ECMAScript shortest output on asymmetric powers of 2) and Clinger FPU + 128-bit **Eisel-Lemire** (`js_atod`, 25,090 decimal strings verified 64-bit IEEE-754 bit-exact).
+
+| Workload | Baseline (`ff809dd`) | PR #2 | Speedup |
+|---|---:|---:|---:|
+| `TextDecoder` mixed 16 KB | — | 259 MB/s | **4.73x** |
+| `TextEncoder` mixed 16 KB | — | 402 MB/s | **4.07x** |
+| `TextDecoder` / `TextEncoder` dense CJK | — | — | **1.04x** |
+| `str.toUpperCase` (4 KB ASCII) | 319.90 us | **5.21 us** (749 MB/s) | **61.4x** |
+| `str.toLowerCase` (4 KB ASCII) | 311.26 us | **5.36 us** (729 MB/s) | **58.1x** |
+| `str.indexOf` (4 KB ASCII) | 83.02 us | **4.36 us** (897 MB/s) | **19.0x** |
+| `str.indexOf` (4 KB CJK) | 80.94 us | **7.08 us** (1,036 MB/s) | **11.4x** |
+| `float64.toString` (16 mixed floats) | 410.9–430.3 us | **34.4–35.3 us** | **11.9x–12.2x** |
+| `float64.toExponential` (16 mixed) | 411.5–416.5 us | **36.5–36.7 us** | **11.3x** |
+| `parseFloat` / `Number(str)` (16 full) | 61.7 / 64.3 us | **30.9 / 33.2 us** | **1.94x–2.00x** |
+
+### 3B. Lazy / CoW `JS_CLASS_ARRAY` Backing (`split`, `slice`, `Object.keys`) (PR #3)
+- Architecture-independent `JSLazyArrayData` using unused `p->u.array.u.ptr` when `fast_array == 0 && count == 0` (0 extra bytes in `JSObject`, 0% overhead on normal `fast_array == 1` arrays via `no_inline js_lazy_array_get_elem`, cycle-GC integrated via `JS_GC_OBJ_TYPE_LAZY_SLICE_BUF`).
+
+| Workload | PR #2 Baseline | PR #3 (`JSLazyArray`) | Speedup |
+|---|---:|---:|---:|
+| `arr(10k).slice(100, 9000)` + `[0]` | 2,202–2,387 us | **6.32–6.52 us** | **338x–378x** |
+| `arr(10k).slice(100, 9000)` + full sum | 6,075–6,079 us | **4,782–4,891 us** | **1.24x–1.27x** |
+| `split('\n').slice(0, 10)` (15.7 KB / 400 lines) | 542–571 us | **74.2–76.4 us** | **7.1x–7.7x** |
+| `split('\n').length` (400 lines) | 444–467 us | **67.6–71.8 us** | **6.2x–6.9x** |
+| `for..of split('\n')` (all 400 lines) | 666–702 us | **476–488 us** | **1.36x–1.47x** (+ O(1) peak RAM) |
+| `Object.keys(100).length` | 77.1–80.7 us | **19.3–19.7 us** | **3.9x–4.2x** |
+| `for..of Object.keys(100)` | 133.8–140.3 us | **82.3–84.4 us** | **1.59x–1.70x** |
+| `normalArr(2k)` read+write (sanity) | 1,068.3 us | **1,067.8 us** | **1.00x (0% overhead)** |
+
+### 3C. Allocation Elimination (`RegExp.test`, `Object.values`/`entries`, `fn.apply`, `JSON.stringify`) (PR #4)
+- Zero-alloc `RegExp.prototype.test` (`test_only` path + `capture_stack[32]`), plain-object direct `p->prop[i]` path for `Object.values`/`entries`, 16-slot stack buffer for `Function.prototype.apply`, and zero-intermediate-`JSString` native `JSON.stringify` (direct quoting, direct `i32toa`/`js_dtoa`/bool/null, C pointer circular stack, 16-key C-stack plain-object walk).
+
+| Workload | PR #3 Baseline | PR #4 (`alloc-killers`) | Speedup |
+|---|---:|---:|---:|
+| `RegExp.test` (named groups) | 16.88–17.38 us | **3.14–3.16 us** | **5.4x–5.5x** |
+| `RegExp.test` (6 captures) | 16.04–16.42 us | **4.97–4.99 us** | **3.2x–3.3x** |
+| `JSON.stringify(500 ints, '')` | 789–797 us | **160.2–161.4 us** | **4.9x–5.0x** |
+| `JSON.stringify(200 strs, '')` | 568–571 us | **118.5–121.3 us** | **4.7x–4.8x** |
+| `JSON.stringify(200 floats, '')` | 459–461 us | **182.3–185.6 us** | **2.5x** |
+| `JSON.stringify(nested, '')` | 1,536–1,608 us | **544.7–560.1 us** | **2.7x–3.0x** |
+| `JSON.stringify(nested, 2)` | 1,864–1,994 us | **882.6–930.9 us** | **2.0x–2.3x** |
+| `Object.values(100)` / `Object.values(5)` | 74.0 / 9.3 us | **18.6 / 3.7 us** | **4.0x / 2.6x** |
+| `Object.entries(5)` / `Object.entries(100)` | 22.2 / 355 us | **10.3 / 232 us** | **2.2x / 1.5x** |
+| `fn.apply` (4 / 12 args) | 2.55–3.04 us | **2.18–2.45 us** | **1.17x–1.24x** |
+
+### Parser & `pi-sandbox` Fuzzing (`crates/cz-runner/tests/fuzz_parsers.rs`)
+- Deterministic 70,000+ mutation & adversarial fuzz suite (`cz-json` 25k+, `cz-net::url` 25k+, `cz-net::ws` 20k, plus 7 hostile `pi-sandbox` resource bombs & 2,000+ FFI calls under 16 MB memory / 256 KB stack / interrupt limits): **4/4 PASS in 0.08s**.
+
+
 
 
