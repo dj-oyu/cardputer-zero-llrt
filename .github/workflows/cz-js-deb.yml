@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout cardputer-zero-llrt
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install system build tools (stable Rust only — no legacy toolchains)
         run: |

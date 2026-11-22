@@ -25,3 +25,6 @@ libc = "0.2"
 rquickjs = { version = "0.14", features = ["std", "classes", "array-buffer", "loader"] }
 swash = "0.2"
 read-fonts = { version = "0.41", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+rquickjs-sys = { path = "vendor/rquickjs-sys" }
