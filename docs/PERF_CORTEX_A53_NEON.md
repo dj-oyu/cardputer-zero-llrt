@@ -92,4 +92,23 @@ Method: same device, back-to-back A vs B, 15 warmup iterations, median of 5 tria
   - `structuredClone(LazyJSON 5.7 KB)`: **32.60 us/op** (164.0 MB/s — **90.7x faster** than original 2,957 us JS `structuredClone`)
   - `structuredClone(LazyJSON 64.0 KB)`: **30.20 us/op** (**2,116.0 MB/s** — identical constant time at 12x payload size)
 
+---
+
+## Round 2C — `JSON.stringify` Eager `walk_json` Fast Path
+
+### Changes (`crates/cz-modules/src/json_module.rs`)
+- Pre-intern `"toJSON"` `JSAtom` once per `do_stringify` call (`WalkCtx`) instead of `JS_NewAtomLen` + `JS_FreeAtom` on every visited object/array.
+- Stack-allocated 32-slot direct-mapped `JSAtom -> "\"key\":"` L1 cache (0 heap allocations) to skip repeated `JS_AtomToCStringLen` + UTF-8 validation + escape + `JS_FreeCString` across homogeneous object arrays.
+- Direct `JS_GetProperty` (replacing `JS_GetOwnProperty` + descriptor setup + `JS_FreeValue` × 2), direct `JS_GetPropertyUint32` for arrays, and direct `JS_TAG_INT` / `JS_TAG_FLOAT64` / `JS_TAG_STRING` tag dispatch.
+
+### Real-Hardware A/B Results (Back-to-Back, CardputerZero Cortex-A53 @ 1.0 GHz)
+| Workload | Baseline A (`64117a8`) | Treatment B (`walk_json` opt) | Speedup |
+|---|---:|---:|---:|
+| `stringify eager 5.7 KB (w/ CJK)` | 649.00 us (8.4 MB/s) | **438.73 us (12.4 MB/s)** | **1.48x (-32.4%)** |
+| `stringify eager 5.7 KB (ASCII)` | 555.40 us (9.8 MB/s) | **349.81 us (15.5 MB/s)** | **1.59x (-37.0%)** |
+| `stringify small 60 B` | 22.47 us (2.2 MB/s) | **19.51 us (2.6 MB/s)** | **1.15x (-13.2%)** |
+
+*(Note: the remaining +88.9 us delta between ASCII and CJK-containing 5.7 KB payloads is `JS_NewStringLen` in QuickJS C, matching the Round 2 PMU profile.)*
+
+
 

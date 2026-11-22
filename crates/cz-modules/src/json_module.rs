@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 
 use rquickjs::function::Args;
-use rquickjs::{Array, Atom, Ctx, CString, Exception, Function, Object, Result, Symbol, Value};
+use rquickjs::{Array, Atom, Ctx, Exception, Function, Object, Result, Symbol, Value};
 
 use cz_hal::kv::KvValue;
 use cz_json::lazy::{Got, LazyDoc};
@@ -778,18 +778,15 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
     if v.is_undefined() || v.is_function() || v.is_symbol() {
         return Ok(Value::new_undefined(ctx.clone()));
     }
-    // 3. Regular JS values.
-    if v.is_undefined() || v.is_function() || v.is_symbol() {
-        return Ok(Value::new_undefined(ctx.clone()));
-    }
     // Scratch reuse for the generic walk too: the borrow is HELD across `walk_json`, so a
     // reentrant JSON.stringify (from a `toJSON` callback) fails `try_borrow_mut` and transparently
     // falls back to a fresh Vec below — no aliasing is ever possible.
+    let mut wctx = WalkCtx::new(ctx.as_raw().as_ptr());
     let scratch_hit = SCRATCH_OUT.with(|c| match c.try_borrow_mut() {
         Ok(mut out) => {
             out.clear();
             let mut stack: Vec<*mut c_void> = Vec::new();
-            match walk_json(ctx, v, &mut *out, &mut stack, 0) {
+            match walk_json(ctx, v, &mut *out, &mut stack, &mut wctx, 0) {
                 Ok(()) => Some(unsafe { js_string_from_bytes(&ctx, &out) }),
                 Err(e) => Some(Err(e)),
             }
@@ -801,7 +798,7 @@ fn do_stringify<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> Result<Value<'js>> {
     }
     let mut out = Vec::new();
     let mut stack: Vec<*mut c_void> = Vec::new();
-    walk_json(ctx, v, &mut out, &mut stack, 0)?;
+    walk_json(ctx, v, &mut out, &mut stack, &mut wctx, 0)?;
     Ok(unsafe { js_string_from_bytes(ctx, &out) }?)
 }
 
@@ -864,78 +861,175 @@ fn write_kv_record(out: &mut Vec<u8>, store: &str, key: &str) {
     out.push(b'}');
 }
 
+/// Per-stringify stack state: pre-interned `"toJSON"` atom (1 C lookup per object instead of
+/// `JS_NewAtomLen` + `JS_FreeAtom` on every node) and a 32-slot direct-mapped `JSAtom -> "\"k\":"`
+/// L1 cache (0 heap allocations) that eliminates repeated `JS_AtomToCStringLen` + UTF-8 check +
+/// escape + `JS_FreeCString` on homogeneous object arrays.
+struct WalkCtx {
+    q: *mut rquickjs::qjs::JSContext,
+    to_json_atom: rquickjs::qjs::JSAtom,
+    keys: [(rquickjs::qjs::JSAtom, u8, [u8; 32]); 32],
+}
+
+impl WalkCtx {
+    fn new(q: *mut rquickjs::qjs::JSContext) -> Self {
+        let to_json_atom = unsafe {
+            rquickjs::qjs::JS_NewAtomLen(q, b"toJSON".as_ptr() as *const core::ffi::c_char, 6)
+        };
+        Self {
+            q,
+            to_json_atom,
+            keys: [(0, 0, [0u8; 32]); 32],
+        }
+    }
+
+    #[inline]
+    unsafe fn write_key(&mut self, atom: rquickjs::qjs::JSAtom, out: &mut Vec<u8>) {
+        let slot = &mut self.keys[(atom as usize) & 31];
+        if slot.1 != 0 && slot.0 == atom {
+            out.extend_from_slice(&slot.2[..slot.1 as usize]);
+            return;
+        }
+        let start = out.len();
+        let mut klen = 0u64;
+        let kptr = rquickjs::qjs::JS_AtomToCStringLen(self.q, &mut klen, atom);
+        if !kptr.is_null() {
+            let kb = std::slice::from_raw_parts(kptr as *const u8, klen as usize);
+            match std::str::from_utf8(kb) {
+                Ok(s) => write_escaped_str(out, s),
+                Err(_) => write_escaped_str(out, &String::from_utf8_lossy(kb)),
+            }
+            rquickjs::qjs::JS_FreeCString(self.q, kptr);
+        }
+        out.push(b':');
+        let written = out.len() - start;
+        if written > 0 && written <= 32 {
+            slot.0 = atom;
+            slot.1 = written as u8;
+            slot.2[..written].copy_from_slice(&out[start..]);
+        }
+    }
+}
+
+impl Drop for WalkCtx {
+    fn drop(&mut self) {
+        unsafe {
+            rquickjs::qjs::JS_FreeAtom(self.q, self.to_json_atom);
+        }
+    }
+}
+
 /// ECMA-262 generic serializer over live JS values with circular-reference detection.
 fn walk_json<'js>(
     ctx: &Ctx<'js>,
     v: &Value<'js>,
     out: &mut Vec<u8>,
     stack: &mut Vec<*mut c_void>,
+    wctx: &mut WalkCtx,
     depth: usize,
 ) -> Result<()> {
     if depth > MAX_WALK_DEPTH {
         return Err(Exception::throw_range(ctx, "Maximum nesting depth exceeded"));
     }
-    if v.is_null() {
-        out.extend_from_slice(b"null");
-        return Ok(());
-    }
-    if v.is_bool() {
-        out.extend_from_slice(if v.as_bool().unwrap_or(false) { b"true" } else { b"false" });
-        return Ok(());
-    }
-    if v.is_string() {
-        let s = CString::from_string(v.clone().into_string().expect("string view"))?;
-        write_escaped_str(out, s.as_str());
-        return Ok(());
-    }
-    if v.is_big_int() {
-        return Err(Exception::throw_type(ctx, "Do not know how to serialize a BigInt"));
-    }
-    if v.is_number() {
-        let n = v.get::<f64>()?;
-        cz_json::write_f64_json(out, n); // NaN / infinity stringify as null per ECMA-262
-        return Ok(());
-    }
-    if !v.is_object() {
-        out.extend_from_slice(b"null");
-        return Ok(());
+    let raw = v.as_raw();
+    match raw.tag as i32 {
+        rquickjs::qjs::JS_TAG_NULL => {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        rquickjs::qjs::JS_TAG_BOOL => {
+            out.extend_from_slice(if unsafe { raw.u.int32 } != 0 { b"true" } else { b"false" });
+            return Ok(());
+        }
+        rquickjs::qjs::JS_TAG_INT => {
+            write_i64(out, unsafe { raw.u.int32 } as i64);
+            return Ok(());
+        }
+        rquickjs::qjs::JS_TAG_FLOAT64 => {
+            cz_json::write_f64_json(out, unsafe { raw.u.float64 });
+            return Ok(());
+        }
+        rquickjs::qjs::JS_TAG_STRING | rquickjs::qjs::JS_TAG_STRING_ROPE => {
+            unsafe {
+                let mut slen = 0u64;
+                let sptr = rquickjs::qjs::JS_ToCStringLen2(wctx.q, &mut slen, raw, false);
+                if sptr.is_null() {
+                    return Err(rquickjs::Error::Exception);
+                }
+                let sb = std::slice::from_raw_parts(sptr as *const u8, slen as usize);
+                match std::str::from_utf8(sb) {
+                    Ok(s) => write_escaped_str(out, s),
+                    Err(_) => write_escaped_str(out, &String::from_utf8_lossy(sb)),
+                }
+                rquickjs::qjs::JS_FreeCString(wctx.q, sptr);
+            }
+            return Ok(());
+        }
+        rquickjs::qjs::JS_TAG_BIG_INT => {
+            return Err(Exception::throw_type(ctx, "Do not know how to serialize a BigInt"));
+        }
+        rquickjs::qjs::JS_TAG_OBJECT => {}
+        _ => {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
     }
 
-    let obj = v.as_object().expect("object view").clone();
     // Cycle detection uses the raw JSValue pointer of the object being emitted.
-    let ptr = unsafe { rquickjs::qjs::JS_VALUE_GET_PTR(v.as_raw()) };
+    let ptr = unsafe { rquickjs::qjs::JS_VALUE_GET_PTR(raw) };
     if stack.contains(&ptr) {
         return Err(Exception::throw_type(ctx, "Circular reference detected"));
     }
     stack.push(ptr);
 
-    // toJSON (Date and friends) takes precedence over structural walking.
-    if obj.contains_key("toJSON")? {
-        if let Ok(f) = obj.get::<_, Function>("toJSON") {
-            // `toJSON` runs with the object as its receiver (Date and friends rely on `this`).
+    let q = wctx.q;
+    // toJSON (Date and friends) takes precedence over structural walking (1 pre-interned atom check).
+    let has_to_json = unsafe { rquickjs::qjs::JS_HasProperty(q, raw, wctx.to_json_atom) };
+    if has_to_json < 0 {
+        stack.pop();
+        return Err(rquickjs::Error::Exception);
+    }
+    if has_to_json > 0 {
+        let f_raw = unsafe { rquickjs::qjs::JS_GetProperty(q, raw, wctx.to_json_atom) };
+        if unsafe { rquickjs::qjs::JS_IsException(f_raw) } {
+            stack.pop();
+            return Err(rquickjs::Error::Exception);
+        }
+        let f_val = unsafe { Value::from_raw(ctx.clone(), f_raw) };
+        if let Some(f) = f_val.as_function() {
+            let obj = v.as_object().expect("object view").clone();
             let mut args = Args::new(ctx.clone(), 0);
-            args.this(obj.clone())?;
-            let produced: Value<'js> = args.apply(&f)?;
-            walk_json(ctx, &produced, out, stack, depth + 1)?;
+            args.this(obj)?;
+            let produced: Value<'js> = args.apply(f)?;
+            walk_json(ctx, &produced, out, stack, wctx, depth + 1)?;
             stack.pop();
             return Ok(());
         }
     }
 
-    if obj.is_array() {
+    if unsafe { rquickjs::qjs::JS_IsArray(raw) } {
         out.push(b'[');
-        let arr = obj.into_array().expect("array view");
-        let len = arr.len();
+        let mut len_i64: i64 = 0;
+        if unsafe { rquickjs::qjs::JS_GetLength(q, raw, &mut len_i64) } < 0 {
+            stack.pop();
+            return Err(rquickjs::Error::Exception);
+        }
+        let len = if len_i64 < 0 { 0u32 } else { len_i64 as u32 };
         for i in 0..len {
             if i > 0 {
                 out.push(b',');
             }
-            let it = arr.get::<Value>(i)?;
+            let it_raw = unsafe { rquickjs::qjs::JS_GetPropertyUint32(q, raw, i) };
+            if unsafe { rquickjs::qjs::JS_IsException(it_raw) } {
+                stack.pop();
+                return Err(rquickjs::Error::Exception);
+            }
+            let it = unsafe { Value::from_raw(ctx.clone(), it_raw) };
             // undefined / holes / functions / symbols inside arrays serialize as null.
             if it.is_undefined() || it.is_function() || it.is_symbol() {
                 out.extend_from_slice(b"null");
             } else {
-                walk_json(ctx, &it, out, stack, depth + 1)?;
+                walk_json(ctx, &it, out, stack, wctx, depth + 1)?;
             }
         }
         out.push(b']');
@@ -947,15 +1041,13 @@ fn walk_json<'js>(
     // Fast path: raw property enumeration straight through the QuickJS C API. This skips the
     // rquickjs per-member String/Value marshaling allocations for plain data objects.
     unsafe {
-        let q = ctx.as_raw().as_ptr();
         let mut tab: *mut rquickjs::qjs::JSPropertyEnum = std::ptr::null_mut();
         let mut len: u32 = 0;
-        let obj_raw = obj.as_value().as_raw();
         if rquickjs::qjs::JS_GetOwnPropertyNames(
             q,
             &mut tab,
             &mut len,
-            obj_raw,
+            raw,
             (rquickjs::qjs::JS_GPN_STRING_MASK | rquickjs::qjs::JS_GPN_ENUM_ONLY) as i32,
         ) == 0
         {
@@ -990,32 +1082,13 @@ fn walk_json<'js>(
             }
             let mut first = true;
             for i in 0..len {
-                let pe = &*tab.add(i as usize);
-                let mut desc: rquickjs::qjs::JSPropertyDescriptor = std::mem::zeroed();
-                let rc = rquickjs::qjs::JS_GetOwnProperty(q, &mut desc, obj_raw, pe.atom);
-                if rc < 0 {
+                let atom = (*tab.add(i as usize)).atom;
+                let raw_val = rquickjs::qjs::JS_GetProperty(q, raw, atom);
+                if rquickjs::qjs::JS_IsException(raw_val) {
+                    stack.pop();
                     return Err(rquickjs::Error::Exception);
                 }
-                if rc == 0 {
-                    continue;
-                }
-                let val = if desc.flags & 0x30 != 0 {
-                    // GETSET / VARREF / AUTOINIT: free descriptor refs (including getter/setter)
-                    // and evaluate the property via JS_GetProperty so getters serialize cleanly.
-                    rquickjs::qjs::JS_FreeValue(q, desc.value);
-                    rquickjs::qjs::JS_FreeValue(q, desc.getter);
-                    rquickjs::qjs::JS_FreeValue(q, desc.setter);
-                    let raw_val = rquickjs::qjs::JS_GetProperty(q, obj_raw, pe.atom);
-                    if rquickjs::qjs::JS_IsException(raw_val) {
-                        rquickjs::qjs::JS_FreeValue(q, raw_val);
-                        return Err(rquickjs::Error::Exception);
-                    }
-                    Value::from_raw(ctx.clone(), raw_val)
-                } else {
-                    rquickjs::qjs::JS_FreeValue(q, desc.getter);
-                    rquickjs::qjs::JS_FreeValue(q, desc.setter);
-                    Value::from_raw(ctx.clone(), desc.value)
-                };
+                let val = Value::from_raw(ctx.clone(), raw_val);
                 if val.is_undefined() || val.is_function() || val.is_symbol() {
                     continue; // ECMA: object members with these types vanish
                 }
@@ -1023,15 +1096,8 @@ fn walk_json<'js>(
                     out.push(b',');
                 }
                 first = false;
-                let mut klen = 0u64;
-                let kptr = rquickjs::qjs::JS_AtomToCStringLen(q, &mut klen, pe.atom);
-                if !kptr.is_null() {
-                    let kb = std::slice::from_raw_parts(kptr as *const u8, klen as usize);
-                    write_escaped_str(out, &String::from_utf8_lossy(kb));
-                    rquickjs::qjs::JS_FreeCString(q, kptr);
-                }
-                out.push(b':');
-                walk_json(ctx, &val, out, stack, depth + 1)?;
+                wctx.write_key(atom, out);
+                walk_json(ctx, &val, out, stack, wctx, depth + 1)?;
             }
             drop(enum_guard);
             out.push(b'}');
@@ -1039,6 +1105,7 @@ fn walk_json<'js>(
             return Ok(());
         }
     }
+    let obj = v.as_object().expect("object view");
     let mut first = true;
     for p in obj.props::<String, Value>() {
         let (k, val) = p?;
@@ -1051,7 +1118,7 @@ fn walk_json<'js>(
         first = false;
         write_escaped_str(out, &k);
         out.push(b':');
-        walk_json(ctx, &val, out, stack, depth + 1)?;
+        walk_json(ctx, &val, out, stack, wctx, depth + 1)?;
     }
     out.push(b'}');
     stack.pop();
