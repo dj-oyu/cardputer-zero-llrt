@@ -482,3 +482,172 @@ const WEB_GLOBALS_SHIM: &str = r#"
     globalThis.__czWebGlobalsInstalled = true;
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rquickjs::{Context, Runtime};
+
+    fn with_ctx<F: FnOnce(&Ctx<'_>)>(f: F) {
+        let rt = Runtime::new().expect("rt");
+        let ctx = Context::full(&rt).expect("ctx");
+        ctx.with(|c| {
+            crate::json_module::install_json(&c).expect("install_json");
+            install_web_globals(&c).expect("install_web_globals");
+            f(&c);
+        });
+    }
+
+    #[test]
+    fn structured_clone_deep_mutation_isolation_plain_arrays_cycles_and_exotics() {
+        with_ctx(|ctx| {
+            let res: String = ctx
+                .eval(
+                    r#"
+                    // 1. Deep plain object + nested arrays + null-prototype + cycle
+                    const nul = Object.create(null);
+                    nul.k = "orig";
+                    const orig = {
+                        top: 1,
+                        nested: { a: { b: [10, { x: 100 }] }, keep: true },
+                        nul,
+                    };
+                    orig.self = orig;
+                    orig.nested.back = orig;
+
+                    const copy = structuredClone(orig);
+
+                    // Mutate original AFTER clone at every depth
+                    orig.top = 999;
+                    orig.nested.a.b[0] = -1;
+                    orig.nested.a.b[1].x = -2;
+                    orig.nested.a.b.push("extra-orig");
+                    delete orig.nested.keep;
+                    orig.nul.k = "mutated-orig";
+
+                    if (copy.top !== 1) throw new Error("top leaked");
+                    if (copy.nested.a.b.length !== 2) throw new Error("array push leaked");
+                    if (copy.nested.a.b[0] !== 10 || copy.nested.a.b[1].x !== 100) throw new Error("deep nested leaked");
+                    if (copy.nested.keep !== true) throw new Error("delete leaked");
+                    if (Object.getPrototypeOf(copy.nul) !== null || copy.nul.k !== "orig") throw new Error("null proto leaked");
+                    if (copy.self !== copy || copy.nested.back !== copy) throw new Error("cycle broken");
+
+                    // Mutate clone AFTER clone and verify original is unaffected
+                    copy.top = 777;
+                    copy.nested.a.b[1].x = 555;
+                    copy.self.added = "only-in-copy";
+                    if (orig.top !== 999 || orig.nested.a.b[1].x !== -2 || "added" in orig) {
+                        throw new Error("clone mutation leaked back into orig");
+                    }
+
+                    // 2. Exotic built-ins: Date, RegExp, Map, Set, ArrayBuffer, Uint8Array
+                    const ab = new ArrayBuffer(4);
+                    const u8 = new Uint8Array(ab);
+                    u8.set([1, 2, 3, 4]);
+                    const ex = {
+                        d: new Date(1700000000000),
+                        r: /foo/gi,
+                        m: new Map([["k", { v: 1 }]]),
+                        s: new Set([10, 20]),
+                        u8,
+                    };
+                    ex.r.lastIndex = 2;
+                    const exCopy = structuredClone(ex);
+
+                    // Mutate both sides
+                    ex.d.setTime(0);
+                    ex.r.lastIndex = 0;
+                    ex.m.get("k").v = 999;
+                    ex.m.set("k2", { v: 2 });
+                    ex.s.add(30);
+                    ex.u8[0] = 0xff;
+                    exCopy.u8[1] = 0xaa;
+
+                    if (exCopy.d.getTime() !== 1700000000000) throw new Error("Date leaked");
+                    if (exCopy.r.lastIndex !== 2) throw new Error("RegExp lastIndex leaked");
+                    if (exCopy.m.size !== 1 || exCopy.m.get("k").v !== 1) throw new Error("Map leaked");
+                    if (exCopy.s.size !== 2 || exCopy.s.has(30)) throw new Error("Set leaked");
+                    if (exCopy.u8[0] !== 1 || ex.u8[1] !== 2) throw new Error("TypedArray bytes leaked");
+
+                    // 3. Non-cloneable values throw DataCloneError
+                    let threw = 0;
+                    for (const bad of [() => {}, { fn: () => {} }, Symbol("s")]) {
+                        try { structuredClone(bad); }
+                        catch (e) { if (e && e.name === "DataCloneError") threw++; }
+                    }
+                    if (threw !== 3) throw new Error("DataCloneError count " + threw);
+
+                    "DEEP_MUTATION_OK"
+                    "#,
+                )
+                .expect("eval");
+            assert_eq!(res, "DEEP_MUTATION_OK");
+        });
+    }
+
+    #[test]
+    fn structured_clone_lazy_json_cow_fork_mutation_isolation() {
+        with_ctx(|ctx| {
+            let res: String = ctx
+                .eval(
+                    r#"
+                    const raw = JSON.stringify({
+                        service: "edge",
+                        version: "1.0",
+                        metrics: { cpu: 42.5, mem: 7.4 },
+                        pad: "x".repeat(4200),
+                    });
+                    const orig = JSON.parse(raw);
+                    const c1 = structuredClone(orig);
+
+                    // Mutate orig (root + nested CoW child + delete)
+                    orig.version = "2.0";
+                    orig.metrics.cpu = 99.9;
+                    delete orig.service;
+
+                    if (c1.service !== "edge" || c1.version !== "1.0" || c1.metrics.cpu !== 42.5) {
+                        throw new Error("orig mutation leaked into c1");
+                    }
+
+                    // Mutate c1 independently and chain-fork c2
+                    c1.version = "1.5";
+                    c1.metrics.mem = 12.0;
+                    const c2 = structuredClone(c1);
+                    c2.version = "3.0";
+                    c2.metrics.mem = 24.0;
+
+                    if (orig.version !== "2.0" || orig.metrics.cpu !== 99.9 || "service" in orig) {
+                        throw new Error("c1/c2 leaked into orig");
+                    }
+                    if (c1.version !== "1.5" || c1.metrics.mem !== 12.0) {
+                        throw new Error("c2 leaked into c1");
+                    }
+                    if (c2.version !== "3.0" || c2.metrics.mem !== 24.0) {
+                        throw new Error("c2 wrong state");
+                    }
+
+                    // Wrapped LazyJSON inside plain object
+                    const w = { tag: "snap", doc: JSON.parse(raw) };
+                    const wCopy = structuredClone(w);
+                    w.doc.version = "orig-w";
+                    wCopy.doc.version = "copy-w";
+                    if (w.doc.version !== "orig-w" || wCopy.doc.version !== "copy-w") {
+                        throw new Error("wrapped LazyJSON isolation failed");
+                    }
+
+                    // Re-serialize each version and verify distinct JSON outputs
+                    const sOrig = JSON.parse(JSON.stringify(orig));
+                    const sC1 = JSON.parse(JSON.stringify(c1));
+                    const sC2 = JSON.parse(JSON.stringify(c2));
+                    if (sOrig.version !== "2.0" || sC1.version !== "1.5" || sC2.version !== "3.0") {
+                        throw new Error("stringify version mismatch");
+                    }
+
+                    "LAZY_COW_MUTATION_OK"
+                    "#,
+                )
+                .expect("eval");
+            assert_eq!(res, "LAZY_COW_MUTATION_OK");
+        });
+    }
+}
