@@ -117,6 +117,8 @@ fn main() {
         println!("cargo:rerun-if-env-changed={}", feature_to_cargo(feature));
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_SANITIZE");
+    println!("cargo:rerun-if-env-changed=CZ_QJS_PGO_GEN");
+    println!("cargo:rerun-if-env-changed=CZ_QJS_PGO_USE");
 
     let src_dir = Path::new("../quickjs");
 
@@ -166,6 +168,28 @@ fn main() {
         }
         Ok(x) => println!("cargo:warning=Unsupported sanitize_option: '{x}'"),
         _ => {}
+    }
+
+    // Optional GCC PGO for QuickJS C core (especially Cortex-A53 32 KiB 2-way L1I).
+    // - CZ_QJS_PGO_GEN=<dir>: instrument libquickjs.a and link libgcov.
+    // - CZ_QJS_PGO_USE=<dir>: apply collected .gcda profiles with
+    //   -fno-reorder-blocks-and-partition (required on AArch64 GCC for
+    //   computed-goto / switch jump tables).
+    if let Ok(pgo_gen) = env::var("CZ_QJS_PGO_GEN") {
+        if !pgo_gen.is_empty() {
+            builder
+                .flag(&format!("-fprofile-generate={pgo_gen}"))
+                .flag("-fno-reorder-blocks-and-partition");
+            println!("cargo:rustc-link-lib=gcov");
+        }
+    } else if let Ok(pgo_use) = env::var("CZ_QJS_PGO_USE") {
+        if !pgo_use.is_empty() {
+            builder
+                .flag(&format!("-fprofile-use={pgo_use}"))
+                .flag("-fprofile-correction")
+                .flag("-Wno-missing-profile")
+                .flag("-fno-reorder-blocks-and-partition");
+        }
     }
 
     let mut bindgen_cflags = vec![];

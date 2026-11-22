@@ -167,6 +167,41 @@ All engine optimizations live in `vendor/quickjs` (`dj-oyu/quickjs`), verified b
 ### Parser & `pi-sandbox` Fuzzing (`crates/cz-runner/tests/fuzz_parsers.rs`)
 - Deterministic 70,000+ mutation & adversarial fuzz suite (`cz-json` 25k+, `cz-net::url` 25k+, `cz-net::ws` 20k, plus 7 hostile `pi-sandbox` resource bombs & 2,000+ FFI calls under 16 MB memory / 256 KB stack / interrupt limits): **4/4 PASS in 0.08s**.
 
+---
+
+## Round 4: QuickJS VM Main-Loop I-Cache & Dispatch Optimization (No JIT, Cortex-A53 Hardware PMU A/B)
+
+Guided by Cortex-A53 hardware PMU counters (`0x11 CPU_CYCLES`, `0x08 INST_RETIRED`, `0x01 L1I_CACHE_REFILL`, `0x03 L1D_CACHE_REFILL`, `0x10 BR_MIS_PRED`), targeting Cortex-A53's 32 KiB 2-way L1I cache without JIT or new bytecode opcodes:
+
+### 4A. Zero-New-Opcode Comparison & Short-Circuit Fusion (`dj-oyu/quickjs` PR #6 & PR #7)
+- **PR #6 (`perf/vm-cmp-branch-fuse`, merged)**: fuses all 8 comparison opcodes (`OP_lt`..`OP_strict_neq`) with `OP_if_false8` via one shared `cmp_fuse_done:` tail (`+64 B` in `JS_CallInternal`):
+  - `w_interp`: **-10.4% cycles, -8.5% inst, -54.8% L1I refills, -28.1% branch misses**
+  - `w_arith`: **-5.3% cycles, -7.8% inst**
+  - `w_lexer`: **-3.1% cycles, -1.9% inst, -38.8% L1I refills**
+- **PR #7 (`perf/vm-dup-branch-fuse`, merged)**: extends `cmp_fuse_done:` to fuse the 4-opcode JS short-circuit chain `OP_cmp + OP_dup + OP_if_false8/OP_if_true8 (+ OP_drop)` with an independent `BREAK;` on the `OP_if_false8` fast path (incremental vs. PR #6):
+  - `w_lexer`: **-14.9% cycles, -15.0% inst (-25.3M inst), -23.8% branch misses**
+  - `w_interp`: **-0.7% cycles, -6.5% branch misses, -0.5% L1I refills**
+  - `w_arith`: **-0.2% cycles, -0.1% inst**
+
+### 4B. Shared Cold-Opcode Outlining (`dj-oyu/quickjs` PR #8, `js_call_cold_op`)
+- Outlines 52 cold opcodes (688 source lines) out of `JS_CallInternal` into a single `static no_inline qjs_cold` helper in `.text.unlikely` behind one shared 20 B call stub (preserving `sf->cur_sp == NULL` while running).
+- `JS_CallInternal`: `47,764 B` -> **`37,572 B` (-10,192 B / -21.3%)**, total binary **-1,172 B**, hot 66-opcode span `23.9 KiB` -> **`18.3 KiB`**.
+- Cortex-A53 Hardware PMU A/B (no PGO, vs. PR #7): `w_interp` **`L1I_REFILL` -25.8%, `CPU_CYCLES` -4.8%**; `w_lexer` **`CPU_CYCLES` -1.15%, `BR_MIS_PRED` -3.8%**.
+
+### 4C. `cz-js` AArch64 GCC PGO (`vendor/rquickjs-sys/build.rs` + `scripts/pgo-train.mjs`)
+- Optional `CZ_QJS_PGO_GEN=<dir>` / `CZ_QJS_PGO_USE=<dir>` flags in `vendor/rquickjs-sys/build.rs` using `-fno-reorder-blocks-and-partition` (required on AArch64 GCC for computed-goto / switch jump tables).
+- Binary size: `5.8 MB` -> **`5.6 MB`** (`CZ_JS_LSE=40`, `CZ_JS_RCPC=0`).
+- Real Cortex-A53 hardware A/B (2x back-to-back average, on top of PR #6 + #7 + #8):
+
+| Benchmark | `cz-js` NO-PGO | `cz-js` **PGO** | Speedup |
+|---|---:|---:|---:|
+| `w_interp` (bytecode VM + TypedArray) | 34.97 ms | **28.52 ms** | **-18.4% (1.23x)** |
+| `w_arith` (float arithmetic loop) | 77.25 ms | **68.07 ms** | **-11.9% (1.13x)** |
+| `w_lexer` (short-circuit string lexer) | 179.68 ms | **153.61 ms** | **-14.5% (1.17x)** |
+| `w_fib28` (recursive JS calls) | 538.72 ms | **505.56 ms** | **-6.2% (1.07x)** |
+| `w_json` (JSON.stringify + parse) | 77.10 ms | **73.80 ms** | **-4.3% (1.04x)** |
+
+
 
 
 
