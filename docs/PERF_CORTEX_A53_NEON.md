@@ -211,6 +211,27 @@ Guided by Cortex-A53 hardware PMU counters (`0x11 CPU_CYCLES`, `0x08 INST_RETIRE
 | `cardputer:kv set / get` | 32.9 / 61.5 ms | **27.7 / 51.1 ms** | **-15.8% / -16.9%** |
 | `new URL() parse (5k)` | 310.1 ms | **282.8 ms** | **-8.8%** |
 
+---
+
+## Round 5: NEON JSON/Split/ReplaceAll & Prototype-Walk / `putc8` Cleanup (`dj-oyu/quickjs` PR #10 & PR #11)
+
+### 5A. ARMv8.0 NEON 16B Scan & Zero-Alloc `replaceAll` (PR #10)
+- 16 B/iter ARMv8.0 NEON scans in `string_buffer_append_quoted`, `json_parse_string` (signed `vcltq_s8(v, 0x20)`), and 1-char `js_string_split` (NEON `vceqq_u8` + `vaddv_u8` bitmask), plus zero-alloc plain `js_string_replace` / `replaceAll` when replacement contains no `$` (+1,232 B / +0.13% in `quickjs.o` `.text`, 0 B in `JS_CallInternal`).
+- Real Cortex-A53 A/B (2x back-to-back):
+  - `split(",").length` (3000 fields): `80.42 ms` -> **`19.20 ms` (4.19x)**
+  - `replaceAll(",", ";")` (3000x): `396.06 ms` -> **`94.45 ms` (4.19x)**
+  - `replaceAll("ok", "PASS")` (600x): `184.51 ms` -> **`63.55 ms` (2.90x)**
+  - `split("\n").length` (600 lines): `39.37 ms` -> **`28.09 ms` (1.40x)**
+  - `JSON.stringify` (200 objs, ~45KB): `55.00 ms` -> **`51.10 ms` (1.08x)**
+
+### 5B. Default `POCKET_VM_LAZY_BUILTINS=0` + Lock-Bit Fix + Inline `string_buffer_putc8` (PR #11)
+- Hardware PMU PC sampling revealed `js_lazy_touch` (`POCKET_VM_LAZY_BUILTINS=1`) was the #1 hotspot (13.5% cycles) on prototype-chain misses (`Object.prototype` stayed lazy forever on missing `toJSON` lookups), and `string_buffer_putc8` was not inlined (8.2% cycles in `JSON.stringify`).
+- Defaulted `POCKET_VM_LAZY_BUILTINS` to `0` (matching upstream `quickjs-ng`, with `#if` guards + `lazy-builtins` CI job testing `=1`), moved `js_obj_set_locked(p, false)` out of `#if POCKET_VM_LAZY_BUILTINS`, and inlined `string_buffer_putc8` fast path (`quickjs.o` `.text`: `-9,960 B`).
+- Real Cortex-A53 A/B (2x back-to-back average):
+  - `plain.toJSON` missing prop (200k): `226.99 ms` -> **`115.35 ms` (1.97x, -49.2%)**
+  - `proto_walk` (200k `toJSON` + `a`): `321.19 ms` -> **`204.55 ms` (1.57x, -36.3%)**
+  - `JSON.stringify` (200 objs x 80): `81.73 ms` -> **`65.24 ms` (1.25x, -20.2%)**
+
 
 
 
