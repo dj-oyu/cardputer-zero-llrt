@@ -232,6 +232,25 @@ Guided by Cortex-A53 hardware PMU counters (`0x11 CPU_CYCLES`, `0x08 INST_RETIRE
   - `proto_walk` (200k `toJSON` + `a`): `321.19 ms` -> **`204.55 ms` (1.57x, -36.3%)**
   - `JSON.stringify` (200 objs x 80): `81.73 ms` -> **`65.24 ms` (1.25x, -20.2%)**
 
+---
+
+## Round 6: Pre-Sized `Array.prototype.join`/`map` & Zero-Intermediate `RegExp` `/g` (`dj-oyu/quickjs` PR #13)
+
+- **`Array.prototype.join` (`js_array_join`)**: For dense `fast_array` inputs of primitives (`string` / `int32` / `bool` / `null` / `undefined`), pre-computes exact final length and 8/16-bit width in 1 pass, allocates the final `JSString` once via `js_alloc_string`, and writes/formats directly (zero `StringBuffer` reallocs and zero per-integer temporary `JSString` allocations).
+- **`Array.prototype.map` (`js_array_every`)**: Pre-allocates the result `fast_array` to `len` once via `expand_fast_array` for dense standard arrays, with per-iteration `fast_array` / `extensible` / `count` guards against callback mutation.
+- **`RegExp` `[Symbol.match]` (`/g`) & `[Symbol.replace]`**: Side-effect-free `js_get_fast_regexp` + direct `lre_exec` with stack `capture_stack[32]`, avoiding per-match `JS_RegExpExec` result array allocations (and lazy `StringBuffer` init on `JS_RegExpReplacePlain` for zero alloc on no-match).
+- `quickjs.o` `.text` (AArch64 `-O2 -mcpu=cortex-a53`): `923,240 B` -> `927,944 B` (`+4,704 B` / `+0.51%`, `0 B` in `JS_CallInternal`).
+- Real Cortex-A53 A/B (2x interleaved average):
+  - `join_int_1k` (`int32[1000].join(',')`): `616.0 ms` -> **`92.5 ms` (6.66x, -85.0%)**
+  - `join_str_1k` (`str[1000].join(',')`): `158.5 ms` -> **`58.5 ms` (2.71x, -63.1%)**
+  - `join_empty_sep` (`char[1000].join('')`): `312.5 ms` -> **`129.0 ms` (2.42x, -58.7%)**
+  - `join_wide_200` (`CJK[200].join('、')`): `96.5 ms` -> **`43.0 ms` (2.24x, -55.4%)**
+  - `map_small_20` / `map_str_1k` / `map_int_1k`: **1.75x / 1.62x / 1.60x**
+  - `re_repl_g_plain` (`replace(/foo/g, 'BAR_REPL')`): `700.0 ms` -> **`237.0 ms` (2.95x, -66.1%)**
+  - `re_match_g_words` (`match(/[a-zA-Z0-9_]+/g)`): `320.0 ms` -> **`114.5 ms` (2.79x, -64.2%)**
+  - `re_repl_1_plain` (`replace(/foo/, 'BAR_REPL')`): `54.0 ms` -> **`46.5 ms` (1.16x, -13.9%)**
+
+
 
 
 
